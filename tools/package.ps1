@@ -1,5 +1,6 @@
 # Builds Release and packs OzMaker.exe with its license files into dist\OzMaker-<version>-win-x64.zip, plus
-# dist\OzMaker.exe and dist\update.txt for the updater.
+# dist\OzMaker.exe and dist\update.txt for the updater. The folder the zip holds stays unpacked next to it (CI uploads
+# it as the build artifact).
 #   powershell -ExecutionPolicy Bypass -File tools\package.ps1 [-NoBuild]
 param([switch]$NoBuild)
 
@@ -54,7 +55,6 @@ if (Test-Path -LiteralPath $installed) {
 }
 
 Compress-Archive -Path $stage -DestinationPath $zip
-Remove-Item -LiteralPath $stage -Recurse -Force
 
 # What the updater in earlier versions reads (src\Updater.h): the exe on its own, and update.txt describing it.
 $exeOut = Join-Path $dist 'OzMaker.exe'
