@@ -1,6 +1,8 @@
 #pragma once
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <winhttp.h>
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <shellapi.h>

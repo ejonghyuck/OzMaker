@@ -9,6 +9,13 @@ Win32 + Direct2D, immediate-mode UI (`src/Ui.*`). Views are in `src/AppViews.cpp
 - After UI changes, also run `--screenshot <dir>` and look at the PNGs. It fails on layering errors.
 - Point `OZMAKER_SETTINGS` at a scratch settings file for every test run.
 
+## Versions and releases
+
+- **Version number:** `src/Version.h` holds it. `res/OzMaker.rc` reads it from there; `res/app.manifest` and `vcpkg.json` repeat it, and `tools/package.ps1` warns when they differ.
+- **Release assets:** every release carries the zip, `OzMaker.exe` and `update.txt`. Keep those names. Installed copies look for `releases/latest/download/update.txt` and the exe it names (`src/Updater.h`).
+- **Updater tests:** `--update-test <dir>` (also part of `--selftest`) uses a fake release folder through `OZMAKER_UPDATE_URL` and a copy standing in for the exe. Never point it at the running exe.
+- **Settings screen:** settings are split into tabs (`SettingsTab`). New settings go into the tab they belong to.
+
 ## Layering: floating UI and the window preview
 
 The live window preview on Home is a DWM thumbnail. DWM composites it above everything the app draws, so draw order can't put anything on top of it.

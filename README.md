@@ -77,6 +77,7 @@
 | UI | Direct2D/DirectWrite로 직접 그린 즉시 모드 UI. 입력·애니메이션이 있을 때만 그려서 대기 중 CPU 0% |
 | GIF | 자체 인코더: 바뀐 픽셀만 다시 인코딩(투명 + 영역 크롭), 프레임마다 Wu 양자화 + k-means 보정 팔레트, 바뀐 영역에만 Floyd–Steinberg 디더링, 누적 반올림으로 정확한 재생 시간 |
 | WebP / AVIF | libwebp(WebPAnimEncoder) / libavif + aom. vcpkg가 있을 때만 빌드에 포함됩니다 |
+| 업데이트 | 시작할 때와 하루 한 번 GitHub 최신 릴리스의 `update.txt`(버전 · 크기 · SHA-256)를 WinHTTP로 읽고, 새 버전이면 exe를 옆에 `OzMaker.exe.new`로 받아 검증해 둠. 누르면 실행 중인 exe를 `.old`로 이름 바꾸고 새 exe를 넣은 뒤 다시 시작(쓰기 권한이 없는 폴더면 릴리스 페이지를 엶) |
 
 ## 빌드
 
@@ -125,10 +126,11 @@ OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장
 OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드)
 OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지
+OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업데이트 확인 → 받기 → 검증 → 교체(--selftest에도 포함)
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```
 
-환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini` 대신 그 파일을 씁니다(테스트용).
+환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini` 대신 그 파일을 씁니다(테스트용). `OZMAKER_UPDATE_URL`은 업데이트를 확인할 곳(주소 또는 폴더)을 바꿉니다.
 
 ## 알려진 제약
 

@@ -3,6 +3,7 @@
 #include "Resize.h"
 #include "Sound.h"
 #include "Util.h"
+#include "Version.h"
 #include "../res/resource.h"
 
 using namespace theme;
@@ -91,14 +92,26 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
                             args.size() >= 4 ? _wtoi(args[3].c_str()) : 360);
 
-    const bool tray = !args.empty() && args[0] == L"--tray";  // started with Windows (HKCU Run)
+    // --tray: started with Windows (HKCU Run). --updated <pid> <shown>: restarted by the version before (main.cpp).
+    const bool updated = args.size() >= 3 && args[0] == L"--updated";
+    const bool tray = (!args.empty() && args[0] == L"--tray") || (updated && args[2] == L"0");
+    if (updated) Updater::CleanUp(util::ExePath());
     autostart_ = util::AutostartEnabled();
     if (autostart_) util::SetAutostart(true);  // keeps pointing at this exe if it was moved
     if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
+    updater_.Init(util::ExePath(), hwnd_, WM_APP_UPDATE);
+    SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way
+    if (updated) {
+        if (tray)
+            TrayBalloon(L"OzMaker를 업데이트했습니다", L"버전 " OZ_VERSION_WSTR);
+        else
+            Toast(L"OzMaker " OZ_VERSION_WSTR L" 버전으로 업데이트했습니다");
+    }
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
@@ -552,6 +565,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                         if (settings_.sounds) sound::Play(sound::Cue::Tick);
                     }
                 }
+            } else if (w == kTimerUpdate) {
+                SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
+                CheckForUpdate();
             } else if (w == kTimerRefresh) {
                 if (screen_ == Screen::Home && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && !picker_.Active() &&
                     !regionPicker_.Active())
@@ -603,6 +619,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_APP_ESTIMATE:
             OnEstimate();
+            return 0;
+        case WM_APP_UPDATE:
+            if (!UpdateReady() && updater_.Get().state != Updater::State::Available) updateOpen_ = false;
+            TrayUpdate();
+            Invalidate();
             return 0;
         case WM_APP_FRAME: {
             size_t idx = 0;
@@ -1258,10 +1279,53 @@ void App::DropHeld(const Clip* clip) {
     std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
 }
 
-bool App::ConfirmQuit() {
+bool App::ConfirmQuit(bool restart) {
     if (held_.empty()) return true;
-    std::wstring msg = util::Format(L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?", held_.size());
+    std::wstring msg = util::Format(restart ? L"저장하지 않은 녹화가 %zu개 있습니다.\n다시 시작하면 사라집니다. 업데이트할까요?"
+                                            : L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?",
+                                    held_.size());
     return MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
+// ---------------------------------------------------------------- updates
+
+// From the timer: at startup, then once a day (an hour after a failed check). The settings call it to check now.
+void App::CheckForUpdate() {
+    Updater::Status st = updater_.Get();
+    double since = util::NowSeconds() - st.checkedAt;
+    bool due = st.checkedAt == 0 || since >= 24 * 3600 || (st.state == Updater::State::Failed && since >= 3600);
+    if (settings_.autoUpdate && due) updater_.Check();
+}
+
+bool App::UpdateReady() const { return updater_.Get().state == Updater::State::Ready; }
+
+void App::InstallUpdate() {
+    updateOpen_ = false;
+    if (rec_ != RecState::Idle || exporter_.Busy()) {
+        Toast(L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다.", true);
+        return;
+    }
+    if (!ConfirmQuit(true)) return;
+    std::wstring err;
+    if (!updater_.Install(err)) {
+        Toast(err, true);
+        return;
+    }
+    // The new exe waits until this process has ended, then starts as this one did (main.cpp).
+    std::wstring exe = util::ExePath();
+    std::wstring cmd = util::Format(L"\"%s\" --updated %lu %d", exe.c_str(), GetCurrentProcessId(),
+                                    IsWindowVisible(hwnd_) ? 1 : 0);
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        Toast(L"새 버전을 시작하지 못했습니다. OzMaker를 다시 켜면 새 버전으로 시작합니다.", true);
+        return;
+    }
+    AllowSetForegroundWindow(pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    quitting_ = true;
+    DestroyWindow(hwnd_);
 }
 
 bool App::OpenVideo(const std::wstring& path) {
@@ -1825,6 +1889,7 @@ void App::TrayUpdate() {
     std::wstring tip = rec_ == RecState::Recording ? L"OzMaker · 녹화 중" + (hotkeyOk_ ? L" (" + hk + L" 중지)" : L"")
                        : hotkeyOk_                  ? L"OzMaker · " + hk + L" 녹화"
                                                     : L"OzMaker · 녹화 단축키를 쓸 수 없음";
+    if (rec_ != RecState::Recording && UpdateReady()) tip += L"\n업데이트 준비 완료";
     wcsncpy_s(nid_.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
@@ -1858,6 +1923,9 @@ void App::TrayMenu() {
         AppendMenuW(menu, MF_STRING | (canRecord ? 0 : MF_GRAYED), 2, (what + hk).c_str());
     else
         AppendMenuW(menu, MF_STRING, 2, (L"녹화 중지\t" + hk).c_str());
+    if (UpdateReady())
+        AppendMenuW(menu, MF_STRING | (rec_ == RecState::Idle ? 0 : MF_GRAYED), 4,
+                    (L"새 버전 " + updater_.Get().version + L"으로 업데이트").c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 3, L"종료");
     SetMenuDefaultItem(menu, 1, FALSE);
@@ -1868,6 +1936,10 @@ void App::TrayMenu() {
     DestroyMenu(menu);
     switch (cmd) {
         case 1: ShowMain(true); break;
+        case 4:
+            ShowMain(true);
+            InstallUpdate();
+            break;
         case 2:
             if (rec_ == RecState::Idle)
                 StartRecording(current, false);

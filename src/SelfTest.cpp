@@ -9,10 +9,13 @@
 //                                         frame by frame and by the audio tone boundaries; editor screenshots
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
 //   --preview-test <dir>                  the live window preview on screen, with the files list open over it
+//   --update-test <dir> [url|github]      the updater on a fake release folder (also part of --selftest); url: the
+//                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
 #include "App.h"
 #include "Resize.h"
 #include "Util.h"
+#include "Version.h"
 #include "VideoClip.h"
 
 namespace {
@@ -152,6 +155,113 @@ public:
 private:
     FILE* f_ = nullptr;
 };
+
+// The updater end to end on files in dir: a fake release folder (OZMAKER_UPDATE_URL) and a copy standing in for
+// the installed exe. Never touches this exe. Returns the number of failures. base: serve the release folder from
+// there instead (an HTTP server pointed at dir\release) to go through WinHTTP.
+int UpdaterChecks(const std::wstring& dir, Log& log, const std::wstring& base = {}) {
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        log((ok ? L"update: ok   " : L"update: FAIL ") + what);
+        if (!ok) ++failures;
+    };
+    using U = Updater;
+    check(U::ParseVersion(L"0.4.1") < U::ParseVersion(L"0.4.10") && U::ParseVersion(L"0.10.0") > U::ParseVersion(L"0.9.9") &&
+              U::ParseVersion(L"1.0.0") > U::ParseVersion(L"0.99.99"),
+          L"version order");
+    check(!U::ParseVersion(L"1.0") && !U::ParseVersion(L"1.0.0.0") && !U::ParseVersion(L"v1.0.0") &&
+              !U::ParseVersion(L"") && !U::ParseVersion(L"1..0") && !U::ParseVersion(L"1.0.") && !U::ParseVersion(L"1.0.x"),
+          L"malformed versions rejected");
+    check(U::ParseVersion(OZ_VERSION_WSTR) == U::CurrentVersion(), L"current version " OZ_VERSION_WSTR);
+    check(U::Sha256("abc", 3) == L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", L"SHA-256 test vector");
+
+    const std::wstring rel = dir + L"\\release", inst = dir + L"\\install", exe = inst + L"\\OzMaker.exe";
+    util::EnsureDir(rel);
+    util::EnsureDir(inst);
+    auto write = [](const std::wstring& path, const void* p, size_t n) {
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD w = 0;
+        bool ok = f != INVALID_HANDLE_VALUE && WriteFile(f, p, (DWORD)n, &w, nullptr) && w == n;
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        return ok;
+    };
+    auto sameAs = [](const std::wstring& path, const std::vector<uint8_t>& want) {
+        uint64_t n = 0;
+        return U::Sha256File(path, &n) == U::Sha256(want.data(), want.size()) && n == want.size();
+    };
+    auto exists = [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    std::vector<uint8_t> oldExe(300'000), newExe(1'234'567);
+    for (size_t i = 0; i < oldExe.size(); ++i) oldExe[i] = (uint8_t)(i * 7);
+    for (size_t i = 0; i < newExe.size(); ++i) newExe[i] = (uint8_t)(i * 13 + (i >> 10));
+    const std::wstring sha = U::Sha256(newExe.data(), newExe.size());
+    write(exe, oldExe.data(), oldExe.size());
+    write(rel + L"\\OzMaker.exe", newExe.data(), newExe.size());
+    auto info = [&](const std::string& version, const std::wstring& sum, size_t size) {
+        std::string s = "; test release\r\nversion=" + version + "\r\nexe=OzMaker.exe\r\nsize=" + std::to_string(size) +
+                        "\r\nsha256=" + util::WideToUtf8(sum) + "\r\n";
+        write(rel + L"\\update.txt", s.data(), s.size());
+    };
+    for (const wchar_t* left : {L".new", L".new.part", L".old"}) DeleteFileW((exe + left).c_str());
+    DeleteFileW((rel + L"\\update.txt").c_str());
+    SetEnvironmentVariableW(L"OZMAKER_UPDATE_URL", base.empty() ? rel.c_str() : base.c_str());
+    auto run = [&](const std::wstring& target) {
+        U u;
+        u.Init(target, nullptr, 0);
+        u.Check();
+        for (int i = 0; i < 1500 && u.Busy(); ++i) Sleep(20);
+        return u.Get();
+    };
+
+    U::Status st = run(exe);
+    check(st.state == U::State::Failed && !exists(exe + L".new"), L"no update.txt: failed, nothing downloaded");
+    info(OZ_VERSION_STR, sha, newExe.size());
+    st = run(exe);
+    check(st.state == U::State::UpToDate, L"same version: up to date");
+    write(rel + L"\\update.txt", "version=99.0.0\r\nexe=../x.exe\r\n", 30);
+    st = run(exe);
+    check(st.state == U::State::Failed, L"bad update.txt: failed");
+    info("99.0.0", std::wstring(64, L'0'), newExe.size());
+    st = run(exe);
+    check(st.state == U::State::Failed && !exists(exe + L".new") && !exists(exe + L".new.part") && sameAs(exe, oldExe),
+          L"wrong SHA-256: failed, nothing kept: " + st.error);
+    info("99.0.0", sha, newExe.size() - 1);
+    st = run(exe);
+    check(st.state == U::State::Failed && !exists(exe + L".new"), L"wrong size: failed");
+    info("99.0.0", sha, newExe.size());
+    st = run(inst + L"\\missing\\OzMaker.exe");
+    check(st.state == U::State::Available && st.version == L"99.0.0", L"folder not writable: available, not downloaded");
+    st = run(exe);
+    check(st.state == U::State::Ready && st.version == L"99.0.0" && sameAs(exe + L".new", newExe),
+          L"newer version: downloaded and verified");
+
+    {
+        U u;
+        u.Init(exe, nullptr, 0);
+        u.Check();
+        for (int i = 0; i < 1500 && u.Busy(); ++i) Sleep(20);
+        check(u.Get().state == U::State::Ready, L"second check reuses the download");
+        std::wstring err;
+        bool ok = u.Install(err);
+        check(ok && sameAs(exe, newExe) && sameAs(exe + L".old", oldExe) && !exists(exe + L".new"),
+              L"install swaps the exe, keeps .old " + err);
+        U::CleanUp(exe);
+        check(!exists(exe + L".old") && sameAs(exe, newExe), L"clean-up removes .old");
+    }
+    {
+        // A staged file that changed after it was checked is not installed.
+        write(exe, oldExe.data(), oldExe.size());
+        U u;
+        u.Init(exe, nullptr, 0);
+        u.Check();
+        for (int i = 0; i < 1500 && u.Busy(); ++i) Sleep(20);
+        write(exe + L".new", oldExe.data(), oldExe.size());
+        std::wstring err;
+        bool ok = u.Install(err);
+        check(!ok && sameAs(exe, oldExe) && !exists(exe + L".old"), L"tampered download refused: " + err);
+    }
+    SetEnvironmentVariableW(L"OZMAKER_UPDATE_URL", nullptr);
+    return failures;
+}
 
 void DrawSynthetic(uint8_t* p, int w, int h, double t) {
     double bx = w * (0.5 + 0.35 * std::sin(t * 3.14159)), by = h * (0.5 + 0.25 * std::cos(t * 2.1));
@@ -485,6 +595,7 @@ int App::RunSelfTest(const std::wstring& dir) {
         target_ = nullptr;
         DestroyWindow(standIn);
     }
+    failures += UpdaterChecks(dir + L"\\update", log);
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -600,12 +711,36 @@ int App::RunScreenshots(const std::wstring& dir) {
         });
     }
 
+    // A new version downloaded: the green button, its tooltip, and the popover it opens.
+    {
+        Updater::Status st;
+        st.state = Updater::State::Ready;
+        st.version = L"0.5.0";
+        updater_.SetForTest(st);
+        screen_ = Screen::Home;
+        shot(L"home_update.png", 96);
+        mouse.mx = updateBtn_.CX();
+        mouse.my = updateBtn_.CY();
+        shot(L"home_update_tip.png", 96);
+        mouse = {};
+        updateOpen_ = true;
+        shot(L"home_update_popover.png", 96);
+        updateOpen_ = false;
+        screen_ = Screen::Settings;
+        settings_.settingsTab = kTabAbout;
+        shot(L"settings_about_update.png", 96);
+        updater_.SetForTest({});
+    }
+
     screen_ = Screen::Settings;
-    settingsScroll_ = 0;
-    shot(L"settings.png", 96);
-    settingsScroll_ = 10000;
-    shot(L"settings_video.png", 96);
-    settingsScroll_ = 0;
+    const wchar_t* tabShots[kTabCount] = {L"settings.png", L"settings_record.png", L"settings_video.png",
+                                          L"settings_audio.png", L"settings_about.png"};
+    for (int i = 0; i < kTabCount; ++i) {
+        settings_.settingsTab = i;
+        settingsScroll_ = 0;
+        shot(tabShots[i], 96);
+    }
+    settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));
     if (thumbThread_.joinable()) thumbThread_.join();  // let it finish (StopThumbnails would cancel)
@@ -1706,6 +1841,24 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
 // The live window preview as DWM shows it. A window of colour blocks is picked and the files list opened over the
 // preview: on screen (our window only, kept on top) the list must show where it is and the window everywhere else,
 // with the title bar hidden and shown, and closing the list must bring back the whole preview.
+int App::RunUpdateTest(const std::wstring& dir, const std::wstring& base) {
+    util::EnsureDir(dir);
+    Log log(dir + L"\\updatetest.log");
+    if (base == L"github") {
+        // The real release: one check, reported (what it finds depends on the latest release).
+        Updater u;
+        u.Init(dir + L"\\OzMaker.exe", nullptr, 0);
+        u.Check();
+        for (int i = 0; i < 3000 && u.Busy(); ++i) Sleep(20);
+        Updater::Status st = u.Get();
+        log(util::Format(L"github: state %d, version %s, error %s", (int)st.state, st.version.c_str(), st.error.c_str()));
+        return 0;
+    }
+    int failures = UpdaterChecks(dir, log, base);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 1 : 0;
+}
+
 int App::RunPreviewTest(const std::wstring& dir) {
     testWindowsOnly_ = true;
     util::EnsureDir(dir);

@@ -60,7 +60,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;winhttp.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <FxCompile>
       <ShaderModel>5.0</ShaderModel>
@@ -114,6 +114,7 @@
     <ClCompile Include="src\Settings.cpp" />
     <ClCompile Include="src\Sound.cpp" />
     <ClCompile Include="src\Ui.cpp" />
+    <ClCompile Include="src\Updater.cpp" />
     <ClCompile Include="src\Util.cpp" />
     <ClCompile Include="src\WindowList.cpp" />
     <ClCompile Include="src\encoders\Encoder.cpp" />
@@ -139,6 +140,8 @@
     <ClInclude Include="src\Sound.h" />
     <ClInclude Include="src\Theme.h" />
     <ClInclude Include="src\Ui.h" />
+    <ClInclude Include="src\Updater.h" />
+    <ClInclude Include="src\Version.h" />
     <ClInclude Include="src\Util.h" />
     <ClInclude Include="src\WindowList.h" />
     <ClInclude Include="src\encoders\Encoder.h" />

@@ -1,4 +1,5 @@
-# Builds Release and packs OzMaker.exe with its license files into dist\OzMaker-<version>-win-x64.zip.
+# Builds Release and packs OzMaker.exe with its license files into dist\OzMaker-<version>-win-x64.zip, plus
+# dist\OzMaker.exe and dist\update.txt for the updater.
 #   powershell -ExecutionPolicy Bypass -File tools\package.ps1 [-NoBuild]
 param([switch]$NoBuild)
 
@@ -16,16 +17,14 @@ if (-not $NoBuild) {
 
 $exe = Join-Path $root 'bin\Release\OzMaker.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Not built yet: $exe" }
-$version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion  # from res\OzMaker.rc
+$version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion  # src\Version.h, through res\OzMaker.rc
 
 # The version is repeated in a few files; catch a forgotten bump.
 [xml]$manifest = Get-Content -LiteralPath (Join-Path $root 'res\app.manifest') -Raw
 $manifestVersion = $manifest.assembly.assemblyIdentity.version
 $vcpkgVersion = (Get-Content -LiteralPath (Join-Path $root 'vcpkg.json') -Raw | ConvertFrom-Json).'version-string'
-$footer = Select-String -LiteralPath (Join-Path $root 'src\AppViews.cpp') -Pattern 'L"OzMaker (\d+\.\d+)' | Select-Object -First 1
-$footerVersion = if ($footer) { $footer.Matches[0].Groups[1].Value } else { '?' }
-if ($manifestVersion -ne "$version.0" -or $vcpkgVersion -ne $version -or -not $version.StartsWith("$footerVersion.")) {
-    Write-Warning "Version mismatch: OzMaker.rc $version, app.manifest $manifestVersion, vcpkg.json $vcpkgVersion, settings footer $footerVersion"
+if ($manifestVersion -ne "$version.0" -or $vcpkgVersion -ne $version) {
+    Write-Warning "Version mismatch: src\Version.h $version, app.manifest $manifestVersion, vcpkg.json $vcpkgVersion"
 }
 
 $name = "OzMaker-$version-win-x64"
@@ -57,7 +56,14 @@ if (Test-Path -LiteralPath $installed) {
 Compress-Archive -Path $stage -DestinationPath $zip
 Remove-Item -LiteralPath $stage -Recurse -Force
 
+# What the updater in earlier versions reads (src\Updater.h): the exe on its own, and update.txt describing it.
+$exeOut = Join-Path $dist 'OzMaker.exe'
+Copy-Item -LiteralPath $exe -Destination $exeOut -Force
+$exeHash = (Get-FileHash -LiteralPath $exeOut -Algorithm SHA256).Hash.ToLowerInvariant()
+$info = "version=$version`r`nexe=OzMaker.exe`r`nsize=$((Get-Item -LiteralPath $exeOut).Length)`r`nsha256=$exeHash`r`n"
+[IO.File]::WriteAllText((Join-Path $dist 'update.txt'), $info, [Text.Encoding]::ASCII)
+
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
 Write-Host ''
-Write-Host "Created $zip"
+Write-Host "Created $zip, OzMaker.exe and update.txt"
 Write-Host ('{0:N0} bytes, SHA-256 {1}' -f (Get-Item -LiteralPath $zip).Length, $hash)
