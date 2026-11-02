@@ -115,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File tools\package.ps1
 
 Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. 안에는 `OzMaker.exe`, `LICENSE.txt`, `README.md`, `THIRD-PARTY-NOTICES.md`가 들어가고, vcpkg로 빌드했다면 라이브러리 라이선스 전문이 `licenses` 폴더에 함께 들어갑니다. 이미 빌드했다면 `-NoBuild`를 붙이세요.
 
-`v0.6.0` 같은 태그를 푸시하면 GitHub Actions가 같은 zip과 업데이트용 `OzMaker.exe` · `update.txt`를 릴리스로 올립니다. 그 전에 `tools\check-version.ps1`이 태그가 `src\Version.h`의 버전과 같은지, 버전을 되풀이하는 `respp.manifest` · `vcpkg.json`이 같은지 보고, 다르면 아무것도 올리지 않고 멈춥니다.
+`v0.6.0` 같은 태그를 푸시하면 GitHub Actions가 같은 zip과 업데이트용 `OzMaker.exe` · `update.txt`를 릴리스로 올립니다. 그 전에 `tools\check-version.ps1`이 태그가 `src\Version.h`의 버전과 같은지, 버전을 되풀이하는 `res\app.manifest` · `vcpkg.json`이 같은지 보고, 다르면 아무것도 올리지 않고 멈춥니다.
 
 받는 사람에게 알려 줄 것:
 
