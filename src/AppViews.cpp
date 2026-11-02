@@ -565,7 +565,7 @@ void App::DrawRegionPanel(Rect in) {
              settings_.HasRegion() ? L"영역 다시 지정" : L"영역 지정", 15.f, TextColor, Bold(AlignCenter));
     TextStyle st = Align(AlignCenter, AlignStart);
     ui_.Text(Rect(card.l + 12, card.t + 92, card.r - 12, card.b - 8),
-             L"화면에서 드래그해서 고릅니다 · 클릭하면 창 전체", 12.f, TextDim, st);
+             L"드래그해서 고르고 툴바에서 바로 녹화합니다", 12.f, TextDim, st);
     if (clicked) StartRegionPick();
 
     in.CutTop(14);
@@ -1665,7 +1665,7 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                                             settings_.maxLengthIdx);
                });
 
-    SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,
+    SettingRow(area, L"시작 카운트다운", L"녹화를 누른 뒤 시작까지의 시간 · 영역 지정 막대에서도 바꿈 (단축키는 즉시 시작)", 230,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.cd"), c, {L"없음", L"3초", L"5초"}, settings_.countdown);
                });

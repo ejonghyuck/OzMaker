@@ -754,7 +754,17 @@ int App::RunScreenshots(const std::wstring& dir) {
             p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
             p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
-            regionPicker_.PaintTest(p, mr, a, c, true);
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Adjust);
+        });
+        // Opened again on the area picked before, with the toolbar's countdown menu open.
+        gfx_.RenderToPng((dir + L"\\region_last.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
+            p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
+            POINT a{mr.left + mw * 30 / 100, mr.top + mh * 30 / 100}, c{mr.left + mw * 58 / 100, mr.top + mh * 62 / 100};
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Last);
         });
     }
 
@@ -1713,7 +1723,8 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     return failures ? 2 : 0;
 }
 
-// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys.
+// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys, the
+// toolbar's countdown, save and record, and opening on the area picked before.
 int App::RunRegionTest(const std::wstring& dir) {
     util::EnsureDir(dir);
     Log log(dir + L"\\region.log");
@@ -1726,7 +1737,8 @@ int App::RunRegionTest(const std::wstring& dir) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
     const int ox = mi.rcMonitor.left, oy = mi.rcMonitor.top;
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    bool done = false, ok = false;
+    bool done = false;
+    PickResult res = PickResult::Cancel;
     RECT got{};
     auto pump = [&](double s) {
         double until = util::NowSeconds() + s;
@@ -1739,11 +1751,12 @@ int App::RunRegionTest(const std::wstring& dir) {
             Sleep(5);
         }
     };
-    auto start = [&](std::vector<WinInfo> cands = {}) {
-        done = ok = false;
-        regionPicker_.Start(std::move(cands), [&](bool o, RECT r) {
+    auto start = [&](std::vector<WinInfo> cands = {}, RECT last = {}) {
+        done = false;
+        res = PickResult::Cancel;
+        regionPicker_.Start(std::move(cands), last, 1, [&](PickResult o, RECT r) {
             done = true;
-            ok = o;
+            res = o;
             got = r;
         });
         pump(0.15);
@@ -1762,6 +1775,11 @@ int App::RunRegionTest(const std::wstring& dir) {
     auto key = [&](UINT vk) {
         PostMessageW(regionPicker_.Hwnd(), WM_KEYDOWN, vk, 0);
         pump(0.08);
+    };
+    auto click = [&](RECT b) {  // a toolbar button, in screen pixels
+        post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
+        post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
+        pump(0.12);
     };
     auto rel = [&](RECT r) {
         return util::Format(L"%d,%d-%d,%d", r.left - ox, r.top - oy, r.right - ox, r.bottom - oy);
@@ -1795,10 +1813,7 @@ int App::RunRegionTest(const std::wstring& dir) {
     post(WM_MOUSEMOVE, 700, 500);
     pump(0.08);
     stale(L"handle hover");
-    RECT b = regionPicker_.ToolbarButton(3);  // 16:9
-    post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
-    post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
-    pump(0.12);
+    click(regionPicker_.ToolbarButton(3));  // 16:9
     s = regionPicker_.AdjustedArea();
     check(is(s, 300, 201, 1151, 680), L"16:9 keeps width and centre: " + rel(s));
     drag(s.right - ox, s.bottom - oy, s.right - ox + 100, s.bottom - oy + 20);
@@ -1817,7 +1832,8 @@ int App::RunRegionTest(const std::wstring& dir) {
     s = regionPicker_.AdjustedArea();
     check(s.left == before.left + 1 && s.right == before.right + 1 && s.top == before.top, L"arrow key moves 1px: " + rel(s));
     key(VK_RETURN);
-    check(done && ok && EqualRect(&got, &s) && !regionPicker_.Active(), L"Enter confirms: " + rel(got));
+    check(done && res == PickResult::Record && EqualRect(&got, &s) && !regionPicker_.Active(),
+          L"Enter records: " + rel(got));
 
     start();
     post(WM_MOUSEMOVE, 400, 300);
@@ -1827,7 +1843,45 @@ int App::RunRegionTest(const std::wstring& dir) {
     s = regionPicker_.AdjustedArea();
     check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click (no window) takes the screen: " + rel(s));
     key(VK_ESCAPE);
-    check(done && !ok && !regionPicker_.Active(), L"Esc cancels");
+    check(done && res == PickResult::Cancel && !regionPicker_.Active(), L"Esc cancels");
+
+    // The toolbar: its countdown menu, then "저장만" keeps the area without recording.
+    start();
+    drag(200, 150, 1000, 600);
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarCountdown));
+    check(regionPicker_.MenuOpen(), L"the countdown button opens its menu");
+    stale(L"countdown menu");
+    key(VK_ESCAPE);
+    check(!done && !regionPicker_.MenuOpen() && regionPicker_.Countdown() == 1, L"Esc closes only the menu");
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarCountdown));
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarMenu + 2));
+    check(!done && !regionPicker_.MenuOpen() && regionPicker_.Countdown() == 2, L"the menu picks 5 s and closes");
+    stale(L"menu closed");
+    s = regionPicker_.AdjustedArea();
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarSave));
+    check(done && res == PickResult::Save && EqualRect(&got, &s), L"save only: " + rel(got));
+
+    // Opened on the area picked before: the record button takes it as it is.
+    RECT last{ox + 320, oy + 240, ox + 960, oy + 600};
+    start({}, last);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &last), L"opens on the last area: " + rel(s));
+    stale(L"last area");
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarRecord));
+    check(done && res == PickResult::Record && EqualRect(&got, &last), L"record button: " + rel(got));
+    // A click outside it starts over: no window there, so the whole monitor.
+    start({}, last);
+    post(WM_MOUSEMOVE, 100, 100);
+    post(WM_LBUTTONDOWN, 100, 100, MK_LBUTTON);
+    post(WM_LBUTTONUP, 100, 100);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click outside it takes the screen: " + rel(s));
+    key(VK_ESCAPE);
+    // Not when it no longer lies on a screen.
+    start({}, RECT{vx - 3000, vy - 3000, vx - 2000, vy - 2400});
+    check(!done && !regionPicker_.Adjusting(), L"a last area off the screens opens empty");
+    key(VK_ESCAPE);
 
     // Hovering windows (made up here, not the user's): the area and its label follow the one under the cursor.
     WinInfo wa, wb;

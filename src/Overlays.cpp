@@ -568,6 +568,7 @@ struct Ratio {
 };
 // Same choices, same order as the editor's crop bar.
 constexpr Ratio kRatios[] = {{L"자유", 0}, {L"1:1", 1}, {L"4:3", 4.0 / 3}, {L"16:9", 16.0 / 9}, {L"9:16", 9.0 / 16}};
+constexpr const wchar_t* kCountdowns[] = {L"없음", L"3초", L"5초"};  // Settings::countdown
 constexpr int kMinSide = 16;
 }  // namespace
 
@@ -576,13 +577,16 @@ void RegionPicker::Init(HINSTANCE inst, ID2D1Factory1* factory) {
     factory_ = factory;
 }
 
-void RegionPicker::Start(std::vector<WinInfo> windows, std::function<void(bool, RECT)> done) {
+void RegionPicker::Start(std::vector<WinInfo> windows, RECT last, int countdown,
+                         std::function<void(PickResult, RECT)> done) {
     cands_ = std::move(windows);
     done_ = std::move(done);
     hover_ = -1;
-    pressed_ = dragging_ = adjusting_ = false;
+    pressed_ = dragging_ = adjusting_ = cdOpen_ = false;
     op_ = -1;
     ratio_ = 0;
+    countdown_ = std::clamp(countdown, 0, 2);
+    lastArea_ = {};
     virt_ = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
     virt_.right = virt_.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
     virt_.bottom = virt_.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -591,8 +595,18 @@ void RegionPicker::Start(std::vector<WinInfo> windows, std::function<void(bool, 
     active_ = true;
     full_ = true;
     GetCursorPos(&cursor_);
-    OnMove(cursor_);
-    Redraw();
+    hover_ = HoverAt(cursor_);
+    // The area picked before comes back, to record again or adjust, while it still lies whole on one monitor.
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromRect(&last, MONITOR_DEFAULTTONULL);
+    RECT in{};
+    if (mon && GetMonitorInfoW(mon, &mi) && IntersectRect(&in, &last, &mi.rcMonitor) && EqualRect(&in, &last) &&
+        last.right - last.left >= kMinSide && last.bottom - last.top >= kMinSide) {
+        lastArea_ = last;
+        StartAdjust(last);
+    } else {
+        Redraw();
+    }
     ShowWindow(win_.Hwnd(), SW_SHOW);
     SetForegroundWindow(win_.Hwnd());
     SetFocus(win_.Hwnd());
@@ -650,6 +664,18 @@ int RegionPicker::HitTest(POINT pt) const {
     return PtInRect(&r, pt) ? 8 : -1;
 }
 
+int RegionPicker::HoverAt(POINT pt) const {
+    for (size_t i = 0; i < cands_.size(); ++i)
+        if (!cands_[i].minimized && PtInRect(&cands_[i].frame, pt)) return (int)i;
+    return -1;
+}
+
+int RegionPicker::SlotAt(POINT pt) const {
+    for (int i = 0; i < kBarSlots; ++i)
+        if (PtInRect(&buttons_[i], pt)) return i;
+    return -1;
+}
+
 void RegionPicker::DragTo(POINT pt) {
     const RECT& m = anchorMon_;
     const RECT& s = opSel_;
@@ -690,16 +716,16 @@ void RegionPicker::DragTo(POINT pt) {
     sel_ = {(LONG)std::lround(l), (LONG)std::lround(t), (LONG)std::lround(l + w), (LONG)std::lround(t + h)};
 }
 
-void RegionPicker::Finish(bool ok, RECT area) {
+void RegionPicker::Finish(PickResult result, RECT area) {
     if (!active_) return;
     active_ = false;
-    adjusting_ = false;
+    adjusting_ = cdOpen_ = false;
     if (GetCapture() == win_.Hwnd()) ReleaseCapture();
     ShowWindow(win_.Hwnd(), SW_HIDE);
     win_.Destroy();
     auto cb = std::move(done_);
     done_ = nullptr;
-    if (cb) cb(ok, area);
+    if (cb) cb(result, area);
 }
 
 RECT RegionPicker::Selection() const {
@@ -727,18 +753,7 @@ void RegionPicker::OnMove(POINT pt) {
         return;
     }
     if (pressed_ && !dragging_ && (std::abs(pt.x - anchor_.x) > 4 || std::abs(pt.y - anchor_.y) > 4)) dragging_ = true;
-    int hit = hover_;
-    if (!pressed_) {
-        hit = -1;
-        for (size_t i = 0; i < cands_.size(); ++i) {
-            const WinInfo& w = cands_[i];
-            if (!w.minimized && PtInRect(&w.frame, pt)) {
-                hit = (int)i;
-                break;
-            }
-        }
-    }
-    hover_ = hit;
+    if (!pressed_) hover_ = HoverAt(pt);
     // The guide lines follow the cursor, so every move redraws.
     if (active_) Redraw();
 }
@@ -753,8 +768,8 @@ void RegionPicker::Redraw() {
     POINT at = adjusting_ ? POINT{(sel_.left + sel_.right) / 2, (sel_.top + sel_.bottom) / 2} : cursor_;
     float scale = ScaleForRect(RECT{at.x, at.y, at.x + 1, at.y + 1});
     Layout L = Arrange(scale);
-    if (L.adjust)
-        for (int i = 0; i < 7; ++i) buttons_[i] = ToScreen(L.slots[i], scale);
+    for (int i = 0; i < kBarSlots; ++i)
+        buttons_[i] = L.adjust && (i < kBarMenu || L.menu) ? ToScreen(L.slots[i], scale) : RECT{};
     const int w = virt_.right - virt_.left, h = virt_.bottom - virt_.top;
     bool full = full_ || scale != scale_ || !win_.HasSurface(w, h);
     std::vector<RECT> dirty;
@@ -850,6 +865,7 @@ std::vector<RECT> RegionPicker::Marks(const Layout& L) const {
                 m.push_back(Rect(r.l, y - 1, r.r, y + 1));
             }
             m.push_back(Rect(L.bar.l, L.bar.t, L.bar.r, L.bar.b + 3));  // with its shadow
+            if (L.menu) m.push_back(Rect(L.menuBox.l, L.menuBox.t, L.menuBox.r, L.menuBox.b + 3));
         }
         m.push_back(L.label);
     }
@@ -884,38 +900,62 @@ RegionPicker::Layout RegionPicker::Arrange(float scale) const {
         const Rect r = L.r = toDip(L.area);
         // Size in physical pixels: exactly what will be recorded.
         L.dims = util::Format(L"%d × %d", L.area.right - L.area.left, L.area.bottom - L.area.top);
-        if (!dragging_ && !adjusting_) L.title = cands_[hover_].title;
+        if (!dragging_ && !adjusting_)
+            L.title = cands_[hover_].title;
+        else if (adjusting_ && EqualRect(&sel_, &lastArea_))
+            L.title = L"직전 영역";
         L.tw = L.title.empty() ? 0 : std::min(320.f, m.Measure(L.title, 13.f, kSemibold)) + 12;
         float lw = L.tw + m.Measure(L.dims, 13.f, kSemibold) + 24;
         L.label = Rect::XYWH(r.l, r.t - 36, lw, 30);
         if (L.label.t < 4) L.label = Rect::XYWH(r.l + 8, r.t + 8, lw, 30);
         if (L.label.r > L.vw - 4) L.label = L.label.Offset(L.vw - 4 - L.label.r, 0);
         if (adjusting_) {
-            // Toolbar below the area (inside it when the screen ends there): ratios, cancel, confirm.
+            // Toolbar below the area (inside it when the screen ends there): ratios | countdown | cancel, save only,
+            // record.
             Rect mon = toDip(anchorMon_);
-            const float bh = 34, rw = 54, cw = 64, ow = 84, gap = 10;
-            float tw = rw * 5 + gap + cw + 6 + ow + 12;
+            const float bh = 34, rw = 54, gap = 13;
+            const float cdw = 74, cw = 56, sw = 72, ow = 80;
+            float tw = 6 + rw * 5 + gap + cdw + gap + cw + 6 + sw + 6 + ow + 6;
             float ty = r.b + 12;
             if (ty + bh + 12 > mon.b) ty = std::max(r.t + 12, r.b - bh - 12);
-            L.bar = Rect::XYWH(std::clamp(r.CX() - tw / 2, mon.l + 8, mon.r - 8 - tw), ty, tw, bh + 12);
+            const float lo = mon.l + 8, hi = std::max(lo, mon.r - 8 - tw);
+            L.bar = Rect::XYWH(std::clamp(r.CX() - tw / 2, lo, hi), ty, tw, bh + 12);
             float x = L.bar.l + 6;
             for (int i = 0; i < 5; ++i, x += rw) L.slots[i] = Rect::XYWH(x, L.bar.t + 6, rw, bh);
             x += gap;
-            L.slots[5] = Rect::XYWH(x, L.bar.t + 6, cw, bh);
-            L.slots[6] = Rect::XYWH(x + cw + 6, L.bar.t + 6, ow, bh);
+            L.slots[kBarCountdown] = Rect::XYWH(x, L.bar.t + 6, cdw, bh);
+            x += cdw + gap;
+            L.slots[kBarCancel] = Rect::XYWH(x, L.bar.t + 6, cw, bh);
+            x += cw + 6;
+            L.slots[kBarSave] = Rect::XYWH(x, L.bar.t + 6, sw, bh);
+            x += sw + 6;
+            L.slots[kBarRecord] = Rect::XYWH(x, L.bar.t + 6, ow, bh);
+            // The countdown menu opens over its button (under the toolbar when the screen ends above it).
+            L.menu = cdOpen_;
+            if (L.menu) {
+                const float iw = 52, mw = iw * 3 + 12, mh = bh + 12;
+                const Rect& c = L.slots[kBarCountdown];
+                float my = L.bar.t - 6 - mh;
+                if (my < mon.t + 8) my = L.bar.b + 6;
+                const float mlo = mon.l + 8, mhi = std::max(mlo, mon.r - 8 - mw);
+                L.menuBox = Rect::XYWH(std::clamp(c.CX() - mw / 2, mlo, mhi), my, mw, mh);
+                for (int i = 0; i < 3; ++i) L.slots[kBarMenu + i] = Rect::XYWH(L.menuBox.l + 6 + i * iw, my + 6, iw, bh);
+            }
         }
     }
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(MonitorFromPoint(cursor_, MONITOR_DEFAULTTONEAREST), &mi);
     Rect mon = toDip(mi.rcWork);
-    L.msg = adjusting_ ? L"끌어서 옮기거나 모서리로 크기를 조절하세요" : L"드래그해서 녹화할 영역을 지정하세요";
-    L.hint = adjusting_ ? L"Enter · 확인   Esc · 취소" : L"클릭 · 창 전체   Esc · 취소";
+    L.msg = !adjusting_                       ? L"드래그해서 녹화할 영역을 지정하세요"
+            : EqualRect(&sel_, &lastArea_) ? L"직전 영역입니다 · 밖에서 드래그하면 새로 지정합니다"
+                                           : L"끌어서 옮기거나 모서리로 크기를 조절하세요";
+    L.hint = adjusting_ ? L"Enter · 녹화   Esc · 취소" : L"클릭 · 창 전체   Esc · 취소";
     float mw = m.Measure(L.msg, 14.f, kSemibold) + m.Measure(L.hint, 12.f) + 64;
     L.pill = Rect::XYWH(mon.CX() - mw / 2, mon.t + 24, mw, 40);
     return L;
 }
 
-void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, bool adjust) {
+void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, TestView view) {
     virt_ = screen;
     anchor_ = anchor;
     cursor_ = cursor;
@@ -923,10 +963,17 @@ void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT
     GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &mi);
     anchorMon_ = mi.rcMonitor;
     hover_ = -1;
-    if (adjust) {
+    if (view != TestView::Drag) {
         adjusting_ = true;
         sel_ = Selection();
-        SetRatio(3);  // 16:9
+        if (view == TestView::Adjust) {
+            SetRatio(3);  // 16:9
+        } else {
+            ratio_ = 0;
+            lastArea_ = sel_;
+            countdown_ = 1;
+            cdOpen_ = true;
+        }
         cursor_ = {(sel_.left + sel_.right) / 2, (sel_.top + sel_.bottom) / 2};
     } else {
         pressed_ = dragging_ = true;
@@ -934,7 +981,8 @@ void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT
     scale_ = 1;
     Layout L = Arrange(1.f);
     Paint(p, L, Rect(0, 0, L.vw, L.vh));
-    pressed_ = dragging_ = adjusting_ = false;
+    pressed_ = dragging_ = adjusting_ = cdOpen_ = false;
+    lastArea_ = {};
 }
 
 // clip: the part being redrawn; what lies outside it is skipped (the target clips the rest).
@@ -985,20 +1033,59 @@ void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
             p.Fill(bar.Offset(0, 3), Hex(0x000000, 0.35f), 12);
             p.Fill(bar, Hex(0x15181E, 0.97f), 12);
             p.Stroke(bar.Inset(0.5f), WithAlpha(White, 0.1f), 12);
+            // Dividers: ratios | countdown | the ways out.
+            for (int i : {(int)kBarCountdown, (int)kBarCancel}) {
+                float x = std::round(L.slots[i].l - 6.5f) + 0.5f;
+                p.Line(x, bar.t + 14, x, bar.b - 14, WithAlpha(White, 0.1f), 1.f);
+            }
             TextStyle cs;
             cs.h = AlignCenter;
             cs.weight = kSemibold;
-            for (int i = 0; i < 7; ++i) {
+            TextStyle ls;
+            ls.weight = kSemibold;
+            for (int i = 0; i < kBarMenu; ++i) {
                 const Rect& b = L.slots[i];
                 bool hot = op_ < 0 && b.Contains(L.cx, L.cy);
-                if (i == 6)
-                    p.Fill(b, hot ? AccentHi : Accent, 8);
-                else if (i == ratio_)
+                bool on = i == ratio_ || (i == kBarCountdown && L.menu);
+                if (i == kBarRecord)
+                    p.Fill(b, hot ? RecHi : Rec, 8);
+                else if (on)
                     p.Fill(b, Hex(0x2C3240), 8);
                 else if (hot)
                     p.Fill(b, Hex(0x252A34), 8);
-                const wchar_t* text = i < 5 ? kRatios[i].label : i == 5 ? L"취소" : L"확인";
-                p.Text(b, text, 12.5f, i == 6 || i == ratio_ || hot ? White : TextDim, cs);
+                const D2D1_COLOR_F fg = i == kBarRecord || on || hot ? White : TextDim;
+                if (i == kBarCountdown || i == kBarRecord) {
+                    // A mark, then the word, centred together.
+                    const wchar_t* text = i == kBarRecord ? L"녹화" : kCountdowns[countdown_];
+                    float w = p.Measure(text, 12.5f, kSemibold), x = b.CX() - (w + 18) / 2;
+                    if (i == kBarCountdown) {
+                        p.Stroke(b.Inset(0.5f), WithAlpha(White, on ? 0 : 0.12f), 8);
+                        p.Icon(Rect::XYWH(x - 1, b.t, 15, b.H()), icon::Timer, 12.f, fg);
+                    } else {
+                        p.Circle(x + 5, b.CY(), 4.5f, White);
+                    }
+                    p.Text(Rect(x + 18, b.t, x + 18 + w + 4, b.b), text, 12.5f, fg, ls);
+                } else {
+                    p.Text(b, i < 5 ? kRatios[i].label : i == kBarCancel ? L"취소" : L"저장만", 12.5f, fg, cs);
+                }
+            }
+        }
+        if (L.menu && meets(Rect(L.menuBox.l, L.menuBox.t, L.menuBox.r, L.menuBox.b + 3))) {
+            const Rect& box = L.menuBox;
+            p.Fill(box.Offset(0, 3), Hex(0x000000, 0.35f), 12);
+            p.Fill(box, Hex(0x15181E, 0.97f), 12);
+            p.Stroke(box.Inset(0.5f), WithAlpha(White, 0.1f), 12);
+            TextStyle cs;
+            cs.h = AlignCenter;
+            cs.weight = kSemibold;
+            for (int i = 0; i < 3; ++i) {
+                const Rect& b = L.slots[kBarMenu + i];
+                bool hot = op_ < 0 && b.Contains(L.cx, L.cy);
+                if (i == countdown_)
+                    p.Fill(b, Hex(0x2C3240), 8);
+                else if (hot)
+                    p.Fill(b, Hex(0x252A34), 8);
+                p.Text(b, kCountdowns[i], 12.5f, i == countdown_ || hot ? White : TextDim, cs);
             }
         }
     }
@@ -1041,8 +1128,7 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
                 POINT pt;
                 GetCursorPos(&pt);
                 int hit = op_ >= 0 ? op_ : HitTest(pt);
-                for (const RECT& b : buttons_)
-                    if (op_ < 0 && PtInRect(&b, pt)) hit = 9;
+                if (op_ < 0 && SlotAt(pt) >= 0) hit = 9;
                 static const LPCWSTR byHit[] = {IDC_SIZENWSE, IDC_SIZENS, IDC_SIZENESW, IDC_SIZEWE, IDC_SIZENWSE,
                                                 IDC_SIZENS,   IDC_SIZENESW, IDC_SIZEWE, IDC_SIZEALL, IDC_HAND};
                 if (hit >= 0) c = byHit[hit];
@@ -1056,22 +1142,34 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDOWN: {
             POINT pt = screenPt();
             if (adjusting_) {
-                for (int i = 0; i < 7; ++i)
-                    if (PtInRect(&buttons_[i], pt)) {
-                        if (i < 5) {
-                            SetRatio(i);
-                            Redraw();
-                        } else {
-                            Finish(i == 6, sel_);
-                        }
-                        return 0;
+                int slot = SlotAt(pt);
+                if (cdOpen_) {
+                    // Any click closes the menu: one on an item picks it, one on its button only closes it.
+                    cdOpen_ = false;
+                    if (slot >= kBarMenu) countdown_ = slot - kBarMenu;
+                    Redraw();
+                    if (slot >= kBarMenu || slot == kBarCountdown) return 0;
+                }
+                if (slot >= 0) {
+                    if (slot < 5) {
+                        SetRatio(slot);
+                        Redraw();
+                    } else if (slot == kBarCountdown) {
+                        cdOpen_ = true;
+                        Redraw();
+                    } else if (slot == kBarCancel) {
+                        Finish(PickResult::Cancel, {});
+                    } else {
+                        Finish(slot == kBarRecord ? PickResult::Record : PickResult::Save, sel_);
                     }
+                    return 0;
+                }
                 int hit = HitTest(pt);
                 if (hit >= 0) {
-                    // Double-click inside confirms.
+                    // Double-click inside records.
                     DWORD now = GetTickCount();
                     if (hit == 8 && now - lastClick_ <= GetDoubleClickTime()) {
-                        Finish(true, sel_);
+                        Finish(PickResult::Record, sel_);
                         return 0;
                     }
                     lastClick_ = hit == 8 ? now : 0;
@@ -1082,6 +1180,7 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
                     return 0;
                 }
                 adjusting_ = false;  // outside: draw a new area
+                hover_ = HoverAt(pt);  // what a click without a drag takes
             }
             SetCapture(h);
             pressed_ = true;
@@ -1120,7 +1219,7 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_RBUTTONDOWN:
             if (adjusting_) {
                 // Back to drawing a new area.
-                adjusting_ = false;
+                adjusting_ = cdOpen_ = false;
                 op_ = -1;
                 ReleaseCapture();
                 OnMove(screenPt());
@@ -1129,14 +1228,17 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ReleaseCapture();
                 Redraw();
             } else {
-                Finish(false, {});
+                Finish(PickResult::Cancel, {});
             }
             return 0;
         case WM_KEYDOWN:
-            if (w == VK_ESCAPE) {
-                Finish(false, {});
+            if (w == VK_ESCAPE && cdOpen_) {
+                cdOpen_ = false;
+                Redraw();
+            } else if (w == VK_ESCAPE) {
+                Finish(PickResult::Cancel, {});
             } else if (adjusting_ && w == VK_RETURN) {
-                Finish(true, sel_);
+                Finish(PickResult::Record, sel_);
             } else if (adjusting_ && op_ < 0 && (w == VK_LEFT || w == VK_RIGHT || w == VK_UP || w == VK_DOWN)) {
                 int step = GetKeyState(VK_SHIFT) < 0 ? 10 : 1;
                 int dx = w == VK_LEFT ? -step : w == VK_RIGHT ? step : 0, dy = w == VK_UP ? -step : w == VK_DOWN ? step : 0;
@@ -1147,7 +1249,10 @@ LRESULT RegionPicker::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_KILLFOCUS:
         case WM_ACTIVATEAPP:
             if (m == WM_KILLFOCUS || !w) {
-                if (active_ && GetForegroundWindow() != h) PostMessageW(h, WM_KEYDOWN, VK_ESCAPE, 0);
+                if (active_ && GetForegroundWindow() != h) {
+                    cdOpen_ = false;  // so the Escape closes the picker, not only the menu
+                    PostMessageW(h, WM_KEYDOWN, VK_ESCAPE, 0);
+                }
             }
             break;
     }

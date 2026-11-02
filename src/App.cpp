@@ -786,15 +786,32 @@ void App::SetSource(int source) {
     Invalidate();
 }
 
+// The picker opens on the area picked before; its toolbar records the area at once or keeps it for Home.
 void App::StartRegionPick() {
     if (rec_ != RecState::Idle || regionPicker_.Active()) return;
     HideMain();
-    regionPicker_.Start(EnumerateCaptureWindows(), [this](bool ok, RECT r) {
-        if (ok) {
+    RECT last = settings_.HasRegion() ? settings_.region : RECT{};
+    regionPicker_.Start(EnumerateCaptureWindows(), last, settings_.countdown, [this](PickResult res, RECT r) {
+        // The toolbar's countdown is the setting in 설정 › 녹화.
+        bool save = regionPicker_.Countdown() != settings_.countdown;
+        settings_.countdown = regionPicker_.Countdown();
+        if (res != PickResult::Cancel) {
             settings_.region = r;
             settings_.source = kSourceRegion;
-            settings_.Save();
+            save = true;
             TakeRegionSnapshot();  // before our window comes back over it
+        }
+        if (save) settings_.Save();
+        if (res == PickResult::Record) {
+            RecTarget t;
+            std::wstring why;
+            if (CurrentTarget(t, &why)) {
+                StartRecording(t, false);  // Home stays hidden; the countdown starts over the area
+                return;
+            }
+            ShowMain(true);
+            Toast(why, true);
+            return;
         }
         ShowMain(true);
     });

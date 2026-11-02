@@ -100,22 +100,34 @@ private:
     bool active_ = false;
 };
 
+// How the picker ended: closed, the area kept for later (Home shows it), or the area to record now.
+enum class PickResult { Cancel, Save, Record };
+
 // Fullscreen drag-to-select for region recording. Clicking without dragging takes the window under the cursor
 // (or the whole monitor when there is none). The result always lies on a single monitor.
 class RegionPicker {
 public:
+    // Toolbar slots after the five ratios; the last three are the countdown menu, there only while it is open.
+    enum : int { kBarCountdown = 5, kBarCancel, kBarSave, kBarRecord, kBarMenu, kBarSlots = kBarMenu + 3 };
+    enum class TestView { Drag, Adjust, Last };
+
     void Init(HINSTANCE inst, ID2D1Factory1* factory);
-    void Start(std::vector<WinInfo> windows, std::function<void(bool ok, RECT area)> done);
-    void Cancel() { Finish(false, {}); }
+    // last: the area picked before. The picker opens on it, ready to record or adjust, if it still lies on one
+    // monitor. countdown: Settings::countdown, which the toolbar can change (Countdown() after `done`).
+    void Start(std::vector<WinInfo> windows, RECT last, int countdown, std::function<void(PickResult, RECT area)> done);
+    void Cancel() { Finish(PickResult::Cancel, {}); }
     bool Active() const { return active_; }
+    int Countdown() const { return countdown_; }
     // Tests drive the picker with posted mouse/key messages and read the result back.
     HWND Hwnd() const { return win_.Hwnd(); }
     bool Adjusting() const { return adjusting_; }
+    bool MenuOpen() const { return cdOpen_; }
     RECT AdjustedArea() const { return sel_; }
     RECT ToolbarButton(int i) const { return buttons_[i]; }
-    // Screenshot tests: paint a mid-drag state over `screen` (virtual-screen pixels) without a window, or with
-    // `adjust` the selection anchor..cursor being fine-tuned.
-    void PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, bool adjust = false);
+    // Screenshot tests: paint a mid-drag state over `screen` (virtual-screen pixels) without a window; with Adjust
+    // the selection anchor..cursor being fine-tuned; with Last that selection as the area picked before, with the
+    // countdown menu open.
+    void PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, TestView view = TestView::Drag);
     // Tests: redraws everything and counts the pixels that differ from what the partial redraws left.
     size_t StalePixels();
     void RedrawAll() {
@@ -134,19 +146,21 @@ private:
     // Where Paint puts things, in DIPs from the virtual screen's top-left.
     struct Layout {
         float scale = 1, vw = 0, vh = 0;
-        bool hole = false, adjust = false, lines = false;
+        bool hole = false, adjust = false, lines = false, menu = false;
         RECT area{};  // the hole, screen pixels
-        Rect r, label, bar, slots[7], pill;
+        Rect r, label, bar, menuBox, slots[kBarSlots], pill;
         float tw = 0, cx = 0, cy = 0;  // title width, cursor
         std::wstring title, dims, msg, hint;
     };
     static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT Handle(HWND, UINT, WPARAM, LPARAM);
     void OnMove(POINT screen);
-    void Finish(bool ok, RECT area);
+    void Finish(PickResult result, RECT area);
     // After the first drag (or click on a window) the area stays up to be moved, resized and given a ratio.
     void StartAdjust(RECT area);
     int HitTest(POINT pt) const;  // 0..7 handles clockwise from top-left, 8 inside, -1 outside
+    int HoverAt(POINT pt) const;  // the window candidate under pt, -1 = none
+    int SlotAt(POINT pt) const;   // the toolbar slot under pt, -1 = none
     void DragTo(POINT pt);
     void SetRatio(int index);
     RECT KeepOnMonitor(RECT r) const;
@@ -163,7 +177,7 @@ private:
     ID2D1Factory1* factory_ = nullptr;
     LayeredWindow win_;
     std::vector<WinInfo> cands_;
-    std::function<void(bool, RECT)> done_;
+    std::function<void(PickResult, RECT)> done_;
     RECT virt_{}, anchorMon_{};
     POINT cursor_{}, anchor_{};
     int hover_ = -1;
@@ -175,7 +189,10 @@ private:
     int op_ = -1;       // HitTest of the press being dragged, -1 = none
     POINT opStart_{};
     RECT opSel_{};
-    RECT buttons_[7]{};  // toolbar in screen pixels: five ratios, cancel, confirm
+    RECT buttons_[kBarSlots]{};  // toolbar in screen pixels (kBar*); empty where nothing is drawn
+    int countdown_ = 1;
+    bool cdOpen_ = false;        // the countdown menu over the toolbar
+    RECT lastArea_{};            // the area picked before, while the picker shows it
     float scale_ = 1;
     DWORD lastClick_ = 0;
     Layout last_;        // what is on screen
