@@ -1,5 +1,7 @@
 # OzMaker — 움짤 메이커
 
+[![Build](https://github.com/ejonghyuck/OzMaker/actions/workflows/build.yml/badge.svg)](https://github.com/ejonghyuck/OzMaker/actions/workflows/build.yml) [최신 버전 내려받기](https://github.com/ejonghyuck/OzMaker/releases/latest)
+
 게임·프로그램 화면을 녹화해서 GIF / WebP / AVIF 움짤이나 MP4 동영상으로 저장하는 가벼운 Windows 도구입니다.
 
 ## 사용법
