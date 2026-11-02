@@ -157,6 +157,7 @@ std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, dou
 }
 
 int App::RunSelfTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\selftest.log");
     int failures = 0;
@@ -230,6 +231,19 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"%s: %s %s, %d frames, %.2fs, %.0f ms %s", FormatName(fmt), r.ok ? L"ok" : L"FAIL",
                          util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds, (util::NowSeconds() - s) * 1000,
                          r.error.c_str()));
+        // The size guess against the real thing. MP4 is VBR (this test picture needs far less than the bitrate),
+        // so only 움짤 must be close.
+        {
+            std::atomic<bool> cancel{false};
+            s = util::NowSeconds();
+            uint64_t est = EstimateBytes(job, cancel);
+            double ratio = r.bytes ? est / (double)r.bytes : 0;
+            bool good = fmt == Format::Mp4 ? est > 0 : ratio > 0.6 && ratio < 1.6;
+            log(util::Format(L"%s estimate: %s %s vs %s (x%.2f), %.0f ms", FormatName(fmt), good ? L"ok" : L"FAIL",
+                             util::FormatBytes(est).c_str(), util::FormatBytes(r.bytes).c_str(), ratio,
+                             (util::NowSeconds() - s) * 1000));
+            if (!good) ++failures;
+        }
         if (!r.ok) ++failures;
     }
     // Cropped, scaled, rate-limited, sped-up GIF.
@@ -295,6 +309,36 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"GIF plays %d: %s loop block %d, file plays %.2fs (want %.2fs)", plays, good ? L"ok" : L"FAIL",
                          loops, cs / 100.0, wantSec));
         if (!good) ++failures;
+    }
+    // 용량 맞추기: a target well under the full-size GIF makes the fit step size/frame rate down; the export with
+    // what it picked must land under the target without shrinking far more than needed.
+    {
+        OpenEditor(MakeSyntheticClip(W, H, N, fps));
+        playing_ = false;
+        fmt_ = (int)Format::Gif;
+        settings_.scaleIdx = settings_.outFpsIdx = 0;
+        settings_.targetIdx = 1;
+        fitTargetForTest_ = 120'000;
+        double s = util::NowSeconds();
+        UpdateEstimate();  // starts the fit
+        while (fitting_ && util::NowSeconds() - s < 120) {
+            Sleep(10);
+            OnEstimate();  // no window to notify here: poll for the result
+        }
+        double fitMs = (util::NowSeconds() - s) * 1000;
+        ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[0]);
+        job.path = dir + L"\\selftest_fit.gif";
+        ExportResult r = ExportSync(ex, job);
+        bool good = !fitting_ && r.ok && r.bytes <= fitTargetForTest_ && r.bytes > fitTargetForTest_ / 4;
+        log(util::Format(L"fit 120 KB: %s %s (estimate %s), %dx%d %.0ffps, %zu candidates, %.0f ms", good ? L"ok" : L"FAIL",
+                         util::FormatBytes(r.bytes).c_str(), util::FormatBytes(estBytes_).c_str(), job.outW, job.outH,
+                         job.fpsLimit, fitKnobs_.size(), fitMs));
+        if (!good) ++failures;
+        fitTargetForTest_ = 0;
+        settings_.targetIdx = 0;
+        CloseEditor();
+        StopThumbnails();
+        clip_.reset();
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
@@ -400,7 +444,18 @@ int App::RunScreenshots(const std::wstring& dir) {
     inF_ = 12;
     outF_ = 100;
     playhead_ = 40;
+    {
+        // The estimate shows once it is ready; the screenshot doesn't wait for the worker.
+        std::atomic<bool> cancel{false};
+        estBytes_ = EstimateBytes(MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[fmt_]), cancel);
+        estKey_ = EstimateKey();
+        estValid_ = true;
+    }
     shot(L"editor.png", 96);
+    settings_.targetIdx = 3;  // 15MB: the fit is under way in this shot
+    shot(L"editor_target.png", 96);
+    settings_.targetIdx = 0;
+    fitting_ = false;
     cropMode_ = true;
     crop_ = {120, 60, 840, 465};
     hasResult_ = true;

@@ -8,6 +8,7 @@ struct ExportSize {
 };
 inline constexpr ExportSize kExportSizes[] = {{100, 0}, {75, 0}, {50, 0}, {33, 0}, {0, 640}, {0, 480}};
 inline constexpr int kLoopOptions[] = {0, 1, 3};  // times a 움짤 plays, 0 = forever
+inline constexpr int kTargetMB[] = {0, 5, 10, 15, 20};  // "용량 맞추기", 0 = off
 inline constexpr double kHoldLastMs = 1000;       // "끝에서 멈춤": the last frame stays this much longer
 // File name patterns offered in the settings; settings.ini may hold any other.
 inline constexpr const wchar_t* kNameTemplates[] = {L"OzMaker_{날짜}", L"{창 이름}_{날짜}", L"{날짜}"};
@@ -73,6 +74,7 @@ struct Settings {
     int outFpsIdx = 0;
     int speedIdx = 1;
     int loopIdx = 0;   // kLoopOptions
+    int targetIdx = 0;  // kTargetMB
     bool holdLast = false;
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 

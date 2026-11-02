@@ -1164,6 +1164,8 @@ void App::DrawExportPanel(Rect r) {
         outFps = outSec > 0 ? outFrames / outSec : 0;
         if (settings_.holdLast) outSec += kHoldLastMs / 1000.0;
     }
+    if (!busy) UpdateEstimate();
+    const uint64_t target = (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
 
     // Bottom: what will be written and the actions, always in view.
     Rect saveAs = in.CutBottom(36);
@@ -1210,6 +1212,28 @@ void App::DrawExportPanel(Rect r) {
     ui_.Text(in.CutTop(20), blurb, 11.5f, TextFaint);
     in.CutTop(8);
 
+    // 용량 맞추기: size, frame rate and quality (MP4: the bitrate) are picked to land under the size.
+    {
+        const bool missed = target && fitMissed_ && !fitting_;
+        label(L"용량 맞추기", !target ? L"" : fitting_ ? L"맞추는 중…" : missed ? L"" : L"맞춤");
+        if (ui_.Segmented(HashId("ex.target"), in.CutTop(32), {L"끔", L"5MB", L"10MB", L"15MB", L"20MB"},
+                          settings_.targetIdx)) {
+            changed = true;
+            fitContent_.clear();  // fit again even when nothing else changed
+            fitCorrection_ = 1;
+            if (!settings_.targetIdx) fitBitrate_ = 0;
+        }
+        if (int mb = kTargetMB[settings_.targetIdx]) {
+            const wchar_t* hint = missed     ? L"가장 작게 해도 넘습니다 · 구간을 줄여 보세요"
+                                  : mp4      ? L"비트레이트를 이 용량에 맞춥니다"
+                                  : mb == 20 ? L"크기·프레임·품질을 맞춤 · 디스코드 무료 한도"
+                                  : mb == 15 ? L"크기·프레임·품질을 맞춤 · X(트위터) GIF 한도"
+                                             : L"크기·프레임 레이트·품질을 이 용량에 맞춥니다";
+            ui_.Text(in.CutTop(20), hint, 11.5f, missed ? Warning : TextFaint);
+        }
+        in.CutTop(8);
+    }
+
     if (mp4) {
         // Codec and bitrate follow the video recording settings.
         Rect head = in.CutTop(20);
@@ -1233,17 +1257,17 @@ void App::DrawExportPanel(Rect r) {
             changed = true;
         }
     }
-    in.CutTop(10);
+    in.CutTop(8);
 
     label(L"크기", util::Format(L"%d × %d", ow, oh));
     changed |= ui_.Segmented(HashId("ex.scale"), in.CutTop(32), {L"100%", L"75%", L"50%", L"33%", L"640px", L"480px"},
                              settings_.scaleIdx);
-    in.CutTop(10);
+    in.CutTop(8);
 
     label(L"프레임 레이트", util::Format(L"%.0f fps", outFps));
     changed |= ui_.Segmented(HashId("ex.fps"), in.CutTop(32), {L"원본", L"30", L"25", L"20", L"15", L"10"},
                              settings_.outFpsIdx);
-    in.CutTop(10);
+    in.CutTop(8);
 
     label(L"재생 속도", {});
     int prevSpeed = settings_.speedIdx;
@@ -1256,7 +1280,7 @@ void App::DrawExportPanel(Rect r) {
         playhead_ = ph;
         SetPlaying(playing_);
     }
-    in.CutTop(10);
+    in.CutTop(8);
     if (!mp4) {
         Rect row = in.CutTop(32);
         ui_.Text(row, L"반복", 12.5f, TextDim);
@@ -1292,9 +1316,14 @@ void App::DrawExportPanel(Rect r) {
     if (!showResult) {
         std::wstring sum = mp4 ? util::Format(L"%d×%d · %.0ffps · %.1f초 · %s", ow, oh, outFps, outSec,
                                               ExportAudio() ? L"소리 포함" : L"소리 없음")
-                               : util::Format(L"%d×%d · %.0ffps · %.1f초 · %zu프레임", ow, oh, outFps, outSec,
-                                              outFrames);
-        ui_.Text(summary, sum, 12.f, TextFaint, Align(AlignCenter));
+                               : util::Format(L"%d×%d · %.0ffps · %.1f초", ow, oh, outFps, outSec);
+        // The estimate, once it matches what is on screen.
+        bool current = estValid_ && estKey_ == EstimateKey();
+        bool over = current && target && estBytes_ > target;
+        if (!busy && FormatAvailable(fmt))
+            sum += current ? L" · 약 " + util::FormatBytes(estBytes_) : std::wstring(L" · 크기 계산 중…");
+        ui_.Text(summary, sum, 12.f, over ? Warning : current ? TextDim : TextFaint, Align(AlignCenter));
+        if (!current && !busy) RequestWake(ui_.Now() + 0.25);
     }
 
     if (busy) {

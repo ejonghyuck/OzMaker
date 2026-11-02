@@ -32,6 +32,7 @@ private:
         WM_APP_QUIT,  // = WM_APP + 6, sent by --exit (main.cpp)
         WM_APP_FRAME,
         WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
+        WM_APP_ESTIMATE,
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
@@ -128,8 +129,14 @@ private:
     void Seek(size_t index);
     size_t PlayheadFromClock();
     int64_t RangeEndTs() const;
-    void OutputSize(int& w, int& h) const;
-    double EffectiveOutFps() const;
+    void OutputSize(int& w, int& h, int scaleIdx = -1) const;  // -1 = the current setting
+    double EffectiveOutFps(int outFpsIdx = -1) const;
+    ExportJob MakeJob(int scaleIdx, int outFpsIdx, int quality) const;  // without a path
+    std::wstring EstimateKey() const;  // everything the size of the export depends on
+    std::wstring ContentKey() const;   // what a size fit depends on (not the settings it picks)
+    void UpdateEstimate();
+    void StartFit();
+    void OnEstimate();
     bool ExportAudio() const;
     VideoConfig VideoSettings(int fps) const;
     std::wstring ExportName(Format f) const;
@@ -255,6 +262,22 @@ private:
     Rect filesBtn_;
     float filesScroll_ = 0;
     std::wstring pendingOpen_;
+
+    // Export size estimate and "용량 맞추기" (EstimateBytes on the estimator's thread).
+    struct FitKnobs {
+        int scaleIdx, outFpsIdx, quality;
+    };
+    Estimator estimator_;
+    uint32_t estSerial_ = 0, fitSerial_ = 0;
+    std::wstring estKey_, fitContent_;
+    double estDue_ = 0;
+    uint64_t estBytes_ = 0;
+    bool estValid_ = false, fitting_ = false, fitMissed_ = false;
+    std::vector<FitKnobs> fitKnobs_;
+    UINT32 fitBitrate_ = 0;     // MP4 under a target: the video bitrate that fits
+    double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
+    uint64_t exportEstimate_ = 0;
+    uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
 
     Exporter exporter_;
     ExportResult lastResult_;

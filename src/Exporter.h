@@ -37,6 +37,41 @@ std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, d
 // MP4: the source frame shown at each tick of a constant output rate.
 std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, double fps, double speed);
 
+// Size of an export without writing it: a few short stretches are encoded for real and scaled up to the whole
+// length (움짤), or bitrate × length (MP4). 0 when cancelled or on failure.
+uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel);
+
+// EstimateBytes on a worker thread over candidate jobs, best first. With a target it stops at the first that fits
+// (fitting an export into a size); without one it estimates the first only. A new request abandons the running one.
+class Estimator {
+public:
+    struct Result {
+        uint32_t serial = 0;
+        int chosen = -1;  // candidate index; the last one when none fit
+        uint64_t bytes = 0;
+        bool fits = false;
+    };
+    ~Estimator();
+    void Start(std::vector<ExportJob> candidates, uint64_t target, uint32_t serial, HWND notify, UINT msg);
+    bool Busy() const { return busy_; }
+    bool Take(Result& out);  // the finished result, once
+
+private:
+    void Run();
+
+    std::thread thread_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::vector<ExportJob> pending_;
+    uint64_t pendingTarget_ = 0;
+    uint32_t pendingSerial_ = 0;
+    bool hasPending_ = false, quit_ = false, ready_ = false;
+    std::atomic<bool> cancel_{false}, busy_{false};
+    Result result_;
+    HWND notify_ = nullptr;
+    UINT msg_ = 0;
+};
+
 class Exporter {
 public:
     ~Exporter();

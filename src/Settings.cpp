@@ -85,6 +85,7 @@ void Settings::Load() {
     speedIdx = ReadInt(ini, L"Speed", speedIdx, 0, _countof(kSpeedOptions) - 1);
     loopIdx = ReadInt(ini, L"LoopCount", ReadInt(ini, L"Loop", 1, 0, 1) ? 0 : 1, 0, _countof(kLoopOptions) - 1);
     holdLast = ReadInt(ini, L"HoldLast", holdLast, 0, 1) != 0;
+    targetIdx = ReadInt(ini, L"TargetSize", targetIdx, 0, _countof(kTargetMB) - 1);
 
     wchar_t buf[MAX_PATH * 2] = {};
     GetPrivateProfileStringW(L"OzMaker", L"Monitor", L"", buf, _countof(buf), ini.c_str());
@@ -152,6 +153,7 @@ void Settings::Save() const {
     num(L"Speed", speedIdx);
     num(L"LoopCount", loopIdx);
     num(L"HoldLast", holdLast);
+    num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);

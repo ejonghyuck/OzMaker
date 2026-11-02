@@ -49,6 +49,149 @@ std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, do
     return out;
 }
 
+// ---------------------------------------------------------------- size estimate
+
+uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
+    if (job.format == Format::Mp4) {
+        size_t n = PlanVideoFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed).size();
+        double sec = job.fpsLimit > 0 ? n / job.fpsLimit : 0;
+        double video = job.video.bitrate ? job.video.bitrate
+                                         : Mp4Writer::AutoBitrate(job.outW, job.outH, (int)std::lround(job.fpsLimit),
+                                                                  job.video.hevc);
+        double audio = job.audio.enabled ? job.audio.bitrate : 0;
+        return (uint64_t)((video + audio) * sec / 8 * 1.01) + 4096;  // + container
+    }
+    auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed);
+    const size_t n = plan.size();
+    if (n == 0 || !FormatAvailable(job.format)) return 0;
+    wchar_t dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    std::wstring path = util::Format(L"%sOzMaker_estimate_%u_%u.%s", dir, GetCurrentProcessId(), GetCurrentThreadId(),
+                                     FormatExt(job.format));
+    auto reader = job.clip->NewReader();
+    AreaResizer resizer;
+    std::vector<uint8_t> frame((size_t)job.outW * job.outH * 4);
+    int cx = job.crop.left, cy = job.crop.top;
+    int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
+    // Bytes of plan[a, b) as a file of its own.
+    auto encode = [&](size_t a, size_t b) -> uint64_t {
+        auto enc = CreateEncoder(job.format);
+        EncoderParams p;
+        p.width = job.outW;
+        p.height = job.outH;
+        p.quality = job.quality;
+        p.plays = job.plays;
+        p.path = path;
+        std::wstring err;
+        if (!enc || !enc->Begin(p, err)) return 0;
+        bool ok = true;
+        for (size_t k = a; k < b && ok; ++k) {
+            const uint8_t* px = cancel ? nullptr : reader->Get(plan[k].index);
+            if (!px) {
+                ok = false;
+                break;
+            }
+            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
+            ok = enc->Add(frame.data(), plan[k].durationMs, err);
+        }
+        ok = ok && enc->End(err);
+        enc.reset();
+        uint64_t size = ok ? util::FileSize(path) : 0;
+        DeleteFileW(path.c_str());
+        return size;
+    };
+    // Short exports are cheap enough to encode whole. Otherwise: the first frame (with the file header) plus the
+    // average cost of a following frame, from three stretches of consecutive frames (start, middle, end).
+    const size_t win = job.format == Format::Avif ? 3 : 6;
+    if (n <= win * 3) return encode(0, n);
+    const size_t starts[] = {0, n / 2 - win / 2, n - win};
+    uint64_t head = 0;
+    double perFrame = 0;
+    for (int w = 0; w < 3; ++w) {
+        uint64_t one = encode(starts[w], starts[w] + 1), all = one ? encode(starts[w], starts[w] + win) : 0;
+        if (!one || !all) return 0;
+        if (w == 0) head = one;
+        perFrame += (double)(all > one ? all - one : 0) / (win - 1) / 3;
+    }
+    return head + (uint64_t)(perFrame * (n - 1));
+}
+
+Estimator::~Estimator() {
+    {
+        std::lock_guard lk(mtx_);
+        quit_ = true;
+        cancel_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+}
+
+void Estimator::Start(std::vector<ExportJob> candidates, uint64_t target, uint32_t serial, HWND notify, UINT msg) {
+    std::lock_guard lk(mtx_);
+    pending_ = std::move(candidates);
+    pendingTarget_ = target;
+    pendingSerial_ = serial;
+    hasPending_ = true;
+    notify_ = notify;
+    msg_ = msg;
+    cancel_ = true;  // whatever runs now is out of date
+    busy_ = true;
+    if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
+    cv_.notify_all();
+}
+
+bool Estimator::Take(Result& out) {
+    std::lock_guard lk(mtx_);
+    if (!ready_) return false;
+    out = result_;
+    ready_ = false;
+    return true;
+}
+
+void Estimator::Run() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) {
+        std::vector<ExportJob> jobs;
+        uint64_t target;
+        Result res;
+        {
+            std::unique_lock lk(mtx_);
+            cv_.wait(lk, [&] { return quit_ || hasPending_; });
+            if (quit_) return;
+            jobs = std::move(pending_);
+            target = pendingTarget_;
+            res.serial = pendingSerial_;
+            hasPending_ = false;
+            cancel_ = false;
+        }
+        // Under a target, skip what can't fit judging by the last one measured (the size grows about with pixels ×
+        // frames); the last candidate is always measured.
+        double lastBytes = 0, lastWork = 0;
+        for (size_t i = 0; i < jobs.size() && !cancel_; ++i) {
+            const ExportJob& j = jobs[i];
+            double work = (double)j.outW * j.outH * PlanFrames(*j.clip, j.first, j.last, j.fpsLimit, j.speed).size();
+            if (target && lastWork > 0 && i + 1 < jobs.size() && lastBytes * work / lastWork > target * 1.6) continue;
+            uint64_t bytes = EstimateBytes(j, cancel_);
+            if (cancel_ || !bytes) break;
+            lastBytes = (double)bytes;
+            lastWork = work;
+            res.chosen = (int)i;
+            res.bytes = bytes;
+            res.fits = target == 0 || bytes <= target;
+            if (res.fits || target == 0) break;
+        }
+        jobs.clear();  // lets go of the clip
+        std::lock_guard lk(mtx_);
+        if (cancel_ || hasPending_) continue;  // superseded
+        result_ = res;
+        ready_ = true;
+        busy_ = false;
+        if (notify_) PostMessageW(notify_, msg_, 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------- export
+
 Exporter::~Exporter() {
     cancel_ = true;
     if (thread_.joinable()) thread_.join();

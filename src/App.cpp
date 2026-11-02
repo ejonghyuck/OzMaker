@@ -536,6 +536,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_EXPORT_DONE:
             OnExportDone();
             return 0;
+        case WM_APP_ESTIMATE:
+            OnEstimate();
+            return 0;
         case WM_APP_FRAME: {
             size_t idx = 0;
             if (clip_ && fetcher_.Take(framePx_, idx) &&
@@ -1103,6 +1106,11 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     cropDrag_ = -1;
     ResetCrop();
     hasResult_ = resultOriginal_ = false;
+    estKey_.clear();
+    fitContent_.clear();
+    estValid_ = fitting_ = fitMissed_ = false;
+    fitBitrate_ = 0;
+    fitCorrection_ = 1;
     // A video stays a video by default; a clip starts with the last 움짤 format.
     bool video = !clip_->SourcePath().empty();
     fmt_ = video && FormatAvailable(Format::Mp4) ? (int)Format::Mp4 : settings_.format;
@@ -1353,16 +1361,16 @@ void App::ApplyCropAspect() {
     crop_ = {x, y, x + w, y + h};
 }
 
-void App::OutputSize(int& w, int& h) const {
+void App::OutputSize(int& w, int& h, int scaleIdx) const {
     int cw = crop_.right - crop_.left, ch = crop_.bottom - crop_.top;
-    const ExportSize& o = kExportSizes[settings_.scaleIdx];
+    const ExportSize& o = kExportSizes[scaleIdx < 0 ? settings_.scaleIdx : scaleIdx];
     double s = o.width ? std::min(1.0, o.width / (double)std::max(1, cw)) : o.percent == 33 ? 1.0 / 3.0 : o.percent / 100.0;
     w = std::max(2, (int)std::lround(cw * s) & ~1);
     h = std::max(2, (int)std::lround(ch * s) & ~1);
 }
 
-double App::EffectiveOutFps() const {
-    double limit = kOutFpsOptions[settings_.outFpsIdx];
+double App::EffectiveOutFps(int outFpsIdx) const {
+    double limit = kOutFpsOptions[outFpsIdx < 0 ? settings_.outFpsIdx : outFpsIdx];
     if (fmt_ == (int)Format::Mp4) {
         // Constant rate: the chosen one, or the source's own rounded up to a usual rate (29.4 -> 30).
         if (limit > 0) return limit;
@@ -1447,27 +1455,11 @@ void App::StartExport(bool saveAs) {
         Toast(L"편집 중인 원본 파일에는 덮어쓸 수 없습니다. 다른 이름을 고르세요.", true);
         return;
     }
-    ExportJob job;
-    job.clip = clip_;
-    job.first = inF_;
-    job.last = outF_;
-    job.crop = crop_;
-    OutputSize(job.outW, job.outH);
-    job.fpsLimit = EffectiveOutFps();
-    job.speed = kSpeedOptions[settings_.speedIdx];
-    job.format = f;
-    job.plays = kLoopOptions[settings_.loopIdx];
-    job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
-    if (f == Format::Mp4) {
-        job.video = VideoSettings((int)std::lround(job.fpsLimit));
-        job.audio.enabled = ExportAudio();
-        job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
-    } else {
-        job.quality = settings_.quality[fmt_];
-    }
+    ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, f == Format::Mp4 ? 0 : settings_.quality[fmt_]);
     job.path = path;
     settings_.Save();
     hasResult_ = resultOriginal_ = false;
+    exportEstimate_ = estValid_ && estKey_ == EstimateKey() ? estBytes_ : 0;
     exporter_.Start(std::move(job), hwnd_, WM_APP_EXPORT_DONE);
     Invalidate();
 }
@@ -1485,6 +1477,199 @@ void App::OnExportDone() {
         DropHeld(clip_.get());  // exported: nothing to protect any more
         AddRecent(r.path);
         if (settings_.sounds) sound::Play(sound::Cue::Saved);
+        uint64_t target = (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
+        if (target && r.bytes > target) {
+            // The guess was low for this clip: learn by how much and fit again, smaller.
+            if (exportEstimate_) fitCorrection_ = std::clamp(fitCorrection_ * r.bytes / (double)exportEstimate_, 1.0, 4.0);
+            fitContent_.clear();
+            Toast(util::Format(L"목표 %dMB보다 커졌습니다(%s). 더 작게 다시 맞췄으니 한 번 더 저장하세요.",
+                               kTargetMB[settings_.targetIdx], util::FormatBytes(r.bytes).c_str()),
+                  true);
+        }
+    }
+    Invalidate();
+}
+
+ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
+    ExportJob job;
+    job.clip = clip_;
+    job.first = inF_;
+    job.last = outF_;
+    job.crop = crop_;
+    OutputSize(job.outW, job.outH, scaleIdx);
+    job.fpsLimit = EffectiveOutFps(outFpsIdx);
+    job.speed = kSpeedOptions[settings_.speedIdx];
+    job.format = (Format)fmt_;
+    job.plays = kLoopOptions[settings_.loopIdx];
+    job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
+    if (job.format == Format::Mp4) {
+        job.video = VideoSettings((int)std::lround(job.fpsLimit));
+        if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
+        job.audio.enabled = ExportAudio();
+        job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
+    } else {
+        job.quality = quality;
+    }
+    return job;
+}
+
+std::wstring App::ContentKey() const {
+    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top, crop_.right,
+                        crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx);
+}
+
+std::wstring App::EstimateKey() const {
+    return ContentKey() + util::Format(L" %d %d %d %d %d %d %d %u %d %d", settings_.scaleIdx, settings_.outFpsIdx,
+                                       fmt_ < 3 ? settings_.quality[fmt_] : 0, settings_.holdLast, ExportAudio(),
+                                       settings_.vCodec, settings_.vBitrateIdx, fitBitrate_, settings_.aBitrateIdx,
+                                       settings_.vFpsIdx);
+}
+
+// Called while the export panel is up: refits when what the fit depends on changed, else re-estimates (a moment
+// after the last change, so dragging a slider doesn't start one per frame).
+void App::UpdateEstimate() {
+    if (!clip_ || !FormatAvailable((Format)fmt_)) return;
+    double now = util::NowSeconds();
+    if (settings_.targetIdx && ContentKey() != fitContent_) {
+        StartFit();
+        return;
+    }
+    if (fitting_) return;
+    std::wstring key = EstimateKey();
+    if (key != estKey_) {
+        estKey_ = key;
+        estValid_ = false;
+        estDue_ = now + 0.35;
+    }
+    if (estDue_ > 0 && now >= estDue_) {
+        estDue_ = 0;
+        estimator_.Start({MakeJob(settings_.scaleIdx, settings_.outFpsIdx, fmt_ < 3 ? settings_.quality[fmt_] : 0)}, 0,
+                         ++estSerial_, hwnd_, WM_APP_ESTIMATE);
+    } else if (estDue_ > 0) {
+        RequestWake(estDue_);
+    }
+}
+
+// Picks size, frame rate and quality (움짤) or the bitrate (MP4) so the export lands under the target. Starts from
+// the best and steps the three down in turns, so none of them drops all the way first.
+void App::StartFit() {
+    fitContent_ = ContentKey();
+    fitMissed_ = false;
+    const uint64_t target = fitTargetForTest_ ? fitTargetForTest_ : (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
+    const Format f = (Format)fmt_;
+    // Sizes and frame rates that make a difference here, largest first.
+    std::vector<int> sizes, rates;
+    for (int i = 0; i < (int)_countof(kExportSizes); ++i) {
+        int w, h;
+        OutputSize(w, h, i);
+        bool dup = false;
+        for (int j : sizes) {
+            int w2, h2;
+            OutputSize(w2, h2, j);
+            dup |= w2 == w;
+        }
+        if (!dup) sizes.push_back(i);
+    }
+    std::stable_sort(sizes.begin(), sizes.end(), [&](int a, int b) {
+        int wa, ha, wb, hb;
+        OutputSize(wa, ha, a);
+        OutputSize(wb, hb, b);
+        return wa > wb;
+    });
+    // What each frame-rate choice really gives (a cap above the clip's own rate changes nothing).
+    const double speed = kSpeedOptions[settings_.speedIdx];
+    auto outRate = [&](int i) {
+        if (f == Format::Mp4) return EffectiveOutFps(i);
+        auto plan = PlanFrames(*clip_, inF_, outF_, EffectiveOutFps(i), speed);
+        double ms = 0;
+        for (auto& p : plan) ms += p.durationMs;
+        return ms > 0 ? plan.size() * 1000.0 / ms : 0.0;
+    };
+    std::vector<double> rateOf;
+    for (int i = 0; i < (int)_countof(kOutFpsOptions); ++i) rateOf.push_back(outRate(i));
+    for (int i = 0; i < (int)_countof(kOutFpsOptions); ++i) {
+        bool dup = false;
+        for (int j : rates) dup |= std::fabs(rateOf[j] - rateOf[i]) < 0.5;
+        if (!dup) rates.push_back(i);
+    }
+    std::stable_sort(rates.begin(), rates.end(), [&](int a, int b) { return rateOf[a] > rateOf[b]; });
+
+    if (f == Format::Mp4) {
+        // The bitrate decides the size; shrink the picture only when that bitrate would starve it.
+        fitting_ = false;
+        const double sec = std::max(0.1, PlanVideoFrames(*clip_, inF_, outF_, EffectiveOutFps(), speed).size() /
+                                             EffectiveOutFps());
+        double audio = ExportAudio() ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000.0 : 0;
+        double video = std::max(2e5, target * 8 * 0.9 / fitCorrection_ / sec - audio);
+        int pick = sizes.front();
+        for (int s : sizes) {
+            int w, h;
+            OutputSize(w, h, s);
+            pick = s;
+            if (video / ((double)w * h * EffectiveOutFps()) >= 0.03) break;  // bits per pixel still watchable
+        }
+        settings_.scaleIdx = pick;
+        fitBitrate_ = (UINT32)std::min(video, 80e6);
+        estBytes_ = EstimateBytes(MakeJob(pick, settings_.outFpsIdx, 0), std::atomic<bool>{false});
+        estValid_ = true;
+        estKey_ = EstimateKey();
+        fitMissed_ = video <= 2e5 + 1;
+        settingsDirty_ = true;
+        hasResult_ = false;
+        return;
+    }
+
+    std::vector<int> qualities = {settings_.quality[fmt_]};
+    if (f != Format::Gif)
+        for (int q : {70, 55, 40})
+            if (q < qualities.back()) qualities.push_back(q);
+    fitKnobs_.clear();
+    std::vector<ExportJob> jobs;
+    size_t si = 0, ri = 0, qi = 0;
+    auto add = [&] {
+        fitKnobs_.push_back({sizes[si], rates[ri], qualities[qi]});
+        jobs.push_back(MakeJob(sizes[si], rates[ri], qualities[qi]));
+    };
+    add();
+    // Frame rate, size, quality, frame rate, ... skipping whichever is already at its lowest.
+    for (int step = 0, idle = 0; idle < 3; step = (step + 1) % 3) {
+        bool moved = (step == 0 && ri + 1 < rates.size() && ++ri) || (step == 1 && si + 1 < sizes.size() && ++si) ||
+                     (step == 2 && qi + 1 < qualities.size() && ++qi);
+        if (moved) {
+            add();
+            idle = 0;
+        } else {
+            ++idle;
+        }
+    }
+    fitting_ = true;
+    estValid_ = false;
+    estDue_ = 0;
+    // Aim a little under: the estimate is a guess.
+    estimator_.Start(std::move(jobs), (uint64_t)(target * 0.9 / fitCorrection_), fitSerial_ = ++estSerial_, hwnd_,
+                     WM_APP_ESTIMATE);
+}
+
+void App::OnEstimate() {
+    Estimator::Result r;
+    if (!estimator_.Take(r)) return;
+    if (r.serial == fitSerial_ && fitting_) {
+        fitting_ = false;
+        if (r.chosen >= 0 && r.chosen < (int)fitKnobs_.size()) {
+            const FitKnobs& k = fitKnobs_[r.chosen];
+            settings_.scaleIdx = k.scaleIdx;
+            settings_.outFpsIdx = k.outFpsIdx;
+            if (fmt_ < 3) settings_.quality[fmt_] = k.quality;
+            fitMissed_ = !r.fits;
+            settingsDirty_ = true;
+            hasResult_ = false;
+        }
+        estBytes_ = (uint64_t)(r.bytes * fitCorrection_);
+        estValid_ = r.chosen >= 0;
+        estKey_ = EstimateKey();
+    } else if (r.serial == estSerial_) {
+        estBytes_ = (uint64_t)(r.bytes * fitCorrection_);
+        estValid_ = r.chosen >= 0;
     }
     Invalidate();
 }
