@@ -149,6 +149,8 @@ private:
     void ShowFrame(size_t index);
     void UploadFrame(const uint8_t* px);
     void SyncAudioPreview();
+    void TogglePreviewMute();
+    void SetPreviewVolume(int v);
     void SetPlaying(bool play);
     void Seek(size_t index);
     size_t PlayheadFromClock();

@@ -89,6 +89,7 @@ struct Settings {
     int outFpsIdx = 0;
     int speedIdx = 1;
     int loopIdx = 0;   // kLoopOptions
+    int previewVolume = 100;  // %, 0-100: the editor's sound preview, not the saved file
     int targetIdx = 0;  // kTargetMB
     bool holdLast = false;
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}

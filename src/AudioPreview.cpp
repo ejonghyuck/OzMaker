@@ -15,6 +15,15 @@ void AudioPreview::Stop() {
     if (thread_.joinable()) thread_.join();
 }
 
+void AudioPreview::Scale(int16_t* s, size_t frames, float from, float to) {
+    if (from >= 1.f && to >= 1.f) return;
+    for (size_t i = 0; i < frames; ++i) {
+        float g = from + (to - from) * (float)i / (float)frames;
+        s[2 * i] = (int16_t)std::lround(s[2 * i] * g);
+        s[2 * i + 1] = (int16_t)std::lround(s[2 * i + 1] * g);
+    }
+}
+
 void AudioPreview::Run(std::shared_ptr<const VideoClip> clip, int64_t from, int64_t to, double requested) {
     VideoClip::AudioReader reader;
     if (!reader.Open(*clip, from)) return;
@@ -46,11 +55,15 @@ void AudioPreview::Run(std::shared_ptr<const VideoClip> clip, int64_t from, int6
     std::vector<int16_t> data[kBufs];
     WAVEHDR hdr[kBufs]{};
     bool queued[kBufs]{};
+    float applied = gain_;
     auto fill = [&](int i) {
         if (left <= 0 || stop_) return false;
         size_t n = (size_t)std::min<int64_t>((int64_t)chunk, left);
         data[i].resize(n * 2);
         reader.Read(data[i].data(), n);
+        float g = gain_;
+        Scale(data[i].data(), n, applied, g);
+        applied = g;
         left -= (int64_t)n;
         hdr[i] = {};
         hdr[i].lpData = reinterpret_cast<LPSTR>(data[i].data());

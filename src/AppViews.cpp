@@ -1112,11 +1112,23 @@ void App::DrawTransport(Rect r) {
     if (clip_->HasAudio()) {
         Rect volR = r.CutLeft(34);
         bool slow = kSpeedOptions[settings_.speedIdx] != 1.0;
+        const int vol = previewMute_ ? 0 : settings_.previewVolume;
         const wchar_t* tip = slow ? L"재생 속도가 1×일 때만 소리가 나옵니다"
-                             : previewMute_ ? L"미리보기 소리 켜기" : L"미리보기 소리 끄기";
+                             : vol == 0 ? L"미리보기 소리 켜기" : L"미리보기 소리 끄기";
         if (ui_.IconButton(HashId("tr.mute"), Rect::Centered(volR.CX(), volR.CY(), 34, 34),
-                           previewMute_ || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
-            previewMute_ = !previewMute_;
+                           vol == 0 || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
+            TogglePreviewMute();
+        // The volume (#36). Crop mode pauses the preview and needs the room.
+        if (!cropMode_) {
+            Rect volS = r.CutLeft(78);
+            Rect track(volS.l + 8, volS.t + 8, volS.r - 8, volS.b - 8);
+            UiId id = HashId("tr.vol");
+            float v = (float)vol;
+            if (ui_.Slider(id, track, v, 0.f, 100.f)) SetPreviewVolume((int)std::lround(v / 5) * 5);
+            if (ui_.In().wheel != 0 && ui_.Hover(Rect(volR.l, volS.t, volS.r, volS.b)))
+                SetPreviewVolume(vol + (ui_.In().wheel > 0 ? 5 : -5));
+            ui_.Tooltip(id, track, util::Format(L"미리보기 음량 %d%% · 휠로도 조절", vol));
+        }
     }
     r.CutLeft(10);
     std::wstring time = util::FormatClock(clip_->Ts(playhead_) / 1e7, true) + L"  /  " +

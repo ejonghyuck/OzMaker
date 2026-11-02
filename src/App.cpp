@@ -1626,18 +1626,42 @@ void App::UploadFrame(const uint8_t* px) {
 // A video's sound follows the preview: only while it plays at 1x in the editor and OzMaker is in front.
 void App::SyncAudioPreview() {
     auto video = std::dynamic_pointer_cast<const VideoClip>(clip_);
-    bool want = video && video->HasAudio() && !previewMute_ && playing_ && !scrubbing_ && screen_ == Screen::Editor &&
-                kSpeedOptions[settings_.speedIdx] == 1.0 && hwnd_ && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) &&
-                GetForegroundWindow() == hwnd_;
+    bool want = video && video->HasAudio() && !previewMute_ && settings_.previewVolume > 0 && playing_ &&
+                !scrubbing_ && screen_ == Screen::Editor && kSpeedOptions[settings_.speedIdx] == 1.0 && hwnd_ &&
+                IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && GetForegroundWindow() == hwnd_;
     if (!want) {
         audioPreview_.Stop();
         return;
     }
+    float v = settings_.previewVolume / 100.f;
+    audioPreview_.SetGain(v * v);  // squared, so the steps sound about even
     if (audioPreview_.Active() && audioEpoch_ == playEpoch_) return;
     audioEpoch_ = playEpoch_;
     int64_t start = clip_->Ts(inF_), end = RangeEndTs();
     int64_t t = playTs_ + (int64_t)((util::NowSeconds() - playWall_) * 1e7);
     audioPreview_.Start(video, std::clamp(t, start, end - 1), end);
+}
+
+// The speaker button. A volume dragged down to 0 comes back at 50 %.
+void App::TogglePreviewMute() {
+    if (!previewMute_ && settings_.previewVolume > 0) {
+        previewMute_ = true;
+        return;
+    }
+    previewMute_ = false;
+    if (settings_.previewVolume == 0) {
+        settings_.previewVolume = 50;
+        settingsDirty_ = true;
+    }
+}
+
+// The volume slider and the wheel over it; moving it turns the sound back on.
+void App::SetPreviewVolume(int v) {
+    v = std::clamp(v, 0, 100);
+    previewMute_ = false;
+    if (v == settings_.previewVolume) return;
+    settings_.previewVolume = v;
+    settingsDirty_ = true;
 }
 
 int64_t App::RangeEndTs() const {

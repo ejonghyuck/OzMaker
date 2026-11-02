@@ -632,6 +632,23 @@ int App::RunSelfTest(const std::wstring& dir) {
         mix.Input(1)(low.data(), 1);
         mcheck(out.size() == 4 && out[0] == 32767 && out[2] == -32768, L"loud sums clip");
     }
+    // The editor's preview volume (#36): the samples scale by the gain, ramped from the one before.
+    {
+        auto vcheck = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"preview volume: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        std::vector<int16_t> s{1000, -1000, 32767, -32768};
+        AudioPreview::Scale(s.data(), 2, 0.25f, 0.25f);
+        vcheck(s[0] == 250 && s[1] == -250 && s[2] == 8192 && s[3] == -8192, L"scales both channels");
+        std::vector<int16_t> ramp(8, 1000);
+        AudioPreview::Scale(ramp.data(), 4, 1.f, 0.f);
+        vcheck(ramp[0] == 1000 && ramp[1] == 1000 && ramp[2] == 750 && ramp[4] == 500 && ramp[7] == 250,
+               L"ramps from the last gain");
+        std::vector<int16_t> full{1234, -1234};
+        AudioPreview::Scale(full.data(), 1, 1.f, 1.f);
+        vcheck(full[0] == 1234 && full[1] == -1234, L"100 % leaves the samples alone");
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -1709,6 +1726,7 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
             });
         }
     };
+    settings_.previewVolume = 60;
     shot(L"editor_video.png");
     hasResult_ = resultOriginal_ = true;
     lastResult_ = {};
@@ -1720,6 +1738,7 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     hasResult_ = false;
     shot(L"editor_video_fast.png");
     settings_.speedIdx = 1;
+    settings_.previewVolume = 100;
     CloseEditor();
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
@@ -1975,6 +1994,24 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
           util::Format(L"plays through the fetcher: frame %zu -> %zu, foreground %d, sound preview %d", first, shown_,
                        fg, audioPreview_.Active()));
     if (fg) check(audioPreview_.Active(), L"sound preview runs while playing in front");
+    // The volume (#36): 0 stops the sound like mute, and the speaker button brings it back at 50 %.
+    settings_.previewVolume = 0;
+    SyncAudioPreview();
+    check(!audioPreview_.Active(), L"volume 0 stops the sound preview");
+    TogglePreviewMute();
+    SyncAudioPreview();
+    check(!previewMute_ && settings_.previewVolume == 50 && (!fg || audioPreview_.Active()),
+          util::Format(L"the speaker button turns a volume of 0 back on (%d%%)", settings_.previewVolume));
+    TogglePreviewMute();
+    SyncAudioPreview();
+    check(previewMute_ && settings_.previewVolume == 50 && !audioPreview_.Active(),
+          L"the speaker button mutes and keeps the volume");
+    SetPreviewVolume(70);
+    SyncAudioPreview();
+    check(!previewMute_ && settings_.previewVolume == 70 && (!fg || audioPreview_.Active()),
+          L"moving the volume turns the sound back on");
+    SetPreviewVolume(140);
+    check(settings_.previewVolume == 100, L"the volume stops at 100 %");
 
     key(VK_SPACE);
     check(!playing_ && !audioPreview_.Active(), L"space pauses (sound stops)");
