@@ -1,7 +1,7 @@
 // Headless test entry points (command line):
 //   --selftest <dir>                      synthetic clip -> frame store round trip -> every available encoder
 //   --screenshot <dir>                    renders each screen to PNG for visual review
-//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause]
+//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause] [mic] [click]
 //                                         records a real window (or its monitor / its area) and exports it
 //   --analyze <file.mp4> <dir> [freq ...] decodes an MP4: timing, size, test-tone levels
 //   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export
@@ -1061,6 +1061,9 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     bool software = mp4 && a[7].find(L"sw") != std::wstring::npos;
     bool audio = a.size() > 8 && a[8] == L"audio";
     bool pause = a.size() > 9 && a[9] == L"pause";  // paused for the middle third: the result is a third shorter
+    // click (anywhere after the mode): a made-up click at the window's centre a quarter of the way in, then the
+    // frames are checked for its highlight. Never a real click: that would land on whatever is on screen.
+    bool click = std::find(a.begin() + std::min<size_t>(a.size(), 8), a.end(), L"click") != a.end();
     CaptureOptions o;
     o.target = target;
     o.fps = a.size() > 4 ? _wtoi(a[4].c_str()) : 30;
@@ -1106,6 +1109,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
                          AudioCapture::ProcessLoopbackSupported(), v.audioPid,
                          v.processAudio ? L"window only" : L"system"));
     }
+    o.clickFx = click;
     std::wstring err;
     double t0 = util::NowSeconds();
     if (!capture_.Start(o, nullptr, 0, err)) {
@@ -1113,13 +1117,20 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         return 1;
     }
     log(util::Format(L"start took %.0f ms", (util::NowSeconds() - t0) * 1000));
-    double begin = util::NowSeconds(), end = begin + seconds;
+    double begin = util::NowSeconds(), end = begin + seconds, clickAt = -1;
     int phase = 0;
     while (util::NowSeconds() < end) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
         MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, 0);
         double t = util::NowSeconds() - begin;
+        if (click && clickAt < 0 && t >= seconds / 4) {
+            RECT f{};
+            GetVisibleFrame(target, f);
+            capture_.InjectClick({(f.left + f.right) / 2, (f.top + f.bottom) / 2}, 1'500'000);
+            clickAt = t;
+            log(util::Format(L"click at %.2fs", t));
+        }
         if (pause && phase == 0 && t >= seconds / 3) {
             capture_.SetPaused(true);
             log(util::Format(L"paused at %.2fs (recorded %.2fs)", t, capture_.Elapsed()));
@@ -1132,9 +1143,47 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     }
     if (pause) log(util::Format(L"recorded %.2fs of %.2fs", capture_.Elapsed(), seconds));
     log(util::Format(L"stopping after %zu frames (%zu scaled on the GPU)", capture_.Frames(), capture_.Scaled()));
+    if (click) log(util::Format(L"%zu frames added for the click highlight", capture_.ClickFrames()));
     t0 = util::NowSeconds();
     CaptureResult res = capture_.Stop();
     log(util::Format(L"stop took %.0f ms", (util::NowSeconds() - t0) * 1000));
+    // The highlight around the middle of the frame (the window's centre): amber while the ripple plays, gone
+    // before and after it.
+    auto clickCheck = [&](const Clip& c) {
+        auto rd = c.NewReader();
+        const int w = c.Width(), h = c.Height();
+        int during = 0, duringN = 0, outside = 0;
+        size_t best = 0;
+        int bestN = 0;
+        for (size_t i = 0; i < c.Count(); ++i) {
+            const uint8_t* px = rd->Get(i);
+            if (!px) continue;
+            int n = 0;
+            for (int y = std::max(0, h / 2 - 70); y < std::min(h, h / 2 + 70); y += 2)
+                for (int x = std::max(0, w / 2 - 70); x < std::min(w, w / 2 + 70); x += 2) {
+                    const uint8_t* p = px + ((size_t)y * w + x) * 4;
+                    if (p[2] - p[0] > 60 && p[1] - p[0] > 25 && p[2] >= p[1]) ++n;  // amber, also half blended
+                }
+            double t = c.Ts(i) / 1e7;
+            if (t > clickAt + 0.08 && t < clickAt + 0.35) {
+                ++duringN;
+                during += n > 20;
+            } else if (t < clickAt - 0.2 || t > clickAt + 0.9) {
+                outside += n > 20;
+            }
+            if (n > bestN) {
+                bestN = n;
+                best = i;
+            }
+        }
+        bool ok = duringN > 0 && during == duringN && outside == 0;
+        log(util::Format(L"%s click highlight: %d of %d frames in the ripple show it, %d frames outside it do",
+                         ok ? L"ok  " : L"FAIL", during, duringN, outside));
+        if (mode != L"monitor" && bestN > 0) {
+            if (const uint8_t* px = rd->Get(best)) SavePng(gfx_.Wic(), dir + L"\\click.png", px, w, h);
+        }
+        return ok;
+    };
     if (res.video) {
         log(util::Format(L"mp4 %s: %s, %.2fs, encoder %s (hw %d), audio %d %s %s", res.ok ? L"ok" : L"FAIL",
                          util::FormatBytes(res.bytes).c_str(), res.seconds, res.encoder.c_str(), res.hardware, res.audio,
@@ -1142,6 +1191,11 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         if (!res.ok) return 2;
         // Never keep pictures of a whole monitor (it may show unrelated windows).
         AnalyzeMp4(log, gfx_.Wic(), res.path, {440, 880}, mode == L"monitor" ? L"" : dir + L"\\mp4");
+        if (click) {
+            std::wstring verr;
+            auto vc = VideoClip::Open(res.path, verr);
+            if (!vc || !clickCheck(*vc)) return 2;
+        }
         return 0;
     }
     auto clip = res.clip;
@@ -1159,6 +1213,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     }
     Exporter ex;
     int failures = 0;
+    if (click && !clickCheck(*clip)) ++failures;
     for (int f = 0; f < (int)Format::Count; ++f) {
         if (!FormatAvailable((Format)f)) continue;
         ExportJob job;

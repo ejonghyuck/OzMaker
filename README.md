@@ -19,6 +19,8 @@
 
 설정 › 녹화의 **최대 녹화 길이**(끔 · 10분 · 30분 · 1시간)가 되면 녹화를 저장하고 멈춥니다. 저장할 드라이브에 남은 공간이 1GB보다 적으면 녹화를 시작할 때 알리고, 녹화 중 300MB까지 줄면 그때까지를 저장하고 멈춥니다.
 
+설정 › 녹화의 **클릭 강조**(기본 끔)를 켜면 마우스를 누른 곳에 퍼지는 원(왼쪽 버튼 노랑, 오른쪽 파랑)과 누르고 있는 동안 커서를 따라가는 점이 함께 녹화됩니다. 움짤 녹화는 화면이 그대로여도 원이 퍼지는 동안 프레임을 더 넣습니다. OzMaker 자신의 창(녹화 중 표시)을 누른 것은 표시하지 않습니다.
+
 ### 움짤 내보내기 옵션
 
 - **크기**: 100% · 75% · 50% · 33% 또는 너비 640px · 480px(원본보다 키우지 않음).
@@ -125,8 +127,9 @@ Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. �
 ```bash
 OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + 모든 인코더 검사
 OzMaker.exe --screenshot <dir>        # 각 화면을 PNG로 렌더링(창 미리보기 자리는 파란색), 레이어 오류가 있으면 실패
-OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute] [pause] [mic]
+OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute] [pause] [mic] [click]
                                       # mic: 기본 마이크를 섞어 녹음(방 소리가 녹음되므로 직접 실행할 때만)
+                                      # click: 가짜 클릭 하나를 넣고 프레임에 클릭 강조가 보이는지 확인
 OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간격·테스트 톤 크기 측정
 OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계) 검사
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장

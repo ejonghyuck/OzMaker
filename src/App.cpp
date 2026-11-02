@@ -1015,6 +1015,7 @@ void App::BeginCapture() {
     o.region = recTarget_.rect;
     o.clientOnly = settings_.clientOnly;
     o.cursor = settings_.cursor;
+    o.clickFx = settings_.clickFx;
     recNotice_.clear();
     if (recVideo_) {
         VideoOptions v;

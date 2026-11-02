@@ -1680,6 +1680,11 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                    changed |= ui_.Segmented(HashId("set.overlay"), c, {L"항상", L"전체화면 제외", L"숨김"},
                                             settings_.overlayMode);
                });
+
+    SettingRow(area, L"클릭 강조", L"마우스를 누른 곳에 퍼지는 원을 함께 녹화합니다 · 왼쪽 버튼 노랑, 오른쪽 파랑", 60,
+               [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.clickfx"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.clickFx);
+               });
 }
 
 void App::SettingsVideo(Rect& area, bool& changed) {

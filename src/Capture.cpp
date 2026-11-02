@@ -21,6 +21,16 @@ struct DeviceLock {
         if (mt) mt->Leave();
     }
 };
+
+constexpr int64_t kRipple = 5'000'000;  // a click's ripple lasts 0.5 s
+
+// Our own windows (the recording pill): clicks on them aren't highlighted.
+bool OwnWindowAt(POINT pt) {
+    HWND h = WindowFromPoint(pt);
+    DWORD pid = 0;
+    if (h) GetWindowThreadProcessId(h, &pid);
+    return pid == GetCurrentProcessId();
+}
 }  // namespace
 
 Capture::~Capture() {
@@ -54,7 +64,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
                                    levels, _countof(levels), D3D11_SDK_VERSION, &dev_, nullptr, &ctx_);
         winrt::check_hresult(hr);
         ctx_.As(&ctx1_);
-        if (video && SUCCEEDED(ctx_.As(&mt_))) mt_->SetMultithreadProtected(TRUE);
+        if ((video || opt.clickFx) && SUCCEEDED(ctx_.As(&mt_))) mt_->SetMultithreadProtected(TRUE);
         ComPtr<IDXGIDevice> dxgi;
         winrt::check_hresult(dev_.As(&dxgi));
         winrt::com_ptr<::IInspectable> insp;
@@ -112,6 +122,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         // scaled, once per tick) and samples them at a fixed rate.
         interval_ = 10'000'000 / std::max(1, opt.fps) / (video ? 2 : 1);
         firstTs_ = -1;
+        lastTs_ = 0;
         frames_ = 0;
         scaled_ = 0;
         finishDue_ = false;
@@ -154,6 +165,19 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             resumed_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);
             ticker_ = std::thread([this] { TickLoop(); });
         }
+        if (opt.clickFx) {
+            HMONITOR mon = opt.source == CaptureSource::Window ? MonitorFromWindow(opt.target, MONITOR_DEFAULTTONEAREST)
+                                                               : opt.monitor;
+            UINT dx = 96, dy = 96;
+            if (!mon || FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy))) dx = 96;
+            dpiScale_ = dx / 96.f;
+            clicks_.clear();
+            fxShown_ = false;
+            clickFrames_ = 0;
+            fxFailed_ = false;
+            clickStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            clickThread_ = std::thread([this] { ClickLoop(); });
+        }
         session_.StartCapture();
     } catch (winrt::hresult_error const& e) {
         running_ = false;
@@ -169,6 +193,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             }
         audio_.Stop(0);
         mic_.Stop(0);
+        StopClicks();
         writer_.reset();
         ReleaseGpu();
         return false;
@@ -327,7 +352,8 @@ void Capture::Fail(std::wstring msg) {
     if (notify_) PostMessageW(notify_, closedMsg_, 1, 0);
 }
 
-void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered) {
+void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered,
+                      int64_t qpc, bool emit) {
     int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
     if (!setupDone_) {
         if (setupFailed_) return;
@@ -353,7 +379,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     if (same) {
         // Same size (an odd edge is trimmed by one pixel): plain copy, no resampling.
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)(sr.left + outW_), (UINT)(sr.top + outH_), 1};
-        ctx_->CopySubresourceRegion(video || mask ? out_.Get() : staging, 0, 0, 0, 0, tex, 0, &box);
+        ctx_->CopySubresourceRegion(video || mask || opt_.clickFx ? out_.Get() : staging, 0, 0, 0, 0, tex, 0, &box);
     } else {
         float f = std::min((float)outW_ / sw, (float)outH_ / sh);
         int dw = std::clamp((int)std::lround(sw * f), 1, outW_);
@@ -393,6 +419,8 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         finish_.dh = dh;
         finish_.lod = lod;
     }
+    if (opt_.clickFx)
+        clickMap_ = {(float)(texOrigin_.x + sr.left), (float)(texOrigin_.y + sr.top), fx, fy, (float)dx, (float)dy};
     finish_.mask.clear();
     if (mask) {
         for (const RECT& c : covered) {
@@ -411,11 +439,17 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         return;
     }
     FinishFrame();
-    if (!video && (!same || mask)) ctx_->CopyResource(staging, out_.Get());
     if (video) {
         SetEvent(firstFrame_);
         return;
     }
+    if (!emit) return;
+    ID3D11Texture2D* from = out_.Get();
+    if (opt_.clickFx) {
+        fxShown_ = DrawClicks(qpc);
+        if (fxShown_) from = fx_.Get();
+    }
+    if (!same || mask || opt_.clickFx) ctx_->CopyResource(staging, from);
     pending_.push_back({ring_, ts});
     ring_ = (ring_ + 1) % kRing;
     // Read back with one frame of latency so Map() doesn't stall on the copy just issued.
@@ -456,6 +490,161 @@ void Capture::FinishFrame() {
         const float black[4] = {0, 0, 0, 1};
         ctx1_->ClearView(outRtv_.Get(), black, f.mask.data(), (UINT)f.mask.size());
     }
+}
+
+// ---------------------------------------------------------------- click highlight
+
+void Capture::InjectClick(POINT at, int64_t hold) {
+    std::lock_guard lk(clickMtx_);
+    int64_t now = util::Qpc100ns();
+    clicks_.push_back({now, now + hold, at, false});
+}
+
+void Capture::StopClicks() {
+    if (!clickThread_.joinable()) return;
+    SetEvent(clickStop_);
+    clickThread_.join();
+    CloseHandle(clickStop_);
+    clickStop_ = nullptr;
+}
+
+POINT Capture::TextureOrigin(int cw, int ch) const {
+    if (opt_.source != CaptureSource::Window || opt_.monitorMode) return {monitorRect_.left, monitorRect_.top};
+    // Window frames come at the window's visible bounds (else its full rectangle).
+    RECT efb{};
+    WINDOWINFO wi{sizeof(wi)};
+    bool haveEfb = GetVisibleFrame(opt_.target, efb);
+    if (haveEfb && efb.right - efb.left == cw && efb.bottom - efb.top == ch) return {efb.left, efb.top};
+    if (GetWindowInfo(opt_.target, &wi) && wi.rcWindow.right - wi.rcWindow.left == cw) return {wi.rcWindow.left, wi.rcWindow.top};
+    return {efb.left, efb.top};
+}
+
+void Capture::ClickLoop() {
+    const bool swap = GetSystemMetrics(SM_SWAPBUTTON) != 0;  // left-handed: the physical buttons are swapped
+    bool was[2] = {};
+    while (WaitForSingleObject(clickStop_, 8) == WAIT_TIMEOUT) {
+        const int64_t now = util::Qpc100ns();
+        POINT pt{};
+        GetCursorPos(&pt);
+        {
+            std::lock_guard lk(clickMtx_);
+            cursorPos_ = pt;
+            for (int b = 0; b < 2; ++b) {
+                bool down = (GetAsyncKeyState((b == 0) != swap ? VK_LBUTTON : VK_RBUTTON) & 0x8000) != 0;
+                if (down && !was[b] && !pausedAt_ && !OwnWindowAt(pt)) clicks_.push_back({now, 0, pt, b == 1});
+                if (!down && was[b])
+                    for (auto it = clicks_.rbegin(); it != clicks_.rend(); ++it)
+                        if (it->right == (b == 1) && !it->up) {
+                            it->up = now;
+                            break;
+                        }
+                was[b] = down;
+            }
+            // Kept a second past the end: the video ticker may draw a little behind.
+            while (!clicks_.empty() && clicks_.front().up &&
+                   now - std::max(clicks_.front().down + kRipple, clicks_.front().up) > 10'000'000)
+                clicks_.pop_front();
+        }
+        if (!opt_.video && (fxShown_ || ClicksShow(now))) {
+            std::lock_guard lk(mtx_);
+            EmitClickFrame(now);
+        }
+    }
+}
+
+bool Capture::ClicksShow(int64_t qpc) {
+    std::lock_guard lk(clickMtx_);
+    for (const Click& c : clicks_)
+        if (qpc >= c.down && (qpc - c.down < kRipple || !c.up || qpc < c.up)) return true;
+    return false;
+}
+
+void Capture::EmitClickFrame(int64_t qpc) {
+    if (!running_ || !setupDone_ || firstTs_ < 0 || pausedAt_) return;
+    int64_t ts = qpc - pausedTotal_;
+    if (ts + interval_ / 4 < nextDue_) return;  // a frame went out a moment ago
+    DeviceLock lock(mt_.Get());
+    bool fx = DrawClicks(qpc);
+    if (!fx && !fxShown_) return;
+    fxShown_ = fx;  // after the last frame with a highlight, one without
+    nextDue_ = ts + interval_;
+    int64_t rel = std::max(ts - firstTs_, lastTs_ + 1);
+    ctx_->CopyResource(staging_[ring_].Get(), fx ? fx_.Get() : out_.Get());
+    pending_.push_back({ring_, rel});
+    ring_ = (ring_ + 1) % kRing;
+    while ((int)pending_.size() >= kRing - 1) DrainOne();
+    lastTs_ = rel;
+    lastArrivalQpc_ = ts;
+    ++clickFrames_;
+}
+
+bool Capture::DrawClicks(int64_t qpc) {
+    if (fxFailed_ || !out_) return false;
+    std::vector<Click> show;
+    POINT cur;
+    {
+        std::lock_guard lk(clickMtx_);
+        cur = cursorPos_;
+        for (const Click& c : clicks_)
+            if (qpc >= c.down && (qpc - c.down < kRipple || !c.up || qpc < c.up)) show.push_back(c);
+    }
+    if (show.empty()) return false;
+    if (!fx_) {
+        D3D11_TEXTURE2D_DESC td;
+        out_->GetDesc(&td);
+        ComPtr<IDXGIDevice> dxgi;
+        ComPtr<IDXGISurface> surf;
+        D2D1_FACTORY_OPTIONS fo{};
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        bool ok = SUCCEEDED(dev_->CreateTexture2D(&td, nullptr, &fx_)) && SUCCEEDED(fx_.As(&surf)) &&
+                  SUCCEEDED(dev_.As(&dxgi)) &&
+                  SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory1), &fo,
+                                              reinterpret_cast<void**>(d2d_.GetAddressOf()))) &&
+                  SUCCEEDED(d2d_->CreateDevice(dxgi.Get(), &d2dDev_)) &&
+                  SUCCEEDED(d2dDev_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2dCtx_)) &&
+                  SUCCEEDED(d2dCtx_->CreateBitmapFromDxgiSurface(surf.Get(), &bp, &fxTarget_)) &&
+                  SUCCEEDED(d2dCtx_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), &fxBrush_));
+        if (!ok) {
+            fxFailed_ = true;  // records on without highlights
+            fx_.Reset();
+            return false;
+        }
+        d2dCtx_->SetTarget(fxTarget_.Get());
+    }
+    ctx_->CopyResource(fx_.Get(), out_.Get());
+    const ClickMap& m = clickMap_;
+    const float k = std::max(0.5f, m.fx * dpiScale_);  // sizes below are in DIPs of the recorded screen
+    auto at = [&](POINT p) { return D2D1::Point2F(m.dx + (p.x - m.ox) * m.fx, m.dy + (p.y - m.oy) * m.fy); };
+    d2dCtx_->BeginDraw();
+    for (const Click& c : show) {
+        const UINT32 rgb = c.right ? 0x60A5FA : 0xFBBF24;  // right: blue, left: amber
+        double age = (double)(qpc - c.down) / kRipple;
+        if (age < 1) {
+            // A ring that grows from where it was pressed, strong at first, then fading out.
+            float t = (float)age, e = 1 - (1 - t) * (1 - t) * (1 - t);
+            float r = (12 + 22 * e) * k;
+            D2D1_ELLIPSE el{at(c.at), r, r};
+            fxBrush_->SetColor(D2D1::ColorF(rgb, 0.32f * (1 - t)));
+            d2dCtx_->FillEllipse(el, fxBrush_.Get());
+            fxBrush_->SetColor(D2D1::ColorF(rgb, 0.95f * (1 - t * t)));
+            d2dCtx_->DrawEllipse(el, fxBrush_.Get(), 3.5f * k);
+        }
+        if (!c.up || qpc < c.up) {
+            // Held: a dot that follows the cursor (drags).
+            D2D1_ELLIPSE el{at(cur), 9 * k, 9 * k};
+            fxBrush_->SetColor(D2D1::ColorF(rgb, 0.45f));
+            d2dCtx_->FillEllipse(el, fxBrush_.Get());
+            fxBrush_->SetColor(D2D1::ColorF(rgb, 0.9f));
+            d2dCtx_->DrawEllipse(el, fxBrush_.Get(), 2 * k);
+        }
+    }
+    if (FAILED(d2dCtx_->EndDraw())) {
+        fxFailed_ = true;
+        return false;
+    }
+    return true;
 }
 
 void Capture::DrainOne() {
@@ -528,11 +717,13 @@ void Capture::TickLoop() {
                 if (cur > k + 2) k = cur;
             }
             // Never under mtx_: the frame callback may own the device lock while it waits for mtx_.
+            ID3D11Texture2D* picture = out_.Get();
             {
                 DeviceLock lock(mt_.Get());
                 if (finishDue_) FinishFrame();
+                if (opt_.clickFx && DrawClicks(due)) picture = fx_.Get();
             }
-            ComPtr<IMFSample> sample = writer_->Convert(out_.Get());
+            ComPtr<IMFSample> sample = writer_->Convert(picture);
             if (!sample) continue;  // encoder pool momentarily full: this tick is dropped
             int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;
             if (!writer_->WriteVideo(sample.Get(), t0, t1 - t0)) {
@@ -558,7 +749,8 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
     if (!frame) return;
 
     auto cs = frame.ContentSize();
-    int64_t ts = frame.SystemRelativeTime().count() - pausedTotal_;  // the recording's own clock
+    const int64_t qpc = frame.SystemRelativeTime().count();
+    int64_t ts = qpc - pausedTotal_;  // the recording's own clock
     bool accept = false;
     if (pausedAt_) {
         // nothing while paused
@@ -571,20 +763,27 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
         accept = true;
         nextDue_ = (nextDue_ + interval_ > ts) ? nextDue_ + interval_ : ts + interval_;
     }
-    if (accept) {
+    // A clip frame that comes too soon still becomes the picture the click highlight frames are drawn on.
+    const bool base = !accept && !opt_.video && opt_.clickFx && !pausedAt_ && firstTs_ >= 0 && ClicksShow(qpc);
+    if (accept || base) {
         RECT sr;
         if (SourceRect(cs.Width, cs.Height, sr)) {
             if (opt_.monitorMode)
                 CoveredRects(sr, covered_);
             else
                 covered_.clear();
+            if (opt_.clickFx) texOrigin_ = TextureOrigin(cs.Width, cs.Height);
             try {
                 auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
                 ComPtr<ID3D11Texture2D> tex;
                 if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) {
-                    Process(tex.Get(), sr, ts - firstTs_, covered_);
-                    lastTs_ = ts - firstTs_;
-                    lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
+                    int64_t rel = ts - firstTs_;
+                    if (rel > 0 && rel <= lastTs_) rel = lastTs_ + 1;  // after a click highlight frame of ours
+                    Process(tex.Get(), sr, rel, covered_, qpc, accept);
+                    if (accept) {
+                        lastTs_ = rel;
+                        lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
+                    }
                 }
             } catch (...) {
             }
@@ -603,6 +802,7 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
 CaptureResult Capture::Stop() {
     CaptureResult res;
     if (!running_.exchange(false)) return res;
+    StopClicks();
     // Stopped while paused: the recording ends where the pause began.
     int64_t stopQpc = pausedAt_ ? pausedAt_.load() : util::Qpc100ns();
     try {
@@ -657,6 +857,12 @@ CaptureResult Capture::Stop() {
 }
 
 void Capture::ReleaseGpu() {
+    fxBrush_.Reset();
+    fxTarget_.Reset();
+    d2dCtx_.Reset();
+    d2dDev_.Reset();
+    d2d_.Reset();
+    fx_.Reset();
     session_ = nullptr;
     pool_ = nullptr;
     item_ = nullptr;

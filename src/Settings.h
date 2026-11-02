@@ -48,6 +48,7 @@ struct Settings {
     int sizeIdx = 2;
     bool cursor = true;
     bool clientOnly = true;
+    bool clickFx = false;  // 설정 › 녹화 "클릭 강조" (#21)
     int captureMode = kCaptureAuto;
     int countdown = 1;  // 0 = none, 1 = 3 s, 2 = 5 s
     int overlayMode = kOverlayExceptFullscreen;

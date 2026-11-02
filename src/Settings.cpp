@@ -64,6 +64,7 @@ void Settings::Load() {
     sizeIdx = ReadInt(ini, L"Size", sizeIdx, 0, _countof(kSizeOptions) - 1);
     cursor = ReadInt(ini, L"Cursor", cursor, 0, 1) != 0;
     clientOnly = ReadInt(ini, L"ClientOnly", clientOnly, 0, 1) != 0;
+    clickFx = ReadInt(ini, L"ClickHighlight", clickFx, 0, 1) != 0;
     captureMode = ReadInt(ini, L"CaptureMode", captureMode, 0, 2);
     countdown = ReadInt(ini, L"Countdown", countdown, 0, 2);
     overlayMode = ReadInt(ini, L"Overlay", overlayMode, 0, 2);
@@ -144,6 +145,7 @@ void Settings::Save() const {
     num(L"Size", sizeIdx);
     num(L"Cursor", cursor);
     num(L"ClientOnly", clientOnly);
+    num(L"ClickHighlight", clickFx);
     num(L"CaptureMode", captureMode);
     num(L"Countdown", countdown);
     num(L"Overlay", overlayMode);
