@@ -88,6 +88,11 @@ void Settings::Load() {
     monitor = buf;
     GetPrivateProfileStringW(L"OzMaker", L"OutDir", L"", buf, _countof(buf), ini.c_str());
     outDir = buf;
+    recent.clear();
+    for (size_t i = 0; i < kMaxRecent; ++i) {
+        GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
+        if (*buf) recent.push_back(buf);
+    }
     if (outDir.empty()) outDir = util::KnownFolder(FOLDERID_Pictures) + L"\\OzMaker";
 }
 
@@ -142,5 +147,12 @@ void Settings::Save() const {
     num(L"Speed", speedIdx);
     num(L"Loop", loop);
     put(L"OutDir", outDir);
+    for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);
+}
+
+void Settings::AddRecent(const std::wstring& path) {
+    std::erase_if(recent, [&](const std::wstring& p) { return _wcsicmp(p.c_str(), path.c_str()) == 0; });
+    recent.insert(recent.begin(), path);
+    if (recent.size() > kMaxRecent) recent.resize(kMaxRecent);
 }

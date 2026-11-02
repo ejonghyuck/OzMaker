@@ -159,6 +159,36 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
     return true;
 }
 
+bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    COMDLG_FILTERSPEC filters[] = {{L"동영상", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts"},
+                                   {L"모든 파일", L"*.*"}};
+    dlg->SetFileTypes(_countof(filters), filters);
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    ComPtr<IShellItem> folder;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        dlg->SetDefaultFolder(folder.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return false;
+    PWSTR p = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return false;
+    out = p;
+    CoTaskMemFree(p);
+    return true;
+}
+
+std::wstring FormatAgo(double s) {
+    if (s < 60) return L"방금";
+    if (s < 3600) return Format(L"%d분 전", (int)(s / 60));
+    if (s < 86400) return Format(L"%d시간 전", (int)(s / 3600));
+    if (s < 2 * 86400) return L"어제";
+    return Format(L"%d일 전", (int)(s / 86400));
+}
+
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name, const wchar_t* ext,
                   const wchar_t* filterName, std::wstring& out) {
     ComPtr<IFileSaveDialog> dlg;

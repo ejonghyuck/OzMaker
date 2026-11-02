@@ -38,6 +38,10 @@ const wchar_t* FormatBlurb(Format f) {
 
 void App::DrawFrame(Rect client) {
     ui_.Fill(client, Bg);
+    // The files list takes all input while it is open; a click anywhere else closes it.
+    if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
+    const bool popover = filesOpen_;
+    if (popover) ui_.SetInputBlocked(true);
     Rect r = client;
     DrawHeader(r.CutTop(60));
     r = r.Inset(20, 0);
@@ -46,6 +50,10 @@ void App::DrawFrame(Rect client) {
         case Screen::Home: DrawHome(r); break;
         case Screen::Editor: DrawEditor(r); break;
         case Screen::Settings: DrawSettings(r); break;
+    }
+    if (popover) {
+        ui_.SetInputBlocked(false);
+        DrawFilesPopover(client);
     }
     DrawToast(client);
 }
@@ -83,11 +91,17 @@ void App::DrawHeader(Rect r) {
         if (ui_.Button(HashId("hdr.new"), Rect::Centered(b.CX(), b.CY(), 120, 36), L"새 녹화", BtnStyle::Ghost,
                        icon::Back, en))
             CloseEditor();
-    } else if (screen_ == Screen::Home && clip_) {
-        Rect b = right.CutRight(150);
-        if (ui_.Button(HashId("hdr.resume"), Rect::Centered(b.CX(), b.CY(), 150, 36), L"이전 녹화 편집",
-                       BtnStyle::Secondary, icon::Next))
-            ResumeEditor();
+        right.CutRight(8);
+        DrawFilesButton(right);
+    } else if (screen_ == Screen::Home) {
+        if (clip_) {
+            Rect b = right.CutRight(150);
+            if (ui_.Button(HashId("hdr.resume"), Rect::Centered(b.CX(), b.CY(), 150, 36), L"이전 녹화 편집",
+                           BtnStyle::Secondary, icon::Next))
+                ResumeEditor();
+            right.CutRight(8);
+        }
+        DrawFilesButton(right);
     }
     if (rec_ == RecState::Recording) {
         std::wstring t = L"REC  " + util::FormatClock(capture_.Elapsed(), true);
@@ -115,6 +129,149 @@ void App::DrawToast(Rect client) {
     ui_.Icon(Rect::XYWH(r.l + 12, r.t, 24, r.H()), toastError_ ? icon::Warning : icon::Check, 14.f,
              WithAlpha(toastError_ ? RecHi : Success, a));
     ui_.Text(Rect(r.l + 42, r.t, r.r - 16, r.b), toast_, 13.f, WithAlpha(TextColor, a));
+}
+
+// ---------------------------------------------------------------- files
+
+void App::DrawFilesButton(Rect& right) {
+    Rect b = right.CutRight(104);
+    filesBtn_ = Rect::Centered(b.CX(), b.CY(), 104, 36);
+    bool en = rec_ == RecState::Idle && !exporter_.Busy();
+    if (ui_.Button(HashId("hdr.files"), filesBtn_, L"파일", filesOpen_ ? BtnStyle::Secondary : BtnStyle::Ghost,
+                   icon::OpenFile, en)) {
+        filesOpen_ = true;
+        filesScroll_ = 0;
+        RefreshRecent();
+    }
+    // Recordings that would be lost on exit.
+    if (!held_.empty()) ui_.Circle(filesBtn_.r - 12, filesBtn_.t + 9, 4.f, Accent2);
+}
+
+void App::DrawFilesPopover(Rect client) {
+    const auto& in = ui_.In();
+    const float W = std::min(420.f, client.W() - 40), rowH = 52, secH = 30, footH = 64;
+    float listH = 0;
+    if (!held_.empty()) listH += secH + held_.size() * rowH;
+    listH += secH + (recentFiles_.empty() ? 56 : recentFiles_.size() * rowH);
+    float top = filesBtn_.b + 8;
+    float H = std::min(listH + footH + 12, client.b - 16 - top);
+    Rect box = Rect::XYWH(std::max(client.l + 20, filesBtn_.r - W), top, W, H);
+    bool outside = !box.Contains(in.mx, in.my);
+    if ((in.pressed && outside) || in.Key(VK_ESCAPE)) {
+        filesOpen_ = false;
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Black, 0.45f), 14);
+    ui_.Fill(box, Surface2, 12);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 12);
+
+    Rect body = box.Inset(8, 8);
+    Rect foot = body.CutBottom(footH - 8);
+    Rect list = body;
+    float maxScroll = std::max(0.f, listH - list.H());
+    if (!outside && in.wheel != 0) filesScroll_ -= in.wheel * 60;
+    filesScroll_ = std::clamp(filesScroll_, 0.f, maxScroll);
+    ui_.PushClip(list);
+    Rect cur = Rect(list.l, list.t - filesScroll_, list.r, list.t - filesScroll_ + listH);
+    auto section = [&](std::wstring_view title) {
+        Rect s = cur.CutTop(secH);
+        ui_.Text(s.Inset(10, 0), title, 12.f, TextFaint, Bold());
+    };
+    auto row = [&](UiId id, Rect r, wchar_t glyph, D2D1_COLOR_F tint, const std::wstring& name,
+                   const std::wstring& sub, int buttons, const std::function<void(int, Rect)>& onButton) -> bool {
+        bool hot = ui_.Hover(r);
+        if (hot) ui_.Fill(r, Surface3, 8);
+        Rect ic = Rect::XYWH(r.l + 8, r.CY() - 16, 32, 32);
+        ui_.Fill(ic, WithAlpha(tint, 0.16f), 8);
+        ui_.Icon(ic, glyph, 15.f, tint);
+        Rect text = Rect(ic.r + 12, r.t, r.r - 8 - buttons * 34, r.b);
+        ui_.Text(Rect(text.l, r.t + 7, text.r, r.CY() + 2), name, 13.f, TextColor, Bold());
+        ui_.Text(Rect(text.l, r.CY() + 1, text.r, r.b - 7), sub, 11.5f, TextFaint);
+        // Buttons first: they take the press before the row does.
+        for (int k = 0; k < buttons; ++k) onButton(k, Rect::XYWH(r.r - 8 - (buttons - k) * 34, r.CY() - 15, 30, 30));
+        return ui_.Click(id, r);
+    };
+
+    if (!held_.empty()) {
+        section(L"저장하지 않은 녹화");
+        for (size_t i = 0; i < held_.size(); ++i) {
+            Rect r = cur.CutTop(rowH);
+            const HeldClip& h = held_[i];
+            const bool current = h.clip == clip_;
+            const bool editing = current && screen_ == Screen::Editor;
+            std::wstring sub = util::FormatClock(h.clip->Seconds(), true) + L" · " +
+                               util::FormatAgo(util::NowSeconds() - h.when) + (editing ? L" · 편집 중" : L"");
+            bool drop = false;
+            bool open = row(HashId("files.held", (uint32_t)i), r, icon::Record, Accent2, h.name, sub, editing ? 0 : 1,
+                            [&](int, Rect b) {
+                                drop = ui_.IconButton(HashId("files.drop", (uint32_t)i), b, icon::Delete, L"버리기");
+                            });
+            if (drop) {
+                if (current) {
+                    StopThumbnails();
+                    clip_.reset();
+                    hasResult_ = false;
+                }
+                DropHeld(h.clip.get());
+                Invalidate();
+                break;
+            }
+            if (open) {
+                filesOpen_ = false;
+                auto clip = h.clip;
+                if (clip != clip_) OpenEditor(clip);
+                else ResumeEditor();
+                break;
+            }
+        }
+    }
+    section(L"최근 파일");
+    if (recentFiles_.empty()) {
+        Rect r = cur.CutTop(56);
+        ui_.Text(r.Inset(10, 0), L"저장하거나 연 파일이 여기에 표시됩니다.", 12.5f, TextFaint);
+    }
+    for (size_t i = 0; i < recentFiles_.size(); ++i) {
+        Rect r = cur.CutTop(rowH);
+        const RecentFile& f = recentFiles_[i];
+        int clicked = -1;
+        bool open = row(HashId("files.recent", (uint32_t)i), r, f.video ? icon::Video : icon::Photo,
+                        f.video ? Accent : Success, util::FileNameOf(f.path),
+                        util::FormatBytes(f.bytes) + L" · " + util::FormatAgo(f.age), 2, [&](int k, Rect b) {
+                            if (k == 0 && ui_.IconButton(HashId("files.folder", (uint32_t)i), b, icon::Folder, L"폴더에서 보기"))
+                                clicked = 0;
+                            if (k == 1 && ui_.IconButton(HashId("files.copy", (uint32_t)i), b, icon::Copy, L"파일 복사"))
+                                clicked = 1;
+                        });
+        if (ui_.Hover(r)) ui_.Tooltip(HashId("files.tip", (uint32_t)i), r, f.path);
+        if (clicked == 0) {
+            util::OpenFolderAndSelect(f.path);
+        } else if (clicked == 1) {
+            bool ok = util::CopyFileToClipboard(hwnd_, f.path);
+            Toast(ok ? L"파일을 복사했습니다. 메신저나 폴더에 붙여넣으세요." : L"복사하지 못했습니다.", !ok);
+        } else if (open) {
+            // Videos open in the editor; 움짤 in whatever shows them.
+            std::wstring path = f.path;
+            if (f.video)
+                OpenMediaFile(path);
+            else
+                util::ShellOpen(path);
+            filesOpen_ = false;
+            break;
+        }
+    }
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float frac = list.H() / listH;
+        float th = std::max(24.f, list.H() * frac);
+        float ty = list.t + (list.H() - th) * (filesScroll_ / maxScroll);
+        ui_.Fill(Rect(list.r - 3, ty, list.r, ty + th), BorderStrong, 1.5f);
+    }
+
+    ui_.Line(foot.l, foot.t + 0.5f, foot.r, foot.t + 0.5f, Border);
+    Rect fb = foot.Inset(2, 12);
+    Rect btn = fb.CutLeft(140);
+    if (ui_.Button(HashId("files.open"), btn, L"파일 열기…", BtnStyle::Secondary, icon::OpenFile)) BrowseForVideo();
+    ui_.Text(fb.Inset(14, 0), L"동영상을 창에 끌어다 놓아도 열립니다", 11.5f, TextFaint, Align(AlignEnd));
 }
 
 // ---------------------------------------------------------------- home

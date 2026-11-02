@@ -96,6 +96,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (!CreateMainWindow(show)) return 1;
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
+    if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
     Loop();
     return 0;
 }
@@ -153,6 +154,7 @@ bool App::CreateMainWindow(int show) {
     COLORREF caption = RGB(0x0D, 0x0F, 0x13);
     DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR, Win11*/, &caption, sizeof(caption));
     if (!gfx_.AttachWindow(hwnd_)) return false;
+    DragAcceptFiles(hwnd_, TRUE);
 
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
@@ -501,6 +503,24 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_SHOW:
             ShowMain(true);
             return 0;
+        case WM_COPYDATA: {
+            auto* cd = reinterpret_cast<const COPYDATASTRUCT*>(l);
+            if (!cd || cd->dwData != kCopyOpenFile || cd->cbData < sizeof(wchar_t)) return FALSE;
+            pendingOpen_.assign((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t) - 1);
+            PostMessageW(hwnd_, WM_APP_OPEN, 0, 0);
+            return TRUE;
+        }
+        case WM_APP_OPEN:
+            if (!pendingOpen_.empty()) OpenMediaFile(std::exchange(pendingOpen_, {}));
+            return 0;
+        case WM_DROPFILES: {
+            auto drop = (HDROP)w;
+            wchar_t path[MAX_PATH * 4];
+            bool got = DragQueryFileW(drop, 0, path, _countof(path)) > 0;
+            DragFinish(drop);
+            if (got) OpenMediaFile(path);
+            return 0;
+        }
         case WM_APP_QUIT:
             quitting_ = true;
             DestroyWindow(hwnd_);
@@ -529,6 +549,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
+            if (!settings_.closeToTray && !quitting_ && !ConfirmQuit()) return 0;
             if (settings_.closeToTray && !quitting_) {
                 HideMain();
                 if (!settings_.trayHintShown) {
@@ -579,6 +600,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
 
 void App::RefreshWindows() {
     windows_ = EnumerateCaptureWindows();
+    if (testWindowsOnly_)
+        std::erase_if(windows_, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
     if (target_ && !IsWindow(target_)) target_ = nullptr;
     for (auto it = icons_.begin(); it != icons_.end();) {
         if (!IsWindow(it->first))
@@ -785,6 +808,18 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
         return;
     }
     recTarget_ = target;
+    if (target.source == kSourceDisplay) {
+        recName_ = L"화면";
+        for (auto& m : monitors_)
+            if (m.handle == target.monitor) recName_ = util::Format(L"화면 %d", m.number);
+    } else if (target.source == kSourceRegion) {
+        recName_ = L"영역";
+    } else {
+        int len = GetWindowTextLengthW(target.hwnd);
+        recName_.assign(len + 1, L'\0');
+        recName_.resize(GetWindowTextW(target.hwnd, recName_.data(), len + 1));
+        if (recName_.empty()) recName_ = L"창";
+    }
     recVideo_ = settings_.output == kOutputVideo;
     if (target.source == kSourceWindow) {
         if (IsIconic(target.hwnd)) {
@@ -910,6 +945,7 @@ void App::StopRecording() {
     }
     if (settings_.sounds) sound::Play(sound::Cue::Stop);
     auto clip = res.clip;
+    if (clip) HoldRecording(clip);
     if (!clip) {
         ReportError(L"녹화 실패", recTarget_.source == kSourceWindow
                                       ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
@@ -938,6 +974,7 @@ void App::OnVideoSaved(const CaptureResult& r) {
         return;
     }
     if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    AddRecent(r.path);
     lastVideo_ = r;
     if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     showVideo_ = true;
@@ -1069,6 +1106,84 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     StartThumbnails();
     SetPlaying(true);
     Invalidate();
+}
+
+// ---------------------------------------------------------------- files
+
+// A video dropped on the window, picked in the open dialog or the recent list, or given on the command line.
+void App::OpenMediaFile(const std::wstring& path) {
+    ShowMain(true);
+    filesOpen_ = false;
+    if (rec_ != RecState::Idle) {
+        Toast(L"녹화 중에는 파일을 열 수 없습니다.", true);
+        return;
+    }
+    if (exporter_.Busy()) {
+        Toast(L"내보내기가 끝난 뒤에 열 수 있습니다.", true);
+        return;
+    }
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        Toast(L"파일을 찾을 수 없습니다: " + util::FileNameOf(path), true);
+        return;
+    }
+    std::wstring ext = path.substr(std::min(path.size(), path.find_last_of(L'.')));
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    if (ext == L".gif" || ext == L".webp" || ext == L".avif" || ext == L".png" || ext == L".apng") {
+        Toast(L"움짤은 편집할 수 없습니다. MP4 같은 동영상 파일을 여세요.", true);
+        return;
+    }
+    if (OpenVideo(path)) AddRecent(path);
+}
+
+void App::BrowseForVideo() {
+    filesOpen_ = false;
+    std::wstring path;
+    if (util::PickVideoFile(hwnd_, settings_.outDir, path)) OpenMediaFile(path);
+}
+
+void App::AddRecent(const std::wstring& path) {
+    settings_.AddRecent(path);
+    settings_.Save();
+}
+
+void App::RefreshRecent() {
+    recentFiles_.clear();
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    auto ticks = [](const FILETIME& f) { return (int64_t)((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime); };
+    for (auto& p : settings_.recent) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa) || (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        RecentFile f;
+        f.path = p;
+        f.bytes = (uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
+        f.age = std::max<int64_t>(0, ticks(nowFt) - ticks(fa.ftLastWriteTime)) / 1e7;
+        std::wstring ext = p.substr(std::min(p.size(), p.find_last_of(L'.')));
+        for (auto& c : ext) c = (wchar_t)towlower(c);
+        f.video = ext != L".gif" && ext != L".webp" && ext != L".avif";
+        recentFiles_.push_back(std::move(f));
+    }
+}
+
+void App::HoldRecording(std::shared_ptr<Clip> clip) {
+    held_.insert(held_.begin(), {std::move(clip), util::NowSeconds(), recName_});
+    // Bounded: each one keeps a temporary file of compressed frames.
+    if (held_.size() > kMaxHeld) {
+        held_.resize(kMaxHeld);
+        Toast(util::Format(L"저장하지 않은 녹화가 %zu개를 넘어 가장 오래된 것을 지웠습니다.", kMaxHeld), true);
+    }
+}
+
+void App::DropHeld(const Clip* clip) {
+    std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
+}
+
+bool App::ConfirmQuit() {
+    if (held_.empty()) return true;
+    std::wstring msg = util::Format(L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?", held_.size());
+    return MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
 }
 
 bool App::OpenVideo(const std::wstring& path) {
@@ -1345,6 +1460,8 @@ void App::OnExportDone() {
         lastResult_ = r;
         hasResult_ = true;
         resultOriginal_ = false;
+        DropHeld(clip_.get());  // exported: nothing to protect any more
+        AddRecent(r.path);
         if (settings_.sounds) sound::Play(sound::Cue::Saved);
     }
     Invalidate();
@@ -1487,6 +1604,7 @@ void App::TrayMenu() {
                 StopRecording();
             break;
         case 3:
+            if (!ConfirmQuit()) break;
             quitting_ = true;
             DestroyWindow(hwnd_);
             break;

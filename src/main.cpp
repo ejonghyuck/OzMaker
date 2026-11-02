@@ -27,7 +27,23 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     if (!testMode) {
         mutex = CreateMutexW(nullptr, TRUE, L"Local\\OzMaker.SingleInstance");
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            if (HWND h = FindWindowW(L"OzMakerMain", nullptr)) PostMessageW(h, WM_APP + 5, 0, 0);
+            if (HWND h = FindWindowW(L"OzMakerMain", nullptr)) {
+                // We were just started by the user, so we may hand the foreground over to the running instance.
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                AllowSetForegroundWindow(pid);
+                if (!first.empty()) {
+                    // A file to open ("Open with", dropped on the exe): the running instance opens it.
+                    wchar_t full[MAX_PATH * 4];
+                    DWORD n = GetFullPathNameW(first.c_str(), _countof(full), full, nullptr);
+                    std::wstring path = n > 0 && n < _countof(full) ? std::wstring(full, n) : first;
+                    COPYDATASTRUCT cd{0x4F5A4F50, (DWORD)((path.size() + 1) * sizeof(wchar_t)), (void*)path.c_str()};
+                    DWORD_PTR res = 0;
+                    SendMessageTimeoutW(h, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &res);
+                } else {
+                    PostMessageW(h, WM_APP + 5, 0, 0);
+                }
+            }
             return 0;
         }
     }

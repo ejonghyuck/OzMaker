@@ -31,7 +31,9 @@ private:
         WM_APP_SHOW,  // = WM_APP + 5, sent by a second instance (main.cpp)
         WM_APP_QUIT,  // = WM_APP + 6, sent by --exit (main.cpp)
         WM_APP_FRAME,
+        WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
     };
+    static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
     enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh };
     enum class RecState { Idle, Countdown, Recording };
@@ -70,6 +72,8 @@ private:
     void DrawExportPanel(Rect r);
     void DrawSettings(Rect r);
     void DrawToast(Rect client);
+    void DrawFilesButton(Rect& right);
+    void DrawFilesPopover(Rect client);
     void SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
                     const std::function<void(Rect)>& control);
     void SettingSection(Rect& area, std::wstring_view title);
@@ -100,6 +104,15 @@ private:
     void ProbeEncoders();
     std::wstring VideoSummary() const;
     std::wstring AudioSummary(int source) const;
+
+    // ---- files: opening videos, recent files, recordings not exported yet
+    void OpenMediaFile(const std::wstring& path);
+    void BrowseForVideo();
+    void AddRecent(const std::wstring& path);
+    void RefreshRecent();
+    void HoldRecording(std::shared_ptr<Clip> clip);
+    void DropHeld(const Clip* clip);
+    bool ConfirmQuit();
 
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
@@ -179,6 +192,7 @@ private:
     RecTarget recTarget_;
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     std::wstring recNotice_;
+    std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")
     CaptureResult lastVideo_;
     bool showVideo_ = false;
     bool encProbed_ = false;
@@ -219,6 +233,26 @@ private:
     int thumbW_ = 0, thumbH_ = 0;
     std::vector<ComPtr<ID2D1Bitmap1>> thumbs_;
 
+    // Recordings stay here until exported, so a new one doesn't silently replace them.
+    struct HeldClip {
+        std::shared_ptr<Clip> clip;
+        double when = 0;
+        std::wstring name;
+    };
+    static constexpr size_t kMaxHeld = 5;
+    std::vector<HeldClip> held_;  // newest first
+    struct RecentFile {
+        std::wstring path;
+        uint64_t bytes = 0;
+        double age = 0;  // seconds since written
+        bool video = false;
+    };
+    std::vector<RecentFile> recentFiles_;  // existing files of settings_.recent, refreshed when the list opens
+    bool filesOpen_ = false;
+    Rect filesBtn_;
+    float filesScroll_ = 0;
+    std::wstring pendingOpen_;
+
     Exporter exporter_;
     ExportResult lastResult_;
     bool hasResult_ = false;
@@ -229,6 +263,7 @@ private:
     double toastUntil_ = 0;
 
     bool capturingHotkey_ = false, hotkeyOk_ = true;
+    bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     NOTIFYICONDATAW nid_{};
     HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr;

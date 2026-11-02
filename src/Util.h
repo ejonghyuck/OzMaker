@@ -28,6 +28,8 @@ bool CopyFileToClipboard(HWND owner, const std::wstring& path);
 bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name,
                   const wchar_t* ext, const wchar_t* filterName, std::wstring& out);
+bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out);
+std::wstring FormatAgo(double seconds);  // "방금", "3분 전", "어제" ...
 
 std::wstring HotkeyToString(UINT mods, UINT vk);
 

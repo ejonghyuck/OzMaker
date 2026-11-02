@@ -263,6 +263,7 @@ int App::RunSelfTest(const std::wstring& dir) {
 }
 
 int App::RunScreenshots(const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     const float W = 1120, H = 780;
     double clock = util::NowSeconds();
@@ -282,11 +283,7 @@ int App::RunScreenshots(const std::wstring& dir) {
         }
     };
 
-    // Only list the dedicated test window (if running): other windows' titles are the user's business.
-    windows_.clear();
-    for (auto& w : EnumerateCaptureWindows())
-        if (w.title.find(L"OzMaker Test Window") != std::wstring::npos) windows_.push_back(w);
-    monitors_ = EnumerateMonitors();
+    RefreshWindows();
     target_ = nullptr;
     screen_ = Screen::Home;
     settings_.source = kSourceWindow;
@@ -366,7 +363,20 @@ int App::RunScreenshots(const std::wstring& dir) {
     toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
     toastUntil_ = clock + 60;
     shot(L"editor_toast.png", 96);
+    toastUntil_ = 0;
     CloseEditor();
+
+    // Files list: two recordings not exported yet and a few recent files (names only, nothing on disk).
+    held_ = {{MakeSyntheticClip(320, 180, 30, 30), clock - 40, L"OzMaker Test Window"},
+             {clip_, clock - 1500, L"화면 1"}};
+    recentFiles_ = {{settings_.outDir + L"\\OzMaker_20261102_142311.gif", 2'345'678, 300, false},
+                    {settings_.outDir + L"\\OzMaker_20261102_140205.mp4", 48'213'004, 4000, true},
+                    {settings_.outDir + L"\\OzMaker_20261101_221940.webp", 812'004, 90000, false}};
+    filesOpen_ = true;
+    shot(L"files_popover.png", 96);
+    filesOpen_ = false;
+    held_.clear();
+    recentFiles_.clear();
     return 0;
 }
 
@@ -799,6 +809,86 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
     return w.Finish(err);
 }
 
+// A copy of an MP4 whose video track says to show it turned clockwise by cw degrees, the way phones mark portrait
+// video: the display matrix and size in the track header (tkhd) change, the pictures stay as they are.
+bool WriteRotatedCopy(const std::wstring& src, const std::wstring& dst, int cw) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(src.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    auto be32 = [&](size_t p) { return (uint32_t)d[p] << 24 | (uint32_t)d[p + 1] << 16 | (uint32_t)d[p + 2] << 8 | d[p + 3]; };
+    auto put32 = [&](size_t p, uint32_t v) {
+        for (int i = 0; i < 4; ++i) d[p + i] = (uint8_t)(v >> (24 - 8 * i));
+    };
+    // Boxes directly inside [from, to): returns the payload offset of the first of that type, 0 if none.
+    auto find = [&](size_t from, size_t to, const char* type) -> size_t {
+        for (size_t p = from; p + 8 <= to;) {
+            uint32_t size = be32(p);
+            if (size < 8 || p + size > to) return 0;
+            if (!memcmp(&d[p + 4], type, 4)) return p + 8;
+            p += size;
+        }
+        return 0;
+    };
+    auto end = [&](size_t payload) { return payload - 8 + be32(payload - 8); };
+    size_t moov = find(0, d.size(), "moov");
+    if (!moov) return false;
+    for (size_t p = moov; p + 8 <= end(moov);) {
+        size_t trak = find(p, end(moov), "trak");
+        if (!trak) return false;
+        p = end(trak);
+        size_t mdia = find(trak, end(trak), "mdia");
+        size_t hdlr = mdia ? find(mdia, end(mdia), "hdlr") : 0;
+        if (!hdlr || memcmp(&d[hdlr + 8], "vide", 4)) continue;
+        size_t tkhd = find(trak, end(trak), "tkhd");
+        if (!tkhd) return false;
+        size_t m = tkhd + (d[tkhd] == 1 ? 52 : 40);  // matrix after the version-dependent times
+        uint32_t w = be32(m + 36), h = be32(m + 40);  // 16.16
+        const uint32_t one = 0x10000, neg = 0xFFFF0000;
+        uint32_t a = 0, b = 0, c = 0, e = 0, x = 0, y = 0;
+        if (cw == 90) b = one, c = neg, x = h;
+        else if (cw == 180) a = neg, e = neg, x = w, y = h;
+        else if (cw == 270) b = neg, c = one, y = w;
+        else a = e = one;
+        uint32_t mat[9] = {a, b, 0, c, e, 0, x, y, 0x40000000};
+        for (int i = 0; i < 9; ++i) put32(m + i * 4, mat[i]);
+        if (cw % 180) {
+            put32(m + 36, h);
+            put32(m + 40, w);
+        }
+        FILE* f = _wfsopen(dst.c_str(), L"wb", _SH_DENYNO);
+        if (!f) return false;
+        bool ok = fwrite(d.data(), 1, d.size(), f) == d.size();
+        fclose(f);
+        return ok;
+    }
+    return false;
+}
+
+// A copy of an MP4 whose video sample entry claims a codec nobody has ('avc1' -> 'oz00').
+bool WriteUnknownCodecCopy(const std::wstring& src, const std::wstring& dst) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(src.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    auto at = [&](const char* s, size_t from) {
+        auto it = std::search(d.begin() + std::min(from, d.size()), d.end(), s, s + 4);
+        return it == d.end() ? SIZE_MAX : (size_t)(it - d.begin());
+    };
+    size_t stsd = at("stsd", 0), entry = stsd == SIZE_MAX ? SIZE_MAX : at("avc1", stsd);
+    if (entry == SIZE_MAX) return false;
+    memcpy(&d[entry], "oz00", 4);
+    FILE* f = _wfsopen(dst.c_str(), L"wb", _SH_DENYNO);
+    if (!f) return false;
+    bool ok = fwrite(d.data(), 1, d.size(), f) == d.size();
+    fclose(f);
+    return ok;
+}
+
 std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double seconds, int& rate) {
     VideoClip::AudioReader ar;
     std::vector<int16_t> out;
@@ -813,6 +903,7 @@ std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double secon
 }  // namespace
 
 int App::RunVideoTest(const std::wstring& dir, int W, int H) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\video.log");
     int failures = 0;
@@ -873,6 +964,51 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
             times += util::Format(L" %d:%.0fms", i, (util::NowSeconds() - t0) * 1000);
         }
         check(bad == 0, util::Format(L"random access: %d wrong,", bad) + times);
+    }
+
+    // No decoder for the video: opening says so instead of showing a blank editor.
+    {
+        std::wstring bad = dir + L"\\vt_unknown_codec.mp4", why;
+        bool made = WriteUnknownCodecCopy(src, bad);
+        auto c = made ? VideoClip::Open(bad, why) : nullptr;
+        check(made && !c && why.find(L"oz00") != std::wstring::npos, L"unknown codec: " + why);
+    }
+
+    // Portrait phone video: the frames come out turned the way the file says.
+    for (int cw : {90, 180, 270}) {
+        std::wstring rotPath = dir + util::Format(L"\\vt_rot%d.mp4", cw);
+        auto rot = WriteRotatedCopy(src, rotPath, cw) ? VideoClip::Open(rotPath, err) : nullptr;
+        if (!rot) {
+            check(false, util::Format(L"rotated %d: can't open (%s)", cw, err.c_str()));
+            continue;
+        }
+        auto ra = clip->NewReader(), rb = rot->NewReader();
+        const uint8_t* pa = ra->Get(45);
+        const uint8_t* pb = rb->Get(45);
+        int bad = 0, points = 0;
+        const int RW = cw == 180 ? W : H, RH = cw == 180 ? H : W;
+        if (pa && pb && rot->Width() == RW && rot->Height() == RH) {
+            for (int y = 0; y < H; y += 7)
+                for (int x = 0; x < W; x += 7) {
+                    // Where source pixel (x, y) ends up after the clockwise turn.
+                    int ox = cw == 90 ? H - 1 - y : cw == 180 ? W - 1 - x : y;
+                    int oy = cw == 90 ? x : cw == 180 ? H - 1 - y : W - 1 - x;
+                    const uint8_t* s = pa + ((size_t)y * W + x) * 4;
+                    const uint8_t* t = pb + ((size_t)oy * RW + ox) * 4;
+                    // The video processor that turns the picture resamples colour a little at sharp edges.
+                    ++points;
+                    for (int k = 0; k < 3; ++k)
+                        if (std::abs(s[k] - t[k]) > 40) {
+                            ++bad;
+                            break;
+                        }
+                }
+            if (cw == 90) SavePng(gfx_.Wic(), dir + L"\\vt_rot90_frame45.png", pb, RW, RH);
+        }
+        check(pa && pb && rot->Rotation() == cw && rot->Width() == RW && rot->Height() == RH && points > 0 &&
+                  bad * 20 < points,
+              util::Format(L"rotated %d: %dx%d, turn %d, %d of %d pixels out of place", cw, rot->Width(),
+                           rot->Height(), rot->Rotation(), bad, points));
     }
 
     // Source audio: where does the tone step at 1.000 s land after the AAC round trip?
@@ -1032,6 +1168,7 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
 // The post-recording flow in the real window and message loop: a saved MP4 opens in the editor, plays through
 // the frame fetcher, gets trimmed with the keyboard and exported, then the editor is closed and reopened.
 int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\editor.log");
     int failures = 0;

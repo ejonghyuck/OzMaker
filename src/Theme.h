@@ -61,6 +61,10 @@ inline constexpr wchar_t Delete = 0xE74D;
 inline constexpr wchar_t Volume = 0xE767;
 inline constexpr wchar_t Mute = 0xE74F;
 inline constexpr wchar_t Cut = 0xE8C6;
+inline constexpr wchar_t Video = 0xE714;
+inline constexpr wchar_t Photo = 0xE91B;
+inline constexpr wchar_t Record = 0xE7C8;
+inline constexpr wchar_t ChevronDown = 0xE70D;
 }  // namespace icon
 
 }  // namespace theme

@@ -5,6 +5,7 @@ inline constexpr int kSizeOptions[] = {0, 1280, 960, 720, 480};  // longest edge
 inline constexpr int kScaleOptions[] = {100, 75, 50, 33, 25};    // export scale %
 inline constexpr int kOutFpsOptions[] = {0, 30, 25, 20, 15, 10};  // 0 = as recorded
 inline constexpr double kSpeedOptions[] = {0.5, 1.0, 1.5, 2.0};
+inline constexpr size_t kMaxRecent = 12;
 
 // MP4 recording
 inline constexpr int kVideoFpsOptions[] = {24, 30, 60};
@@ -65,6 +66,9 @@ struct Settings {
     int speedIdx = 1;
     bool loop = true;
 
+    std::vector<std::wstring> recent;  // saved and opened files, newest first
+
+    void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
     bool HasRegion() const { return region.right - region.left >= 16 && region.bottom - region.top >= 16; }
