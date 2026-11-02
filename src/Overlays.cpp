@@ -46,8 +46,11 @@ void LayeredWindow::Destroy() {
     }
     if (dib_) DeleteObject(dib_);
     dib_ = nullptr;
+    bits_ = nullptr;
     w_ = h_ = 0;
     painter_ = Painter();  // its brush belonged to the released render target
+    soft_.Reset();
+    softPainter_ = Painter();
 }
 
 bool LayeredWindow::EnsureSurface(int w, int h) {
@@ -72,6 +75,7 @@ bool LayeredWindow::EnsureSurface(int w, int h) {
     memDC_ = CreateCompatibleDC(screen);
     ReleaseDC(nullptr, screen);
     if (!dib_ || !memDC_) return false;
+    bits_ = (const uint32_t*)bits;
     oldBmp_ = (HBITMAP)SelectObject(memDC_, dib_);
     w_ = w;
     h_ = h;
@@ -105,6 +109,57 @@ void LayeredWindow::Render(const RECT& rect, float scale, bool move, const std::
     SIZE sz{w, h};
     BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(hwnd_, nullptr, move ? &dst : nullptr, &sz, memDC_, &src, 0, &bf, ULW_ALPHA);
+}
+
+void LayeredWindow::RenderDirty(float scale, const std::vector<RECT>& dirty,
+                                const std::function<void(Painter&, const Rect&)>& draw) {
+    if (!hwnd_ || !dib_ || !rt_) return;
+    // Small passes are much cheaper on the CPU: the GPU target waits for its copy back every time. Its
+    // antialiasing differs a little from the GPU's, so callers redraw each thing whole, never part of it.
+    if (!soft_) {
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+        if (FAILED(factory_->CreateDCRenderTarget(&props, &soft_))) return;
+        soft_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    }
+    // A pass starts where a whole number of pixels is an exact number of DIPs, so it draws on the same grid as a
+    // full render: 1 px at 100 %, 5 px at 125 %, 3 px at 150 %.
+    int k = (int)std::lround(scale * 4);
+    if (k <= 0 || std::fabs(k - scale * 4) > 1e-4f) k = 1;
+    while (k % 2 == 0) k /= 2;
+    const RECT surface{0, 0, w_, h_};
+    for (RECT d : dirty) {
+        if (!IntersectRect(&d, &d, &surface)) continue;
+        d.left -= d.left % k;
+        d.top -= d.top % k;
+        soft_->BindDC(memDC_, &d);
+        soft_->SetDpi(96.f * scale, 96.f * scale);
+        soft_->BeginDraw();
+        float ox = d.left / scale, oy = d.top / scale;
+        soft_->SetTransform(D2D1::Matrix3x2F::Translation(-ox, -oy));
+        soft_->Clear(D2D1::ColorF(0, 0, 0, 0));
+        softPainter_.Bind(soft_.Get());
+        draw(softPainter_, Rect(ox, oy, d.right / scale, d.bottom / scale));
+        soft_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (FAILED(soft_->EndDraw())) {
+            soft_.Reset();
+            softPainter_ = Painter();
+            w_ = h_ = 0;  // the next Render starts over
+            return;
+        }
+        POINT src{0, 0};
+        SIZE sz{w_, h_};
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UPDATELAYEREDWINDOWINFO info{sizeof(info)};
+        info.hdcSrc = memDC_;
+        info.pptSrc = &src;
+        info.psize = &sz;
+        info.pblend = &bf;
+        info.dwFlags = ULW_ALPHA;
+        info.prcDirty = &d;
+        UpdateLayeredWindowIndirect(hwnd_, &info);
+    }
 }
 
 // ---------------------------------------------------------------- RecOverlay
@@ -151,14 +206,21 @@ void RecOverlay::ShowCountdown(const RECT& target, int value) {
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
 }
 
-void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop) {
+namespace {
+constexpr float kPillW = 228, kPillH = 40;
+}
+
+void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop,
+                          std::function<void()> onPause) {
     Ensure();
     onStop_ = std::move(onStop);
+    onPause_ = std::move(onPause);
     mode_ = Mode::Pill;
     elapsed_ = 0;
     frames_ = 0;
-    hoverStop_ = false;
-    Place(target, 196, 40, false, outside);
+    hover_ = 0;
+    paused_ = false;
+    Place(target, (int)kPillW, (int)kPillH, false, outside);
     Redraw(true);
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
 }
@@ -201,9 +263,16 @@ void RecOverlay::Update(double elapsed, size_t frames) {
     Redraw(false);
 }
 
+void RecOverlay::SetPaused(bool paused) {
+    if (paused_ == paused) return;
+    paused_ = paused;
+    Redraw(false);
+}
+
 void RecOverlay::Hide() {
     mode_ = Mode::None;
     onStop_ = nullptr;
+    onPause_ = nullptr;
     if (win_.Hwnd()) ShowWindow(win_.Hwnd(), SW_HIDE);
     for (HWND& f : frame_) {
         if (f) DestroyWindow(f);
@@ -211,13 +280,35 @@ void RecOverlay::Hide() {
     }
 }
 
-Rect RecOverlay::StopRect() const { return Rect::Centered(196 - 21, 20, 28, 28); }
+Rect RecOverlay::StopRect() const { return Rect::Centered(kPillW - 21, kPillH / 2, 28, 28); }
+Rect RecOverlay::PauseRect() const { return Rect::Centered(kPillW - 53, kPillH / 2, 28, 28); }
+
+int RecOverlay::ButtonAt(float x, float y) const {
+    if (PauseRect().Inset(-2).Contains(x, y) && onPause_) return 1;
+    if (StopRect().Inset(-2).Contains(x, y)) return 2;
+    return 0;
+}
 
 void RecOverlay::Redraw(bool move) {
     if (mode_ == Mode::None) return;
     // Keep the current position if the user dragged the pill.
     if (!move) GetWindowRect(win_.Hwnd(), &rect_);
-    win_.Render(rect_, scale_, move, [&](Painter& p) {
+    win_.Render(rect_, scale_, move, [&](Painter& p) { Paint(p); });
+}
+
+void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover) {
+    mode_ = Mode::Pill;
+    elapsed_ = elapsed;
+    paused_ = paused;
+    hover_ = hover;
+    onPause_ = [] {};
+    Paint(p);
+    mode_ = Mode::None;
+    onPause_ = nullptr;
+}
+
+void RecOverlay::Paint(Painter& p) {
+    {
         if (mode_ == Mode::Countdown) {
             p.Circle(66, 66, 62, Hex(0x111318, 0.88f));
             p.Ring(66, 66, 62, WithAlpha(White, 0.10f), 1.f);
@@ -230,23 +321,40 @@ void RecOverlay::Redraw(bool move) {
             p.Text(Rect(0, 86, 132, 112), L"녹화 준비", 12.f, TextDim, sub);
             return;
         }
-        Rect r(0.5f, 0.5f, 195.5f, 39.5f);
+        Rect r(0.5f, 0.5f, kPillW - 0.5f, kPillH - 0.5f);
         p.Fill(r, Hex(0x111318, 0.92f), 20);
-        p.Stroke(r, WithAlpha(White, 0.09f), 20);
-        float pulse = 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6);
-        p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
-        p.Circle(19, 20, 5, Rec);
-        TextStyle rec;
-        rec.weight = kBold;
-        p.Text(Rect(32, 0, 70, 40), L"REC", 11.5f, Rec, rec);
+        p.Stroke(r, WithAlpha(paused_ ? Warning : White, paused_ ? 0.35f : 0.09f), 20);
+        TextStyle label;
+        label.weight = kBold;
+        if (paused_) {
+            p.Fill(Rect::XYWH(14, 14, 3.5f, 12), Warning, 1);
+            p.Fill(Rect::XYWH(20.5f, 14, 3.5f, 12), Warning, 1);
+            p.Text(Rect(32, 0, 90, 40), L"일시정지", 11.5f, Warning, label);
+        } else {
+            float pulse = 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6);
+            p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
+            p.Circle(19, 20, 5, Rec);
+            p.Text(Rect(32, 0, 90, 40), L"REC", 11.5f, Rec, label);
+        }
         TextStyle tm;
         tm.weight = kSemibold;
         tm.tabular = true;
-        p.Text(Rect(66, 0, 160, 40), util::FormatClock(elapsed_, true), 15.f, White, tm);
+        p.Text(Rect(paused_ ? 88.f : 66.f, 0, kPillW - 68, 40), util::FormatClock(elapsed_, true), 15.f,
+               paused_ ? TextDim : White, tm);
+        // Pause / resume, then stop.
+        Rect pr = PauseRect();
+        p.Circle(pr.CX(), pr.CY(), 14, WithAlpha(White, hover_ == 1 ? 0.22f : 0.10f));
+        D2D1_COLOR_F ink = hover_ == 1 ? White : Hex(0xE6E8EE);
+        if (paused_) {
+            p.Icon(pr.Offset(1, 0), 0xE768 /*Play*/, 11.f, ink);
+        } else {
+            p.Fill(Rect::XYWH(pr.CX() - 4.5f, pr.CY() - 5.5f, 3, 11), ink, 1);
+            p.Fill(Rect::XYWH(pr.CX() + 1.5f, pr.CY() - 5.5f, 3, 11), ink, 1);
+        }
         Rect sr = StopRect();
-        p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hoverStop_ ? 0.22f : 0.10f));
-        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), hoverStop_ ? White : Hex(0xE6E8EE), 2);
-    });
+        p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hover_ == 2 ? 0.22f : 0.10f));
+        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), hover_ == 2 ? White : Hex(0xE6E8EE), 2);
+    }
 }
 
 LRESULT CALLBACK RecOverlay::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -267,38 +375,37 @@ LRESULT RecOverlay::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_NCHITTEST: {
             if (mode_ != Mode::Pill) return HTTRANSPARENT;
             auto [x, y] = toDip(l, true);
-            return StopRect().Inset(-4).Contains(x, y) ? HTCLIENT : HTCAPTION;
+            return ButtonAt(x, y) ? HTCLIENT : HTCAPTION;
         }
         case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, hoverStop_ ? IDC_HAND : IDC_SIZEALL));
+            SetCursor(LoadCursorW(nullptr, hover_ ? IDC_HAND : IDC_SIZEALL));
             return TRUE;
         case WM_MOUSEMOVE: {
             auto [x, y] = toDip(l, false);
-            bool hov = StopRect().Inset(-4).Contains(x, y);
+            int hov = ButtonAt(x, y);
             if (!tracking_) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
                 TrackMouseEvent(&tme);
                 tracking_ = true;
             }
-            if (hov != hoverStop_) {
-                hoverStop_ = hov;
+            if (hov != hover_) {
+                hover_ = hov;
                 Redraw(false);
             }
             return 0;
         }
         case WM_MOUSELEAVE:
             tracking_ = false;
-            if (hoverStop_) {
-                hoverStop_ = false;
+            if (hover_) {
+                hover_ = 0;
                 Redraw(false);
             }
             return 0;
         case WM_LBUTTONUP: {
             auto [x, y] = toDip(l, false);
-            if (StopRect().Inset(-4).Contains(x, y) && onStop_) {
-                auto cb = onStop_;
-                cb();
-            }
+            int b = ButtonAt(x, y);
+            auto cb = b == 1 ? onPause_ : b == 2 ? onStop_ : nullptr;
+            if (cb) cb();
             return 0;
         }
     }
@@ -482,6 +589,7 @@ void RegionPicker::Start(std::vector<WinInfo> windows, std::function<void(bool, 
     if (!win_.Hwnd())
         win_.Create(inst_, factory_, L"OzMakerRegion", WS_EX_TOPMOST | WS_EX_TOOLWINDOW, Proc, this);
     active_ = true;
+    full_ = true;
     GetCursorPos(&cursor_);
     OnMove(cursor_);
     Redraw();
@@ -635,10 +743,176 @@ void RegionPicker::OnMove(POINT pt) {
     if (active_) Redraw();
 }
 
+namespace {
+long long Area(const RECT& r) { return (long long)(r.right - r.left) * (r.bottom - r.top); }
+}
+
+// The picker covers the whole virtual screen, so a mouse move redraws only what changed: the guide lines, the
+// edges of the area, its label and toolbar, the hint. Elsewhere it is the same dim as before.
 void RegionPicker::Redraw() {
     POINT at = adjusting_ ? POINT{(sel_.left + sel_.right) / 2, (sel_.top + sel_.bottom) / 2} : cursor_;
-    scale_ = ScaleForRect(RECT{at.x, at.y, at.x + 1, at.y + 1});
-    win_.Render(virt_, scale_, true, [&](Painter& p) { Paint(p, scale_); });
+    float scale = ScaleForRect(RECT{at.x, at.y, at.x + 1, at.y + 1});
+    Layout L = Arrange(scale);
+    if (L.adjust)
+        for (int i = 0; i < 7; ++i) buttons_[i] = ToScreen(L.slots[i], scale);
+    const int w = virt_.right - virt_.left, h = virt_.bottom - virt_.top;
+    bool full = full_ || scale != scale_ || !win_.HasSurface(w, h);
+    std::vector<RECT> dirty;
+    if (!full) {
+        dirty = Marks(last_);
+        for (const RECT& m : Marks(L)) dirty.push_back(m);
+        // The area itself turns from dim to clear (and back) where it moved.
+        if (last_.hole != L.hole || !EqualRect(&last_.area, &L.area)) {
+            for (const Layout* l : {&last_, &L})
+                if (l->hole) dirty.push_back(ToSurface(l->r.Inset(-11), l->scale));
+        }
+        // Fewer, larger passes: each one costs about as much as this many pixels on top of its own.
+        const long long overhead = 40000;
+        for (bool merged = true; merged;) {
+            merged = false;
+            for (size_t i = 0; i < dirty.size() && !merged; ++i)
+                for (size_t j = i + 1; j < dirty.size(); ++j) {
+                    RECT u;
+                    UnionRect(&u, &dirty[i], &dirty[j]);
+                    if (Area(u) <= Area(dirty[i]) + Area(dirty[j]) + overhead) {
+                        dirty[i] = u;
+                        dirty.erase(dirty.begin() + j);
+                        merged = true;
+                        break;
+                    }
+                }
+        }
+        long long px = 0;
+        for (const RECT& d : dirty) px += Area(d);
+        full = px * 2 > (long long)w * h;
+        if (!full) stats_.partialPx += px;
+    }
+    scale_ = scale;
+    full_ = false;
+    double t0 = util::NowSeconds();
+    if (full) {
+        win_.Render(virt_, scale, true, [&](Painter& p) { Paint(p, L, Rect(0, 0, L.vw, L.vh)); });
+        ++stats_.full;
+        stats_.fullSec += util::NowSeconds() - t0;
+    } else {
+        win_.RenderDirty(scale, dirty, [&](Painter& p, const Rect& clip) { Paint(p, L, clip); });
+        ++stats_.partial;
+        stats_.partialSec += util::NowSeconds() - t0;
+    }
+    last_ = std::move(L);
+}
+
+size_t RegionPicker::StalePixels() {
+    const int w = virt_.right - virt_.left, h = virt_.bottom - virt_.top;
+    if (!active_ || !win_.HasSurface(w, h)) return SIZE_MAX;
+    GdiFlush();
+    std::vector<uint32_t> partial(win_.Bits(), win_.Bits() + (size_t)w * h);
+    // One pass over everything on the same (CPU) target: the GPU antialiases a little differently.
+    win_.RenderDirty(scale_, {RECT{0, 0, w, h}}, [&](Painter& p, const Rect& clip) { Paint(p, last_, clip); });
+    GdiFlush();
+    const uint32_t* now = win_.Bits();
+    size_t stale = 0;
+    for (size_t i = 0; i < partial.size(); ++i) {
+        uint32_t a = partial[i], b = now[i];
+        for (int s = 0; s < 32 && a != b; s += 8)
+            if (std::abs((int)((a >> s) & 0xFF) - (int)((b >> s) & 0xFF)) > 2) {
+                ++stale;
+                break;
+            }
+    }
+    return stale;
+}
+
+RECT RegionPicker::ToSurface(const Rect& r, float scale) const {
+    return {(LONG)std::floor(r.l * scale), (LONG)std::floor(r.t * scale), (LONG)std::ceil(r.r * scale),
+            (LONG)std::ceil(r.b * scale)};
+}
+
+RECT RegionPicker::ToScreen(const Rect& r, float scale) const {
+    return {(LONG)std::lround(r.l * scale + virt_.left), (LONG)std::lround(r.t * scale + virt_.top),
+            (LONG)std::lround(r.r * scale + virt_.left), (LONG)std::lround(r.b * scale + virt_.top)};
+}
+
+// What differs from the plain dim, in surface pixels. Paint draws nothing else.
+std::vector<RECT> RegionPicker::Marks(const Layout& L) const {
+    std::vector<Rect> m;
+    if (L.hole) {
+        const Rect& r = L.r;
+        const float e = 9;  // the stroke, the handles
+        m.push_back(Rect(r.l - e, r.t - e, r.r + e, r.t + e));
+        m.push_back(Rect(r.l - e, r.b - e, r.r + e, r.b + e));
+        m.push_back(Rect(r.l - e, r.t - e, r.l + e, r.b + e));
+        m.push_back(Rect(r.r - e, r.t - e, r.r + e, r.b + e));
+        if (L.adjust) {
+            for (int i = 1; i < 3; ++i) {
+                float x = r.l + r.W() * i / 3, y = r.t + r.H() * i / 3;
+                m.push_back(Rect(x - 1, r.t, x + 1, r.b));
+                m.push_back(Rect(r.l, y - 1, r.r, y + 1));
+            }
+            m.push_back(Rect(L.bar.l, L.bar.t, L.bar.r, L.bar.b + 3));  // with its shadow
+        }
+        m.push_back(L.label);
+    }
+    if (L.lines) {
+        m.push_back(Rect(0, L.cy - 1, L.vw, L.cy + 1));
+        m.push_back(Rect(L.cx - 1, 0, L.cx + 1, L.vh));
+    }
+    m.push_back(L.pill);
+    std::vector<RECT> out;
+    out.reserve(m.size());
+    for (const Rect& r : m) out.push_back(ToSurface(r.Inset(-2), L.scale));  // antialiasing
+    return out;
+}
+
+RegionPicker::Layout RegionPicker::Arrange(float scale) const {
+    Layout L;
+    L.scale = scale;
+    L.vw = (virt_.right - virt_.left) / scale;
+    L.vh = (virt_.bottom - virt_.top) / scale;
+    L.adjust = adjusting_;
+    L.lines = !dragging_ && !adjusting_;
+    L.cx = (cursor_.x - virt_.left) / scale;
+    L.cy = (cursor_.y - virt_.top) / scale;
+    auto toDip = [&](const RECT& r) {
+        return Rect((r.left - virt_.left) / scale, (r.top - virt_.top) / scale, (r.right - virt_.left) / scale,
+                    (r.bottom - virt_.top) / scale);
+    };
+    Painter m;  // measures only
+    L.hole = dragging_ || hover_ >= 0 || adjusting_;
+    if (L.hole) {
+        L.area = dragging_ ? Selection() : adjusting_ ? sel_ : HoverArea();
+        const Rect r = L.r = toDip(L.area);
+        // Size in physical pixels: exactly what will be recorded.
+        L.dims = util::Format(L"%d × %d", L.area.right - L.area.left, L.area.bottom - L.area.top);
+        if (!dragging_ && !adjusting_) L.title = cands_[hover_].title;
+        L.tw = L.title.empty() ? 0 : std::min(320.f, m.Measure(L.title, 13.f, kSemibold)) + 12;
+        float lw = L.tw + m.Measure(L.dims, 13.f, kSemibold) + 24;
+        L.label = Rect::XYWH(r.l, r.t - 36, lw, 30);
+        if (L.label.t < 4) L.label = Rect::XYWH(r.l + 8, r.t + 8, lw, 30);
+        if (L.label.r > L.vw - 4) L.label = L.label.Offset(L.vw - 4 - L.label.r, 0);
+        if (adjusting_) {
+            // Toolbar below the area (inside it when the screen ends there): ratios, cancel, confirm.
+            Rect mon = toDip(anchorMon_);
+            const float bh = 34, rw = 54, cw = 64, ow = 84, gap = 10;
+            float tw = rw * 5 + gap + cw + 6 + ow + 12;
+            float ty = r.b + 12;
+            if (ty + bh + 12 > mon.b) ty = std::max(r.t + 12, r.b - bh - 12);
+            L.bar = Rect::XYWH(std::clamp(r.CX() - tw / 2, mon.l + 8, mon.r - 8 - tw), ty, tw, bh + 12);
+            float x = L.bar.l + 6;
+            for (int i = 0; i < 5; ++i, x += rw) L.slots[i] = Rect::XYWH(x, L.bar.t + 6, rw, bh);
+            x += gap;
+            L.slots[5] = Rect::XYWH(x, L.bar.t + 6, cw, bh);
+            L.slots[6] = Rect::XYWH(x + cw + 6, L.bar.t + 6, ow, bh);
+        }
+    }
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromPoint(cursor_, MONITOR_DEFAULTTONEAREST), &mi);
+    Rect mon = toDip(mi.rcWork);
+    L.msg = adjusting_ ? L"끌어서 옮기거나 모서리로 크기를 조절하세요" : L"드래그해서 녹화할 영역을 지정하세요";
+    L.hint = adjusting_ ? L"Enter · 확인   Esc · 취소" : L"클릭 · 창 전체   Esc · 취소";
+    float mw = m.Measure(L.msg, 14.f, kSemibold) + m.Measure(L.hint, 12.f) + 64;
+    L.pill = Rect::XYWH(mon.CX() - mw / 2, mon.t + 24, mw, 40);
+    return L;
 }
 
 void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, bool adjust) {
@@ -658,31 +932,27 @@ void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT
         pressed_ = dragging_ = true;
     }
     scale_ = 1;
-    Paint(p, 1.f);
+    Layout L = Arrange(1.f);
+    Paint(p, L, Rect(0, 0, L.vw, L.vh));
     pressed_ = dragging_ = adjusting_ = false;
 }
 
-void RegionPicker::Paint(Painter& p, float scale) {
-    float vw = (virt_.right - virt_.left) / scale, vh = (virt_.bottom - virt_.top) / scale;
-    auto toDip = [&](const RECT& r) {
-        return Rect((r.left - virt_.left) / scale, (r.top - virt_.top) / scale, (r.right - virt_.left) / scale,
-                    (r.bottom - virt_.top) / scale);
-    };
+// clip: the part being redrawn; what lies outside it is skipped (the target clips the rest).
+void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
+    auto meets = [&](const Rect& a) { return !a.Inset(-2).Intersect(clip).Empty(); };
     const D2D1_COLOR_F dim = Hex(0x05060A, 0.55f);
-    Rect all(0, 0, vw, vh);
-    bool hole = dragging_ || hover_ >= 0 || adjusting_;
-    RECT area = dragging_ ? Selection() : adjusting_ ? sel_ : HoverArea();
-    if (!hole) {
+    Rect all(0, 0, L.vw, L.vh);
+    if (!L.hole) {
         p.Fill(all, dim);
     } else {
-        Rect r = toDip(area);
+        const Rect& r = L.r;
         p.Fill(Rect(all.l, all.t, all.r, r.t), dim);
         p.Fill(Rect(all.l, r.b, all.r, all.b), dim);
         p.Fill(Rect(all.l, r.t, r.l, r.b), dim);
         p.Fill(Rect(r.r, r.t, all.r, r.b), dim);
         p.Fill(r, Hex(0x000000, 0.004f));  // keeps the hole clickable
-        p.Stroke(r.Inset(-1.f), dragging_ || adjusting_ ? Accent : WithAlpha(Accent, 0.85f), 0, 2.f);
-        if (adjusting_) {
+        p.Stroke(r.Inset(-1.f), dragging_ || L.adjust ? Accent : WithAlpha(Accent, 0.85f), 0, 2.f);
+        if (L.adjust) {
             // Thirds as a framing aid, and the handles.
             for (int i = 1; i < 3; ++i) {
                 p.Line(r.l + r.W() * i / 3, r.t, r.l + r.W() * i / 3, r.b, WithAlpha(White, 0.18f), 1.f);
@@ -699,47 +969,28 @@ void RegionPicker::Paint(Painter& p, float scale) {
             }
         }
 
-        // Size in physical pixels: exactly what will be recorded.
-        std::wstring dims = util::Format(L"%d × %d", area.right - area.left, area.bottom - area.top);
-        std::wstring title = dragging_ || adjusting_ ? L"" : cands_[hover_].title;
-        TextStyle ts;
-        ts.weight = kSemibold;
-        ts.tabular = true;
-        float tw = title.empty() ? 0 : std::min(320.f, p.Measure(title, 13.f, kSemibold)) + 12;
-        float dw = p.Measure(dims, 13.f, kSemibold);
-        float lw = tw + dw + 24;
-        Rect label = Rect::XYWH(r.l, r.t - 36, lw, 30);
-        if (label.t < 4) label = Rect::XYWH(r.l + 8, r.t + 8, lw, 30);
-        if (label.r > vw - 4) label = label.Offset(vw - 4 - label.r, 0);
-        p.Fill(label, Accent, 8);
-        if (!title.empty()) p.Text(Rect(label.l + 12, label.t, label.l + tw, label.b), title, 13.f, White, ts);
-        p.Text(Rect(label.l + 12 + tw, label.t, label.r - 8, label.b), dims, 13.f,
-               title.empty() ? White : WithAlpha(White, 0.8f), ts);
+        if (meets(L.label)) {
+            TextStyle ts;
+            ts.weight = kSemibold;
+            ts.tabular = true;
+            const Rect& label = L.label;
+            p.Fill(label, Accent, 8);
+            if (!L.title.empty()) p.Text(Rect(label.l + 12, label.t, label.l + L.tw, label.b), L.title, 13.f, White, ts);
+            p.Text(Rect(label.l + 12 + L.tw, label.t, label.r - 8, label.b), L.dims, 13.f,
+                   L.title.empty() ? White : WithAlpha(White, 0.8f), ts);
+        }
 
-        if (adjusting_) {
-            // Toolbar below the area (inside it when the screen ends there): ratios, cancel, confirm.
-            Rect mon = toDip(anchorMon_);
-            const float bh = 34, rw = 54, cw = 64, ow = 84, gap = 10;
-            float tw2 = rw * 5 + gap + cw + 6 + ow + 12;
-            float ty = r.b + 12;
-            if (ty + bh + 12 > mon.b) ty = std::max(r.t + 12, r.b - bh - 12);
-            Rect bar = Rect::XYWH(std::clamp(r.CX() - tw2 / 2, mon.l + 8, mon.r - 8 - tw2), ty, tw2, bh + 12);
+        if (L.adjust && meets(Rect(L.bar.l, L.bar.t, L.bar.r, L.bar.b + 3))) {
+            const Rect& bar = L.bar;
             p.Fill(bar.Offset(0, 3), Hex(0x000000, 0.35f), 12);
             p.Fill(bar, Hex(0x15181E, 0.97f), 12);
             p.Stroke(bar.Inset(0.5f), WithAlpha(White, 0.1f), 12);
-            Rect slots[7];
-            float x = bar.l + 6;
-            for (int i = 0; i < 5; ++i, x += rw) slots[i] = Rect::XYWH(x, bar.t + 6, rw, bh);
-            x += gap;
-            slots[5] = Rect::XYWH(x, bar.t + 6, cw, bh);
-            slots[6] = Rect::XYWH(x + cw + 6, bar.t + 6, ow, bh);
-            float cx = (cursor_.x - virt_.left) / scale, cy = (cursor_.y - virt_.top) / scale;
             TextStyle cs;
             cs.h = AlignCenter;
             cs.weight = kSemibold;
             for (int i = 0; i < 7; ++i) {
-                const Rect& b = slots[i];
-                bool hot = op_ < 0 && b.Contains(cx, cy);
+                const Rect& b = L.slots[i];
+                bool hot = op_ < 0 && b.Contains(L.cx, L.cy);
                 if (i == 6)
                     p.Fill(b, hot ? AccentHi : Accent, 8);
                 else if (i == ratio_)
@@ -748,34 +999,27 @@ void RegionPicker::Paint(Painter& p, float scale) {
                     p.Fill(b, Hex(0x252A34), 8);
                 const wchar_t* text = i < 5 ? kRatios[i].label : i == 5 ? L"취소" : L"확인";
                 p.Text(b, text, 12.5f, i == 6 || i == ratio_ || hot ? White : TextDim, cs);
-                buttons_[i] = {(LONG)std::lround(b.l * scale + virt_.left), (LONG)std::lround(b.t * scale + virt_.top),
-                               (LONG)std::lround(b.r * scale + virt_.left), (LONG)std::lround(b.b * scale + virt_.top)};
             }
         }
     }
-    if (!dragging_ && !adjusting_) {
+    if (L.lines) {
         // Guide lines through the cursor help line up the first corner.
-        float cx = (cursor_.x - virt_.left) / scale, cy = (cursor_.y - virt_.top) / scale;
-        p.Line(0, cy, vw, cy, WithAlpha(White, 0.22f), 1.f);
-        p.Line(cx, 0, cx, vh, WithAlpha(White, 0.22f), 1.f);
+        p.Line(0, L.cy, L.vw, L.cy, WithAlpha(White, 0.22f), 1.f);
+        p.Line(L.cx, 0, L.cx, L.vh, WithAlpha(White, 0.22f), 1.f);
     }
 
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(MonitorFromPoint(cursor_, MONITOR_DEFAULTTONEAREST), &mi);
-    Rect mon = toDip(mi.rcWork);
-    std::wstring msg = adjusting_ ? L"끌어서 옮기거나 모서리로 크기를 조절하세요" : L"드래그해서 녹화할 영역을 지정하세요";
-    std::wstring hint = adjusting_ ? L"Enter · 확인   Esc · 취소" : L"클릭 · 창 전체   Esc · 취소";
-    float mw = p.Measure(msg, 14.f, kSemibold) + p.Measure(hint, 12.f) + 64;
-    Rect pill = Rect::XYWH(mon.CX() - mw / 2, mon.t + 24, mw, 40);
-    p.Fill(pill, Hex(0x111318, 0.95f), 20);
-    p.Stroke(pill.Inset(0.5f), WithAlpha(White, 0.1f), 20);
-    p.Stroke(Rect::Centered(pill.l + 22, pill.CY(), 14, 11), Accent, 2, 1.6f);
-    TextStyle ts;
-    ts.weight = kSemibold;
-    p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), msg, 14.f, White, ts);
-    TextStyle hs;
-    hs.h = AlignEnd;
-    p.Text(Rect(pill.l, pill.t, pill.r - 16, pill.b), hint, 12.f, TextDim, hs);
+    if (meets(L.pill)) {
+        const Rect& pill = L.pill;
+        p.Fill(pill, Hex(0x111318, 0.95f), 20);
+        p.Stroke(pill.Inset(0.5f), WithAlpha(White, 0.1f), 20);
+        p.Stroke(Rect::Centered(pill.l + 22, pill.CY(), 14, 11), Accent, 2, 1.6f);
+        TextStyle ts;
+        ts.weight = kSemibold;
+        p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), L.msg, 14.f, White, ts);
+        TextStyle hs;
+        hs.h = AlignEnd;
+        p.Text(Rect(pill.l, pill.t, pill.r - 16, pill.b), L.hint, 12.f, TextDim, hs);
+    }
 }
 
 LRESULT CALLBACK RegionPicker::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {

@@ -40,6 +40,7 @@ private:
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
     enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate };
     enum class RecState { Idle, Countdown, Recording };
+    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
 
     // ---- window plumbing (App.cpp)
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -97,6 +98,8 @@ private:
 
     // ---- sources
     void RefreshWindows();
+    void WatchWindows(bool on);
+    static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND h, LONG obj, LONG child, DWORD, DWORD);
     void SelectTarget(HWND h);
     const WinInfo* FindWindowInfo(HWND h) const;
     void SetSource(int source);
@@ -114,12 +117,18 @@ private:
     void StopRecording();
     void OnVideoSaved(const CaptureResult& r);
     void OnHotkey();
+    void TogglePause();
+    // Every recording tick: the length limit and the free space (#17). Stops with a reason when one is reached.
+    void CheckLimits();
+    std::wstring RecordingDir() const;  // where the recording grows: the MP4's folder, or the clip's temp file
     bool NotifyQuietly() const;  // a fullscreen app is in front of a hotkey recording
     void ReportError(const std::wstring& title, const std::wstring& text);
     bool UseMonitorCapture(HWND target) const;
     void ProbeEncoders();
     std::wstring VideoSummary() const;
     std::wstring AudioSummary(int source) const;
+    std::wstring MicDeviceName() const;
+    bool MicMenu(const Rect& anchor);
 
     // ---- files: opening videos, recent files, recordings not exported yet
     void OpenMediaFile(const std::wstring& path);
@@ -165,7 +174,8 @@ private:
 
     // ---- system
     void RegisterRecordHotkey();
-    void SetCapturingHotkey(bool on);
+    void RegisterPauseHotkey();  // only while recording, so the keys stay free for other programs otherwise
+    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause, 0 = none
     std::wstring HotkeyLabel() const;  // the record hotkey, or a note that there is none
     void TrayAdd();
     void TrayUpdate();
@@ -187,6 +197,7 @@ private:
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
+    int RunTestWindow(double seconds);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
@@ -227,6 +238,9 @@ private:
     RecTarget recTarget_;
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     std::wstring recNotice_;
+    std::wstring stopReason_;  // why the recording stopped by itself (length limit, disk space), shown after it
+    bool recPaused_ = false;
+    double nextDiskCheck_ = 0;
     std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")
     std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
@@ -318,7 +332,12 @@ private:
     bool toastError_ = false;
     double toastUntil_ = 0;
 
-    bool capturingHotkey_ = false, hotkeyOk_ = true;
+    int capturingHotkey_ = 0;  // the hotkey being chosen in the settings
+    bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
+    std::vector<HWINEVENTHOOK> winHooks_;
+    bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
+    std::vector<AudioCapture::Device> micDevices_;  // 설정 › 소리, listed when the tab is opened
+    bool micListed_ = false;
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;

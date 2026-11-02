@@ -90,7 +90,7 @@ void App::DrawHeader(Rect r) {
                        icon::Back) ||
             ui_.In().Key(VK_ESCAPE)) {
             screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
-            SetCapturingHotkey(false);
+            SetCapturingHotkey(0);
             if (screen_ == Screen::Home) RefreshWindows();
         }
     }
@@ -114,13 +114,19 @@ void App::DrawHeader(Rect r) {
         DrawFilesButton(right);
     }
     if (rec_ == RecState::Recording) {
-        std::wstring t = L"REC  " + util::FormatClock(capture_.Elapsed(), true);
-        Rect pill = Rect::Centered(r.CX(), r.CY(), 120, 30);
-        ui_.Fill(pill, WithAlpha(Rec, 0.16f), 15);
-        ui_.Circle(pill.l + 16, pill.CY(), 4.5f, Rec);
+        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(capture_.Elapsed(), true);
+        const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
+        Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
+        ui_.Fill(pill, WithAlpha(tint, 0.16f), 15);
+        if (recPaused_) {
+            ui_.Fill(Rect::XYWH(pill.l + 12, pill.CY() - 5, 3, 10), tint, 1);
+            ui_.Fill(Rect::XYWH(pill.l + 17, pill.CY() - 5, 3, 10), tint, 1);
+        } else {
+            ui_.Circle(pill.l + 16, pill.CY(), 4.5f, Rec);
+        }
         TextStyle st = Bold();
         st.tabular = true;
-        ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, RecHi, st);
+        ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, recPaused_ ? Warning : RecHi, st);
     }
     ui_.Line(r.l, r.b - 0.5f, r.r, r.b - 0.5f, Border, 1.f);
 }
@@ -819,18 +825,29 @@ void App::DrawCapturePanel(Rect r) {
                                  {L"원본", L"1280", L"960", L"720", L"480"}, settings_.sizeIdx);
     }
 
-    // Toggles: cursor, (window) title bar, (video) sound.
-    Rect toggles = controls.CutTop(44);
-    int n = 1 + (src == kSourceWindow) + video;
-    float tw = (toggles.W() - 10 * (n - 1)) / n;
-    changed |= ui_.ToggleRow(HashId("home.cursor"), toggles.CutLeft(tw), L"마우스 커서", settings_.cursor);
-    if (src == kSourceWindow) {
-        toggles.CutLeft(10);
-        changed |= ui_.ToggleRow(HashId("home.client"), toggles.CutLeft(tw), L"제목 표시줄 제외", settings_.clientOnly);
-    }
+    // Toggles: cursor, (window) title bar, (video) sound and mic. Each as wide as its label needs, with the room
+    // left shared out evenly (or all narrowed alike when there is too little).
+    struct ToggleItem {
+        UiId id;
+        const wchar_t* label;
+        bool* v;
+    };
+    std::vector<ToggleItem> items{{HashId("home.cursor"), L"마우스 커서", &settings_.cursor}};
+    if (src == kSourceWindow) items.push_back({HashId("home.client"), L"제목 표시줄 제외", &settings_.clientOnly});
     if (video) {
-        toggles.CutLeft(10);
-        changed |= ui_.ToggleRow(HashId("home.audio"), toggles.CutLeft(tw), L"소리 녹음", settings_.audio);
+        items.push_back({HashId("home.audio"), L"소리 녹음", &settings_.audio});
+        items.push_back({HashId("home.mic"), L"마이크", &settings_.mic});
+    }
+    Rect toggles = controls.CutTop(44);
+    const float n = (float)items.size(), avail = toggles.W() - 10 * (n - 1);
+    float need = 0;
+    for (const auto& it : items) need += ui_.Measure(it.label, 13.f) + 64;  // ToggleRow: padding, label, switch
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) toggles.CutLeft(10);
+        float w = ui_.Measure(items[i].label, 13.f) + 64;
+        w = need <= avail ? w + (avail - need) / n : w * avail / need;
+        changed |= ui_.ToggleRow(items[i].id, i + 1 == items.size() ? toggles : toggles.CutLeft(w), items[i].label,
+                                 *items[i].v);
     }
     controls.CutTop(10);
 
@@ -1480,7 +1497,8 @@ void App::SettingSection(Rect& area, std::wstring_view title) {
 void App::OpenSettings(int tab) {
     if (screen_ != Screen::Settings) settingsReturn_ = screen_;
     screen_ = Screen::Settings;
-    SetCapturingHotkey(false);
+    SetCapturingHotkey(0);
+    micListed_ = false;
     if (tab >= 0 && tab != settings_.settingsTab) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
@@ -1528,7 +1546,7 @@ void App::DrawSettings(Rect r) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
         settingsDirty_ = true;
-        SetCapturingHotkey(false);
+        SetCapturingHotkey(0);
     }
 
     // Scroll view, one per tab
@@ -1626,12 +1644,26 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
 void App::SettingsRecord(Rect& area, bool& changed) {
     std::wstring hkDesc = hotkeyOk_ ? L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"
                                     : L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요";
-    SettingRow(area, L"녹화 단축키", hkDesc, 230, [&](Rect c) {
-        std::wstring label = capturingHotkey_ ? L"키 조합을 누르세요…" : util::HotkeyToString(settings_.hkMods, settings_.hkVk);
-        if (ui_.Button(HashId("set.hotkey"), c, label, capturingHotkey_ ? BtnStyle::Primary : BtnStyle::Secondary,
+    auto hotkeyButton = [&](Rect c, int which, UINT mods, UINT vk) {
+        bool on = capturingHotkey_ == which;
+        std::wstring label = on ? L"키 조합을 누르세요…" : util::HotkeyToString(mods, vk);
+        if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
                        icon::Keyboard, true, 13.f))
-            SetCapturingHotkey(!capturingHotkey_);
-    });
+            SetCapturingHotkey(on ? 0 : which);
+    };
+    SettingRow(area, L"녹화 단축키", hkDesc, 230,
+               [&](Rect c) { hotkeyButton(c, kHotkeyRecord, settings_.hkMods, settings_.hkVk); });
+
+    SettingRow(area, L"일시정지 단축키",
+               pauseHotkeyOk_ ? L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"
+                              : L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요",
+               230, [&](Rect c) { hotkeyButton(c, kHotkeyPause, settings_.hkPauseMods, settings_.hkPauseVk); });
+
+    SettingRow(area, L"최대 녹화 길이", L"이 길이가 되면 저장하고 편집 화면을 엽니다 · 움짤과 동영상 모두", 300,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.maxlen"), c, {L"끔", L"10분", L"30분", L"1시간"},
+                                            settings_.maxLengthIdx);
+               });
 
     SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,
                [&](Rect c) {
@@ -1643,10 +1675,15 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                    changed |= ui_.Segmented(HashId("set.mode"), c, {L"자동", L"창", L"화면"}, settings_.captureMode);
                });
 
-    SettingRow(area, L"녹화 중 표시", L"녹화 시간 · 중지 버튼 · 영역 테두리 (녹화 결과에는 찍히지 않습니다)", 300,
+    SettingRow(area, L"녹화 중 표시", L"녹화 시간 · 일시정지 · 중지 버튼 · 영역 테두리 (녹화 결과에는 찍히지 않습니다)", 300,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.overlay"), c, {L"항상", L"전체화면 제외", L"숨김"},
                                             settings_.overlayMode);
+               });
+
+    SettingRow(area, L"클릭 강조", L"마우스를 누른 곳에 퍼지는 원을 함께 녹화합니다 · 왼쪽 버튼 노랑, 오른쪽 파랑", 60,
+               [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.clickfx"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.clickFx);
                });
 }
 
@@ -1718,6 +1755,46 @@ void App::SettingsAudio(Rect& area, bool& changed) {
                60, [&](Rect c) {
                    changed |= ui_.Toggle(HashId("set.audio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.audio);
                });
+
+    SettingRow(area, L"마이크 녹음", L"내 목소리를 동영상(MP4)에 함께 녹음합니다 · 위의 소리와 한 트랙으로 섞입니다", 60,
+               [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.mic"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.mic);
+               });
+    if (!micListed_) {
+        // Tests show a made-up device, not this PC's.
+        micDevices_ = testWindowsOnly_ ? std::vector<AudioCapture::Device>{{L"test", L"마이크(USB 테스트 장치)", true}}
+                                       : AudioCapture::InputDevices();
+        micListed_ = true;
+    }
+    bool micKnown = settings_.micDevice.empty();
+    for (const auto& d : micDevices_) micKnown |= d.id == settings_.micDevice;
+    std::wstring micDesc = micDevices_.empty() ? L"연결된 마이크가 없습니다"
+                           : !micKnown         ? L"고른 장치가 연결되어 있지 않습니다 · 연결하거나 다른 장치를 고르세요"
+                                               : L"기본 장치로 두면 Windows에서 기본 장치를 바꿀 때 함께 바뀝니다";
+    SettingRow(area, L"마이크 장치", micDesc, 300, [&](Rect c) {
+        UiId id = HashId("set.micDevice");
+        bool hov = ui_.Hover(c);
+        if (ui_.Click(id, c)) changed |= MicMenu(c);
+        ui_.Fill(c, hov ? Surface3 : Surface2, 8);
+        ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
+        Rect t(c.l + 12, c.t, c.r - 30, c.b);
+        ui_.PushClip(t);
+        ui_.Text(t, MicDeviceName(), 13.f, micKnown ? TextColor : Warning);
+        ui_.PopClip();
+        ui_.Icon(Rect(c.r - 30, c.t, c.r - 8, c.b), icon::ChevronDown, 10.f, TextDim);
+    });
+    SettingRow(area, L"마이크 음량", L"목소리가 작거나 크게 들리면 조절하세요 · 100%는 장치 그대로", 300, [&](Rect c) {
+        Rect label = c.CutRight(52);
+        float v = (float)settings_.micVolume;
+        if (ui_.Slider(HashId("set.micVol"), c.Inset(8, 0), v, 0.f, 200.f)) {
+            int nv = (int)std::lround(v / 5) * 5;  // in steps of 5 %
+            changed |= nv != settings_.micVolume;
+            settings_.micVolume = nv;
+        }
+        TextStyle st = Align(AlignEnd);
+        st.tabular = true;
+        ui_.Text(label, util::Format(L"%d%%", settings_.micVolume), 13.f, TextColor, st);
+    });
 
     SettingRow(area, L"오디오 비트레이트", L"AAC · 160 kbps면 게임 · 음악 모두 충분합니다", 260, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.abr"), c, {L"96", L"128", L"160", L"192"}, settings_.aBitrateIdx);

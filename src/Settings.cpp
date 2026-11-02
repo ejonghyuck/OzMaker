@@ -58,10 +58,13 @@ void Settings::Load() {
     audio = ReadInt(ini, L"Audio", audio, 0, 1) != 0;
     aBitrateIdx = ReadInt(ini, L"AudioBitrate", aBitrateIdx, 0, _countof(kAudioBitrateOptions) - 1);
     aRateIdx = ReadInt(ini, L"AudioRate", aRateIdx, 0, _countof(kAudioRateOptions) - 1);
+    mic = ReadInt(ini, L"Mic", mic, 0, 1) != 0;
+    micVolume = ReadInt(ini, L"MicVolume", micVolume, 0, 200);
     fpsIdx = ReadInt(ini, L"Fps", fpsIdx, 0, _countof(kFpsOptions) - 1);
     sizeIdx = ReadInt(ini, L"Size", sizeIdx, 0, _countof(kSizeOptions) - 1);
     cursor = ReadInt(ini, L"Cursor", cursor, 0, 1) != 0;
     clientOnly = ReadInt(ini, L"ClientOnly", clientOnly, 0, 1) != 0;
+    clickFx = ReadInt(ini, L"ClickHighlight", clickFx, 0, 1) != 0;
     captureMode = ReadInt(ini, L"CaptureMode", captureMode, 0, 2);
     countdown = ReadInt(ini, L"Countdown", countdown, 0, 2);
     overlayMode = ReadInt(ini, L"Overlay", overlayMode, 0, 2);
@@ -77,6 +80,9 @@ void Settings::Load() {
     windowMax = ReadInt(ini, L"WindowMax", windowMax, 0, 1) != 0;
     hkMods = (UINT)ReadInt(ini, L"HotkeyMods", (int)hkMods, 0, 0xF);
     hkVk = (UINT)ReadInt(ini, L"HotkeyKey", (int)hkVk, 1, 0xFE);
+    hkPauseMods = (UINT)ReadInt(ini, L"PauseHotkeyMods", (int)hkPauseMods, 0, 0xF);
+    hkPauseVk = (UINT)ReadInt(ini, L"PauseHotkeyKey", (int)hkPauseVk, 1, 0xFE);
+    maxLengthIdx = ReadInt(ini, L"MaxLength", maxLengthIdx, 0, _countof(kMaxLengthOptions) - 1);
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
@@ -94,6 +100,8 @@ void Settings::Load() {
     monitor = buf;
     GetPrivateProfileStringW(L"OzMaker", L"OutDir", L"", buf, _countof(buf), ini.c_str());
     outDir = buf;
+    GetPrivateProfileStringW(L"OzMaker", L"MicDevice", L"", buf, _countof(buf), ini.c_str());
+    micDevice = buf;
     recent.clear();
     for (size_t i = 0; i < kMaxRecent; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
@@ -131,10 +139,13 @@ void Settings::Save() const {
     num(L"Audio", audio);
     num(L"AudioBitrate", aBitrateIdx);
     num(L"AudioRate", aRateIdx);
+    num(L"Mic", mic);
+    num(L"MicVolume", micVolume);
     num(L"Fps", fpsIdx);
     num(L"Size", sizeIdx);
     num(L"Cursor", cursor);
     num(L"ClientOnly", clientOnly);
+    num(L"ClickHighlight", clickFx);
     num(L"CaptureMode", captureMode);
     num(L"Countdown", countdown);
     num(L"Overlay", overlayMode);
@@ -150,6 +161,9 @@ void Settings::Save() const {
     num(L"WindowMax", windowMax);
     num(L"HotkeyMods", (long)hkMods);
     num(L"HotkeyKey", (long)hkVk);
+    num(L"PauseHotkeyMods", (long)hkPauseMods);
+    num(L"PauseHotkeyKey", (long)hkPauseVk);
+    num(L"MaxLength", maxLengthIdx);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
     num(L"ExportSize", scaleIdx);
@@ -159,6 +173,7 @@ void Settings::Save() const {
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);
+    put(L"MicDevice", micDevice);
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);

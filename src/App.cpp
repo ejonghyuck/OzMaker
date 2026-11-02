@@ -92,6 +92,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--test-window") return RunTestWindow(_wtof(args[1].c_str()));
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
@@ -183,7 +184,7 @@ bool App::CreateMainWindow(int show) {
                     util::HotkeyToString(settings_.hkMods, settings_.hkVk) +
                         L"을(를) 다른 프로그램이 쓰고 있습니다. 설정에서 다른 조합을 지정하세요.");
     RefreshWindows();
-    SetTimer(hwnd_, kTimerRefresh, 2500, nullptr);
+    WatchWindows(true);
     if (restored && settings_.windowMax && show != SW_HIDE && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE)
         show = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd_, show);
@@ -457,7 +458,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (capturingHotkey_) {
                 UINT vk = (UINT)w;
                 if (vk == VK_ESCAPE) {
-                    SetCapturingHotkey(false);
+                    SetCapturingHotkey(0);
                 } else if (vk != VK_CONTROL && vk != VK_MENU && vk != VK_SHIFT && vk != VK_LWIN && vk != VK_RWIN) {
                     UINT mods = 0;
                     if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
@@ -465,20 +466,27 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     if (GetKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
                     if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
                     bool fkey = vk >= VK_F1 && vk <= VK_F24;
-                    if (fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) {
-                        UINT oldMods = settings_.hkMods, oldVk = settings_.hkVk;
-                        settings_.hkMods = mods;
-                        settings_.hkVk = vk;
-                        RegisterRecordHotkey();
-                        if (hotkeyOk_) {
-                            capturingHotkey_ = false;
+                    const bool record = capturingHotkey_ == kHotkeyRecord;
+                    UINT& hm = record ? settings_.hkMods : settings_.hkPauseMods;
+                    UINT& hv = record ? settings_.hkVk : settings_.hkPauseVk;
+                    const UINT otherMods = record ? settings_.hkPauseMods : settings_.hkMods;
+                    const UINT otherVk = record ? settings_.hkPauseVk : settings_.hkVk;
+                    if ((fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) && mods == otherMods &&
+                        vk == otherVk) {
+                        Toast(record ? L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요."
+                                     : L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요.",
+                              true);
+                    } else if (fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) {
+                        // Try it first; the keys are registered for real once capturing ends.
+                        if (RegisterHotKey(hwnd_, capturingHotkey_, mods | MOD_NOREPEAT, vk)) {
+                            UnregisterHotKey(hwnd_, capturingHotkey_);
+                            hm = mods;
+                            hv = vk;
+                            SetCapturingHotkey(0);
                             settings_.Save();
                             TrayUpdate();
                         } else {
-                            // Keep the previous key (registered again when capturing ends) and let them try another.
-                            UnregisterHotKey(hwnd_, 1);
-                            settings_.hkMods = oldMods;
-                            settings_.hkVk = oldVk;
+                            // Keep the previous key and let them try another.
                             Toast(util::HotkeyToString(mods, vk) + L"은(는) 다른 프로그램이 쓰고 있습니다. 다른 조합을 눌러 주세요.",
                                   true);
                         }
@@ -535,11 +543,15 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 1;
         case WM_ACTIVATE:
             if (LOWORD(w) != WA_INACTIVE && screen_ == Screen::Home) RefreshWindows();
-            if (LOWORD(w) == WA_INACTIVE) SetCapturingHotkey(false);  // keys go elsewhere now; keep the old one
+            if (LOWORD(w) == WA_INACTIVE) SetCapturingHotkey(0);  // keys go elsewhere now; keep the old one
             Invalidate();
             break;
         case WM_HOTKEY:
-            if (w == 1 && !capturingHotkey_) OnHotkey();
+            if (capturingHotkey_) return 0;
+            if (w == kHotkeyRecord)
+                OnHotkey();
+            else if (w == kHotkeyPause)
+                TogglePause();
             return 0;
         case WM_DISPLAYCHANGE:
             monitors_ = EnumerateMonitors();
@@ -555,6 +567,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     }
                     overlay_.Update(capture_.Elapsed(), capture_.Frames());
                     if (IsWindowVisible(hwnd_)) Invalidate();
+                    CheckLimits();
                 }
             } else if (w == kTimerCountdown) {
                 if (rec_ == RecState::Countdown) {
@@ -569,6 +582,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
                 CheckForUpdate();
             } else if (w == kTimerRefresh) {
+                // Otherwise Home refreshes when it is shown or activated again.
+                KillTimer(hwnd_, kTimerRefresh);
+                windowsDirty_ = false;
                 if (screen_ == Screen::Home && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && !picker_.Active() &&
                     !regionPicker_.Active())
                     RefreshWindows();
@@ -680,7 +696,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             audioPreview_.Stop();
             fetcher_.Stop();
             ReleaseThumbnails();
-            UnregisterHotKey(hwnd_, 1);
+            WatchWindows(false);
+            UnregisterHotKey(hwnd_, kHotkeyRecord);
+            UnregisterHotKey(hwnd_, kHotkeyPause);
             TrayRemove();
             settings_.Save();
             PostQuitMessage(0);
@@ -704,6 +722,41 @@ void App::RefreshWindows() {
     }
     monitors_ = EnumerateMonitors();
     Invalidate();
+}
+
+namespace {
+App* g_watcher = nullptr;  // the App whose window list the WinEvent hooks keep current
+}
+
+// Other programs' windows appearing, closing, renaming, moving or minimizing refresh the window list, instead of
+// polling it. Out of context: the callbacks come in through this thread's message loop.
+void App::WatchWindows(bool on) {
+    for (HWINEVENTHOOK h : winHooks_) UnhookWinEvent(h);
+    winHooks_.clear();
+    g_watcher = on ? this : nullptr;
+    if (!on) return;
+    const std::pair<DWORD, DWORD> ranges[] = {
+        {EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE},          // destroy, show, hide
+        {EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE},  // title
+        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED},      // other virtual desktops, suspended UWP apps
+        {EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND},
+        {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
+    };
+    for (auto [from, to] : ranges)
+        if (HWINEVENTHOOK h = SetWinEventHook(from, to, nullptr, OnWinEvent, 0, 0,
+                                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS))
+            winHooks_.push_back(h);
+}
+
+void CALLBACK App::OnWinEvent(HWINEVENTHOOK, DWORD event, HWND h, LONG obj, LONG child, DWORD, DWORD) {
+    App* self = g_watcher;
+    if (!self || !h || obj != OBJID_WINDOW || child != CHILDID_SELF) return;
+    // A top-level window that may join the list, or one already in it.
+    bool appears = event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED;
+    if (appears ? GetAncestor(h, GA_ROOT) != h : !self->FindWindowInfo(h)) return;
+    if (self->windowsDirty_) return;
+    self->windowsDirty_ = true;
+    SetTimer(self->hwnd_, kTimerRefresh, 400, nullptr);
 }
 
 void App::SelectTarget(HWND h) {
@@ -962,6 +1015,7 @@ void App::BeginCapture() {
     o.region = recTarget_.rect;
     o.clientOnly = settings_.clientOnly;
     o.cursor = settings_.cursor;
+    o.clickFx = settings_.clickFx;
     recNotice_.clear();
     if (recVideo_) {
         VideoOptions v;
@@ -972,18 +1026,23 @@ void App::BeginCapture() {
             v.path = base + util::Format(L"_%d.mp4", i);
         o.fps = kVideoFpsOptions[settings_.vFpsIdx];
         v.video = VideoSettings(o.fps);
-        v.audio.enabled = settings_.audio;
+        v.sound = settings_.audio;
+        v.mic = settings_.mic;
+        v.micDevice = settings_.micDevice;
+        v.micGain = settings_.micVolume / 100.f;
         v.audio.sampleRate = kAudioRateOptions[settings_.aRateIdx];
         v.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
         // A window records only its own sound; screens and regions record what the speakers play.
         v.processAudio = window;
         if (window) {
             v.audioPid = AudioCapture::AudioProcessOf(recTarget_.hwnd);
-            if (v.audio.enabled && !AudioCapture::ProcessLoopbackSupported()) {
-                v.audio.enabled = false;
-                recNotice_ = L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.";
+            if (v.sound && !AudioCapture::ProcessLoopbackSupported()) {
+                v.sound = false;
+                recNotice_ = v.mic ? L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다."
+                                   : L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.";
             }
         }
+        v.audio.enabled = v.sound || v.mic;
         o.maxEdge = v.video.hevc ? 8192 : 4096;  // encoder limits
         if (int res = kVideoResOptions[settings_.vResIdx]) {
             o.boxShort = res;
@@ -994,6 +1053,16 @@ void App::BeginCapture() {
         o.fps = kFpsOptions[settings_.fpsIdx];
         o.maxEdge = kSizeOptions[settings_.sizeIdx];
     }
+    // Free space (#17): too little to start, or a warning that the recording will stop itself.
+    uint64_t freeBytes = util::FreeBytes(RecordingDir());
+    if (freeBytes < kLowDiskStop) {
+        rec_ = RecState::Idle;
+        overlay_.Hide();
+        TrayUpdate();
+        ReportError(L"녹화를 시작하지 못했습니다",
+                    L"저장할 드라이브에 남은 공간이 " + util::FormatBytes(freeBytes) + L"뿐입니다. 공간을 비운 뒤 녹화하세요.");
+        return;
+    }
     std::wstring err;
     if (!capture_.Start(o, hwnd_, WM_APP_CAPTURE_CLOSED, err)) {
         rec_ = RecState::Idle;
@@ -1003,11 +1072,19 @@ void App::BeginCapture() {
         return;
     }
     rec_ = RecState::Recording;
+    recPaused_ = false;
+    stopReason_.clear();
+    nextDiskCheck_ = util::NowSeconds() + 2;
+    if (freeBytes < kLowDiskWarn)
+        TrayBalloon(L"남은 공간이 적습니다", L"저장할 드라이브에 " + util::FormatBytes(freeBytes) +
+                                                L" 남았습니다. 300MB까지 줄면 녹화를 멈추고 저장합니다.");
+    RegisterPauseHotkey();
     bool pill = settings_.overlayMode == kOverlayAlways ||
                 (settings_.overlayMode == kOverlayExceptFullscreen && !recFullscreen_);
     if (pill)
         overlay_.ShowPill(recTarget_.rect, recTarget_.source == kSourceRegion,
-                          [this] { PostMessageW(hwnd_, WM_HOTKEY, 1, 0); });
+                          [this] { PostMessageW(hwnd_, WM_HOTKEY, kHotkeyRecord, 0); },
+                          [this] { PostMessageW(hwnd_, WM_HOTKEY, kHotkeyPause, 0); });
     else
         overlay_.Hide();
     if (recTarget_.source == kSourceRegion && settings_.overlayMode != kOverlayNever) overlay_.ShowFrame(recTarget_.rect);
@@ -1030,6 +1107,8 @@ void App::StopRecording() {
     KillTimer(hwnd_, kTimerRec);
     CaptureResult res = capture_.Stop();
     rec_ = RecState::Idle;
+    recPaused_ = false;
+    RegisterPauseHotkey();  // releases it
     overlay_.Hide();
     TrayUpdate();
     if (res.video) {
@@ -1052,6 +1131,8 @@ void App::StopRecording() {
         warn = L"디스크 공간이 부족해 녹화를 멈췄습니다. 그 앞까지만 저장되어 있습니다.";
     else if (clip->Dropped() > 0)
         warn = util::Format(L"디스크가 느려 프레임 %u개를 건너뛰었습니다.", clip->Dropped());
+    if (!stopReason_.empty() && !clip->WriteFailed()) warn = stopReason_ + (warn.empty() ? L"" : L" " + warn);
+    stopReason_.clear();
     if (NotifyQuietly()) {
         TrayBalloon(L"녹화 완료 · " + util::FormatClock(clip->Seconds(), true),
                     warn.empty() ? L"클릭하면 편집 화면이 열립니다." : warn);
@@ -1088,14 +1169,52 @@ void App::OnVideoSaved(const CaptureResult& r) {
         if (screen_ == Screen::Editor) CloseEditor();
     }
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
+    std::wstring reason = std::exchange(stopReason_, {});
     if (NotifyQuietly())
-        TrayBalloon(L"동영상 저장 완료 · " + util::FormatClock(r.seconds, false), info);
+        TrayBalloon(L"동영상 저장 완료 · " + util::FormatClock(r.seconds, false), reason.empty() ? info : reason);
     else
         ShowMain(true);
     if (!lastVideo_.notice.empty())
-        Toast(lastVideo_.notice, true);
+        Toast(reason.empty() ? lastVideo_.notice : reason + L" " + lastVideo_.notice, true);
+    else if (!reason.empty())
+        Toast(reason + L" · " + info, true);
     else
         Toast(L"동영상을 저장했습니다 · " + info);
+}
+
+void App::TogglePause() {
+    if (rec_ != RecState::Recording) return;
+    recPaused_ = !recPaused_;
+    capture_.SetPaused(recPaused_);
+    overlay_.SetPaused(recPaused_);
+    if (settings_.sounds) sound::Play(sound::Cue::Tick);
+    TrayUpdate();
+    Invalidate();
+}
+
+std::wstring App::RecordingDir() const {
+    if (recVideo_) return settings_.outDir;
+    wchar_t tmp[MAX_PATH + 1] = {};
+    GetTempPathW(_countof(tmp), tmp);  // where FrameStore keeps the clip
+    return tmp;
+}
+
+void App::CheckLimits() {
+    if (rec_ != RecState::Recording) return;
+    int minutes = kMaxLengthOptions[settings_.maxLengthIdx];
+    if (minutes > 0 && capture_.Elapsed() >= minutes * 60.0) {
+        stopReason_ = (minutes % 60 ? util::Format(L"%d분", minutes) : util::Format(L"%d시간", minutes / 60)) +
+                      L"이 되어 녹화를 멈췄습니다.";
+        StopRecording();
+        return;
+    }
+    double now = util::NowSeconds();
+    if (now < nextDiskCheck_) return;
+    nextDiskCheck_ = now + 2;
+    if (util::FreeBytes(RecordingDir()) < kLowDiskStop) {
+        stopReason_ = L"남은 저장 공간이 300MB까지 줄어 녹화를 멈추고 저장했습니다.";
+        StopRecording();
+    }
 }
 
 void App::OnHotkey() {
@@ -1167,10 +1286,50 @@ std::wstring App::VideoSummary() const {
 }
 
 std::wstring App::AudioSummary(int source) const {
-    if (!settings_.audio) return L"소리 끔";
-    if (source == kSourceWindow)
-        return AudioCapture::ProcessLoopbackSupported() ? L"이 창의 소리만 녹음" : L"창 소리 녹음 불가 (Windows 10 2004 이상)";
-    return L"시스템 전체 소리 녹음";
+    std::wstring s;
+    if (settings_.audio)
+        s = source != kSourceWindow                         ? L"시스템 전체 소리 녹음"
+            : AudioCapture::ProcessLoopbackSupported() ? L"이 창의 소리만 녹음"
+                                                       : L"창 소리 녹음 불가 (Windows 10 2004 이상)";
+    if (settings_.mic) s = s.empty() ? L"마이크만 녹음" : s + L" + 마이크";
+    return s.empty() ? L"소리 끔" : s;
+}
+
+std::wstring App::MicDeviceName() const {
+    for (const auto& d : micDevices_)
+        if (settings_.micDevice.empty() ? d.isDefault : d.id == settings_.micDevice)
+            return settings_.micDevice.empty() ? L"기본 장치 · " + d.name : d.name;
+    return settings_.micDevice.empty() ? L"기본 장치" : L"연결되지 않은 장치";
+}
+
+// The input devices as a native menu under `anchor` (DIPs): Windows' default, then each by name.
+bool App::MicMenu(const Rect& anchor) {
+    if (!testWindowsOnly_) micDevices_ = AudioCapture::InputDevices();
+    auto escape = [](std::wstring s) {
+        for (size_t i = 0; (i = s.find(L'&', i)) != std::wstring::npos; i += 2) s.insert(i, 1, L'&');
+        return s;
+    };
+    HMENU menu = CreatePopupMenu();
+    std::wstring def = L"Windows 기본 장치";
+    for (const auto& d : micDevices_)
+        if (d.isDefault) def += L" (" + d.name + L")";
+    AppendMenuW(menu, MF_STRING | (settings_.micDevice.empty() ? MF_CHECKED : 0), 1, escape(def).c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    for (size_t i = 0; i < micDevices_.size(); ++i)
+        AppendMenuW(menu, MF_STRING | (micDevices_[i].id == settings_.micDevice ? MF_CHECKED : 0), 100 + (UINT)i,
+                    escape(micDevices_[i].name).c_str());
+    if (micDevices_.empty()) AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, L"연결된 마이크가 없습니다");
+    POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
+    ClientToScreen(hwnd_, &pt);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
+                              nullptr);
+    DestroyMenu(menu);
+    std::wstring pick = settings_.micDevice;
+    if (cmd == 1) pick.clear();
+    if (cmd >= 100 && cmd - 100 < micDevices_.size()) pick = micDevices_[cmd - 100].id;
+    if (pick == settings_.micDevice) return false;
+    settings_.micDevice = pick;
+    return true;
 }
 
 // ---------------------------------------------------------------- editor
@@ -1847,19 +2006,29 @@ void App::StopThumbnails() {
 // ---------------------------------------------------------------- system
 
 void App::RegisterRecordHotkey() {
-    UnregisterHotKey(hwnd_, 1);
-    hotkeyOk_ = RegisterHotKey(hwnd_, 1, settings_.hkMods | MOD_NOREPEAT, settings_.hkVk) != FALSE;
+    UnregisterHotKey(hwnd_, kHotkeyRecord);
+    hotkeyOk_ = RegisterHotKey(hwnd_, kHotkeyRecord, settings_.hkMods | MOD_NOREPEAT, settings_.hkVk) != FALSE;
 }
 
-// While a new key is being chosen the current one is released, so pressing it again reaches the window (and
+void App::RegisterPauseHotkey() {
+    UnregisterHotKey(hwnd_, kHotkeyPause);
+    if (rec_ == RecState::Recording && !capturingHotkey_)
+        pauseHotkeyOk_ =
+            RegisterHotKey(hwnd_, kHotkeyPause, settings_.hkPauseMods | MOD_NOREPEAT, settings_.hkPauseVk) != FALSE;
+}
+
+// While a new key is being chosen the current ones are released, so pressing them again reaches the window (and
 // doesn't start a recording).
-void App::SetCapturingHotkey(bool on) {
-    if (on == capturingHotkey_) return;
-    capturingHotkey_ = on;
-    if (on)
-        UnregisterHotKey(hwnd_, 1);
-    else
+void App::SetCapturingHotkey(int which) {
+    if (which == capturingHotkey_) return;
+    capturingHotkey_ = which;
+    if (which) {
+        UnregisterHotKey(hwnd_, kHotkeyRecord);
+        UnregisterHotKey(hwnd_, kHotkeyPause);
+    } else {
         RegisterRecordHotkey();
+        RegisterPauseHotkey();
+    }
     Invalidate();
 }
 
@@ -1886,7 +2055,9 @@ void App::TrayUpdate() {
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid_.hIcon = rec_ == RecState::Recording ? iconRec_ : iconAppSmall_;
     std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
-    std::wstring tip = rec_ == RecState::Recording ? L"OzMaker · 녹화 중" + (hotkeyOk_ ? L" (" + hk + L" 중지)" : L"")
+    std::wstring tip = rec_ == RecState::Recording && recPaused_ ? L"OzMaker · 일시정지 (" +
+                                                                         util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk) + L" 이어서)"
+                       : rec_ == RecState::Recording ? L"OzMaker · 녹화 중" + (hotkeyOk_ ? L" (" + hk + L" 중지)" : L"")
                        : hotkeyOk_                  ? L"OzMaker · " + hk + L" 녹화"
                                                     : L"OzMaker · 녹화 단축키를 쓸 수 없음";
     if (rec_ != RecState::Recording && UpdateReady()) tip += L"\n업데이트 준비 완료";
@@ -1923,6 +2094,11 @@ void App::TrayMenu() {
         AppendMenuW(menu, MF_STRING | (canRecord ? 0 : MF_GRAYED), 2, (what + hk).c_str());
     else
         AppendMenuW(menu, MF_STRING, 2, (L"녹화 중지\t" + hk).c_str());
+    if (rec_ == RecState::Recording)
+        AppendMenuW(menu, MF_STRING, 5,
+                    ((recPaused_ ? L"이어서 녹화\t" : L"일시정지\t") +
+                     util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk))
+                        .c_str());
     if (UpdateReady())
         AppendMenuW(menu, MF_STRING | (rec_ == RecState::Idle ? 0 : MF_GRAYED), 4,
                     (L"새 버전 " + updater_.Get().version + L"으로 업데이트").c_str());
@@ -1940,6 +2116,7 @@ void App::TrayMenu() {
             ShowMain(true);
             InstallUpdate();
             break;
+        case 5: TogglePause(); break;
         case 2:
             if (rec_ == RecState::Idle)
                 StartRecording(current, false);

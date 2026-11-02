@@ -9,9 +9,13 @@ enum class CaptureSource { Window, Monitor, Region };
 struct VideoOptions {
     std::wstring path;
     VideoConfig video;          // size and frame rate are filled in by Capture
-    AudioConfig audio;          // enabled = record sound
+    AudioConfig audio;          // enabled = an audio track: sound, the mic or both mixed
+    bool sound = false;         // what plays
     bool processAudio = false;  // only the target process tree (window capture) instead of the system mix
     DWORD audioPid = 0;
+    bool mic = false;           // the microphone mixed in (#21)
+    std::wstring micDevice;     // endpoint ID, empty = Windows' default input
+    float micGain = 1;
 };
 
 struct CaptureOptions {
@@ -23,6 +27,7 @@ struct CaptureOptions {
     RECT region{};               // Region, screen pixels
     bool clientOnly = true;      // Window: drop title bar and borders
     bool cursor = true;
+    bool clickFx = false;        // a ripple where the mouse is pressed, a dot while it is held (#21)
     int fps = 30;
     int maxEdge = 0;             // 0 = original size, else longest edge limit in pixels
     int boxLong = 0, boxShort = 0;  // fit inside this box in either orientation (video presets); 0 = no limit
@@ -55,8 +60,15 @@ public:
 
     bool Running() const { return running_; }
     bool StoreFailed() const;  // clip mode: the temp file couldn't be written (disk full)
-    double Elapsed() const;
+    // While paused nothing is recorded, and the recording continues afterwards as if the pause never happened.
+    void SetPaused(bool on);
+    bool Paused() const { return pausedAt_ != 0; }
+    double Elapsed() const;  // recorded time, pauses left out
     size_t Frames() const;
+    size_t Scaled() const { return scaled_; }  // frames scaled on the GPU so far (tests)
+    // Tests: a click as if the left button went down at `at` (screen pixels) now and up `hold` (100 ns) later.
+    void InjectClick(POINT at, int64_t hold);
+    size_t ClickFrames() const { return clickFrames_; }  // clip frames added for highlights (tests)
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
 
@@ -65,12 +77,50 @@ private:
     bool SourceRect(int contentW, int contentH, RECT& r) const;
     void CoveredRects(const RECT& sr, std::vector<RECT>& out) const;
     bool Setup(int srcW, int srcH);
-    // covered: parts of sr (relative to it) to black out.
-    void Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered);
+    // covered: parts of sr (relative to it) to black out. qpc: when the frame was captured. emit = false (clip
+    // mode): only keep it in out_, for the click highlight frames in between.
+    void Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered, int64_t qpc,
+                 bool emit);
+    void FinishFrame();
     void DrainOne();
     void TickLoop();
     void Fail(std::wstring msg);
     void ReleaseGpu();
+
+    // Click highlight (#21): clickThread_ polls the mouse; the highlights are drawn with Direct2D over a copy of
+    // out_ (fx_). Video mode draws them at each tick. Clip mode draws them on the frames that come in, and while
+    // one shows adds frames of its own from out_ (the screen may not change), then one without it.
+    struct Click {
+        int64_t down = 0, up = 0;  // QPC; up = 0 while held
+        POINT at{};                // screen pixels
+        bool right = false;
+    };
+    void ClickLoop();
+    bool ClicksShow(int64_t qpc);
+    bool DrawClicks(int64_t qpc);       // under the device lock: false when nothing shows at qpc
+    void EmitClickFrame(int64_t qpc);  // clip mode, under mtx_
+    POINT TextureOrigin(int contentW, int contentH) const;
+    void StopClicks();
+    std::thread clickThread_;
+    HANDLE clickStop_ = nullptr;
+    std::mutex clickMtx_;  // clicks_, cursorPos_
+    std::deque<Click> clicks_;
+    POINT cursorPos_{};
+    // Screen pixels -> out_ pixels for the frame in out_ (under the device lock).
+    struct ClickMap {
+        float ox = 0, oy = 0, fx = 1, fy = 1, dx = 0, dy = 0;
+    } clickMap_;
+    POINT texOrigin_{};  // screen position of the captured texture's top-left, OnFrame -> Process
+    float dpiScale_ = 1;
+    std::atomic<bool> fxShown_{false};  // clip mode: the last frame out had a highlight on it
+    std::atomic<size_t> clickFrames_{0};
+    bool fxFailed_ = false;
+    ComPtr<ID3D11Texture2D> fx_;
+    ComPtr<ID2D1Factory1> d2d_;
+    ComPtr<ID2D1Device> d2dDev_;
+    ComPtr<ID2D1DeviceContext> d2dCtx_;
+    ComPtr<ID2D1Bitmap1> fxTarget_;
+    ComPtr<ID2D1SolidColorBrush> fxBrush_;
 
     CaptureOptions opt_;
     HWND notify_ = nullptr;
@@ -103,21 +153,33 @@ private:
     struct Pending { int idx; int64_t ts; };
     std::deque<Pending> pending_;
     std::vector<RECT> covered_;
+    // What is left to do to the frame Process took: scale it from mip_ into out_, black out what covers it.
+    // Under the device lock. Video mode leaves it to the ticker (finishDue_), which needs one frame per tick.
+    struct Finish {
+        bool scaled = false;
+        int dx = 0, dy = 0, dw = 0, dh = 0, lod = 0;
+        std::vector<D3D11_RECT> mask;
+    } finish_;
+    bool finishDue_ = false;
+    std::atomic<size_t> scaled_{0};
 
     std::shared_ptr<FrameStore> store_;
     int outW_ = 0, outH_ = 0;
     bool setupDone_ = false, setupFailed_ = false;
     int64_t firstTs_ = -1, nextDue_ = 0, interval_ = 0, startQpc_ = 0;
-    int64_t lastTs_ = 0, lastArrivalQpc_ = 0;
+    int64_t lastTs_ = 0, lastArrivalQpc_ = 0;  // the last frame: its time in the clip, when it came (minus pauses)
+    std::atomic<int64_t> pausedAt_{0};     // QPC (100 ns) of the pause in progress, 0 = not paused
+    std::atomic<int64_t> pausedTotal_{0};  // length of the pauses so far
     std::atomic<size_t> frames_{0};
     mutable std::mutex mtx_;
     std::atomic<bool> running_{false};
 
     // video mode
     std::unique_ptr<Mp4Writer> writer_;
-    AudioCapture audio_;
+    AudioCapture audio_, mic_;
+    AudioMix mix_;  // audio_ (input 0) and mic_ (input 1) into the writer
     std::thread ticker_;
-    HANDLE tickStop_ = nullptr, firstFrame_ = nullptr;
+    HANDLE tickStop_ = nullptr, firstFrame_ = nullptr, resumed_ = nullptr;
     std::wstring videoError_, notice_;
     std::atomic<bool> failed_{false};
 };

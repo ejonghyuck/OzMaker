@@ -22,6 +22,7 @@ bool EnsureDir(const std::wstring& dir);
 std::wstring TimestampName();            // 20261102_142311
 std::wstring FileNameOf(const std::wstring& path);
 uint64_t FileSize(const std::wstring& path);
+uint64_t FreeBytes(const std::wstring& dir);  // free space on its drive for this user, UINT64_MAX if unknown
 
 void OpenFolderAndSelect(const std::wstring& path);
 void ShellOpen(const std::wstring& path);

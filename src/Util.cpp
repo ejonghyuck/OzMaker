@@ -76,6 +76,11 @@ bool EnsureDir(const std::wstring& dir) {
     return SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr) == ERROR_SUCCESS;
 }
 
+uint64_t FreeBytes(const std::wstring& dir) {
+    ULARGE_INTEGER avail{};
+    return GetDiskFreeSpaceExW(dir.c_str(), &avail, nullptr, nullptr) ? avail.QuadPart : UINT64_MAX;
+}
+
 std::wstring ExePath() {
     wchar_t exe[MAX_PATH * 2];
     DWORD n = GetModuleFileNameW(nullptr, exe, _countof(exe));
