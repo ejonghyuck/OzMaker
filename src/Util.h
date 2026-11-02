@@ -25,7 +25,10 @@ uint64_t FileSize(const std::wstring& path);
 uint64_t FreeBytes(const std::wstring& dir);  // free space on its drive for this user, UINT64_MAX if unknown
 
 void OpenFolderAndSelect(const std::wstring& path);
-void ShellOpen(const std::wstring& path);
+// Opens a file, folder or link (with args for a program) through Explorer, so that what starts isn't a child of
+// OzMaker: recordings leave out OzMaker's process tree (AudioCapture::Source::Others), and a player or browser
+// started from here must still be heard in them. False when Explorer couldn't, and OzMaker started it itself.
+bool ShellOpen(const std::wstring& path, const std::wstring& args = {});
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
 bool MoveToRecycleBin(HWND owner, const std::wstring& path);  // false if the file is still there
 bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);

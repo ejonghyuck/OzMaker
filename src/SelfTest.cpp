@@ -753,6 +753,33 @@ int App::RunSelfTest(const std::wstring& dir) {
             }
         }
     }
+    // What OzMaker opens (a video in its player, a page in the browser) is Explorer's child, not this process's:
+    // the recording sound leaves out OzMaker's process tree and must still hear that player or browser.
+    {
+        std::wstring out = dir + L"\\parent.txt";
+        DeleteFileW(out.c_str());
+        if (!util::ShellOpen(util::ExePath(), L"--report-parent \"" + out + L"\"")) {
+            log(L"open through Explorer: skipped (no Explorer desktop)");
+        } else {
+            DWORD parent = 0;
+            for (double until = util::NowSeconds() + 10; util::NowSeconds() < until; Sleep(50)) {
+                std::string text;
+                if (FILE* f = _wfsopen(out.c_str(), L"rb", _SH_DENYNO)) {
+                    char buf[32] = {};
+                    text.assign(buf, fread(buf, 1, sizeof(buf) - 1, f));
+                    fclose(f);
+                }
+                if (!text.empty()) {
+                    parent = (DWORD)strtoul(text.c_str(), nullptr, 10);
+                    break;
+                }
+            }
+            bool ok = parent != 0 && parent != GetCurrentProcessId();
+            if (!ok) ++failures;
+            log(util::Format(L"open through Explorer: %s what it starts is not OzMaker's child (parent %s)",
+                             ok ? L"ok  " : L"FAIL", parent == 0 ? L"unknown" : parent == GetCurrentProcessId() ? L"OzMaker" : L"another process"));
+        }
+    }
     // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
     {
         auto clip = MakeSyntheticClip(320, 180, 10, 30);

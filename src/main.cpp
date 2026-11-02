@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "App.h"
 
+#include <tlhelp32.h>
+
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     winrt::init_apartment(winrt::apartment_type::single_threaded);
@@ -18,6 +20,22 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
             cmd += a.find(L' ') != std::wstring::npos ? L"\"" + a + L"\"" : a;
         }
         LocalFree(argv);
+    }
+    if (first == L"--report-parent") {  // the self-test: what started this process (util::ShellOpen)
+        DWORD parent = 0, me = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe{sizeof(pe)};
+        for (BOOL ok = snap != INVALID_HANDLE_VALUE && Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+            if (pe.th32ProcessID == me) parent = pe.th32ParentProcessID;
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        std::string text = std::to_string(parent);
+        HANDLE f = CreateFileW(second.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD done = 0;
+        if (f != INVALID_HANDLE_VALUE) {
+            WriteFile(f, text.data(), (DWORD)text.size(), &done, nullptr);
+            CloseHandle(f);
+        }
+        return 0;
     }
     if (first == L"--exit") {  // ask a running instance to quit (scripts, installers)
         if (HWND h = FindWindowW(L"OzMakerMain", nullptr)) PostMessageW(h, WM_APP + 6, 0, 0);
