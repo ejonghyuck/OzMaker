@@ -76,6 +76,12 @@ bool EnsureDir(const std::wstring& dir) {
     return SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr) == ERROR_SUCCESS;
 }
 
+std::wstring ExePath() {
+    wchar_t exe[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, exe, _countof(exe));
+    return std::wstring(exe, n);
+}
+
 std::wstring AppDataDir() {
     std::wstring d = KnownFolder(FOLDERID_RoamingAppData) + L"\\OzMaker";
     EnsureDir(d);

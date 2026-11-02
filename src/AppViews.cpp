@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "App.h"
 #include "Util.h"
+#include "Version.h"
 
 using namespace theme;
 
@@ -40,7 +41,8 @@ void App::DrawFrame(Rect client) {
     ui_.Fill(client, Bg);
     // The files list takes all input while it is open; a click anywhere else closes it.
     if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
-    const bool popover = filesOpen_;
+    if (rec_ != RecState::Idle) updateOpen_ = false;
+    const bool popover = filesOpen_ || updateOpen_;
     if (popover) ui_.SetInputBlocked(true);
     Rect r = client;
     DrawHeader(r.CutTop(60));
@@ -56,7 +58,10 @@ void App::DrawFrame(Rect client) {
     if (popover) {
         ui_.SetInputBlocked(false);
         ui_.BeginFloat();
-        DrawFilesPopover(client);
+        if (filesOpen_)
+            DrawFilesPopover(client);
+        else
+            DrawUpdatePopover(client);
         ui_.EndFloat();
     }
     ui_.BeginFloat();
@@ -76,11 +81,8 @@ void App::DrawHeader(Rect r) {
     Rect right = h;
     if (screen_ != Screen::Settings) {
         Rect b = right.CutRight(36);
-        if (ui_.IconButton(HashId("hdr.settings"), Rect::Centered(b.CX(), b.CY(), 36, 36), icon::Settings, L"설정")) {
-            settingsReturn_ = screen_;
-            screen_ = Screen::Settings;
-            SetCapturingHotkey(false);
-        }
+        if (ui_.IconButton(HashId("hdr.settings"), Rect::Centered(b.CX(), b.CY(), 36, 36), icon::Settings, L"설정"))
+            OpenSettings();
         right.CutRight(8);
     } else {
         Rect b = right.CutRight(110);
@@ -92,6 +94,7 @@ void App::DrawHeader(Rect r) {
             if (screen_ == Screen::Home) RefreshWindows();
         }
     }
+    DrawUpdateButton(right);
     if (screen_ == Screen::Editor) {
         Rect b = right.CutRight(120);
         bool en = !exporter_.Busy();
@@ -159,11 +162,86 @@ void App::DrawFilesButton(Rect& right) {
     if (ui_.Button(HashId("hdr.files"), filesBtn_, L"파일", filesOpen_ ? BtnStyle::Secondary : BtnStyle::Ghost,
                    icon::OpenFile, en)) {
         filesOpen_ = true;
+        updateOpen_ = false;
         filesScroll_ = 0;
         RefreshRecent();
     }
     // Recordings that would be lost on exit.
     if (!held_.empty()) ui_.Circle(filesBtn_.r - 12, filesBtn_.t + 9, 4.f, Accent2);
+}
+
+// A green round button, shown once a new version is downloaded and ready (or out, when it can't be put in place
+// here). It opens a small popover to restart into it.
+void App::DrawUpdateButton(Rect& right) {
+    Updater::Status st = updater_.Get();
+    bool ready = st.state == Updater::State::Ready, available = st.state == Updater::State::Available;
+    if (!ready && !available) return;
+    Rect b = right.CutRight(36);
+    right.CutRight(8);
+    updateBtn_ = Rect::Centered(b.CX(), b.CY(), 36, 36);
+    UiId id = HashId("hdr.update");
+    bool hot = ui_.Hover(updateBtn_);
+    if (ui_.Click(id, updateBtn_)) {
+        updateOpen_ = !updateOpen_;
+        filesOpen_ = false;
+    }
+    float h = ui_.Anim(id, hot || updateOpen_ ? 1.f : 0.f);
+    ui_.Circle(updateBtn_.CX(), updateBtn_.CY(), 13.f + h, Mix(Success, Hex(0x6EE7B7), h * 0.6f));
+    // A bold download arrow over a base line (the MDL2 glyph is too thin at this size).
+    const float x = updateBtn_.CX(), y = updateBtn_.CY();
+    const D2D1_COLOR_F ink = Hex(0x06281C);
+    ui_.Line(x, y - 6.5f, x, y + 3.f, ink, 2.f);
+    ui_.Line(x - 4.5f, y - 1.f, x + 0.7f, y + 4.2f, ink, 2.f);
+    ui_.Line(x + 4.5f, y - 1.f, x - 0.7f, y + 4.2f, ink, 2.f);
+    ui_.Line(x - 5.5f, y + 7.f, x + 5.5f, y + 7.f, ink, 2.f);
+    ui_.Tooltip(id, updateBtn_, ready ? L"업데이트 준비 완료!" : L"새 버전이 나왔습니다");
+}
+
+void App::DrawUpdatePopover(Rect client) {
+    const auto& in = ui_.In();
+    Updater::Status st = updater_.Get();
+    const bool ready = st.state == Updater::State::Ready;
+    const bool busy = rec_ != RecState::Idle || exporter_.Busy();
+    const float W = std::min(320.f, client.W() - 40), H = ready && !busy ? 120.f : 142.f;
+    Rect box = Rect::XYWH(std::max(client.l + 20, updateBtn_.r - W), updateBtn_.b + 8, W, H);
+    if ((in.pressed && !box.Contains(in.mx, in.my)) || in.Key(VK_ESCAPE)) {
+        updateOpen_ = false;
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Black, 0.45f), 14);
+    ui_.Fill(box, Surface2, 12);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 12);
+    Rect c = box.Inset(16, 14);
+    Rect title = c.CutTop(24);
+    ui_.Icon(Rect::XYWH(title.l, title.t, 18, title.H()), ready ? icon::Check : icon::Download, 13.f, Success);
+    ui_.Text(Rect(title.l + 26, title.t, title.r, title.b),
+             ready ? L"새 버전 " + st.version + L" 준비 완료" : L"새 버전이 나왔습니다: " + st.version, 14.f, TextColor,
+             Bold());
+    Rect sub = c.CutTop(22);
+    std::wstring now = L"지금 쓰는 버전 " OZ_VERSION_WSTR L" · ";
+    float nw = ui_.Measure(now, 12.f);
+    ui_.Text(sub, now, 12.f, TextDim);
+    Rect link = Rect(sub.l + nw, sub.t, sub.l + nw + ui_.Measure(L"바뀐 점 보기", 12.f) + 4, sub.b);
+    bool lh = ui_.Hover(link);
+    if (ui_.Click(HashId("upd.notes"), link)) util::ShellOpen(Updater::ReleasePage(st.version));
+    ui_.Text(link, L"바뀐 점 보기", 12.f, lh ? AccentHi : Accent);
+    c.CutTop(6);
+    if (ready && busy) {
+        ui_.Text(c.CutTop(22), L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다", 12.f, Warning);
+    } else if (!ready) {
+        ui_.Text(c.CutTop(22), L"이 폴더에는 직접 바꿀 수 없어 내려받기 페이지에서 받아야 합니다", 11.5f, TextFaint);
+    }
+    Rect btns = c.CutBottom(36);
+    Rect later = btns.CutRight(84);
+    btns.CutRight(8);
+    if (ready) {
+        if (ui_.Button(HashId("upd.install"), btns, L"다시 시작해서 업데이트", BtnStyle::Primary, 0, !busy, 13.f))
+            InstallUpdate();
+    } else if (ui_.Button(HashId("upd.page"), btns, L"내려받기 페이지 열기", BtnStyle::Primary, 0, true, 13.f)) {
+        util::ShellOpen(Updater::ReleasePage(st.version));
+        updateOpen_ = false;
+    }
+    if (ui_.Button(HashId("upd.later"), later, L"나중에", BtnStyle::Secondary, 0, true, 13.f)) updateOpen_ = false;
 }
 
 void App::DrawFilesPopover(Rect client) {
@@ -762,11 +840,7 @@ void App::DrawCapturePanel(Rect r) {
         Rect link = cap.CutRight(80);
         UiId lid = HashId("home.vsettings");
         bool lh = ui_.Hover(link);
-        if (ui_.Click(lid, link)) {
-            settingsReturn_ = screen_;
-            screen_ = Screen::Settings;
-            settingsScroll_ = 10000;  // jump to the video section
-        }
+        if (ui_.Click(lid, link)) OpenSettings(kTabVideo);
         ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
         std::wstring audio = AudioSummary(src);
         bool warn = settings_.audio && src == kSourceWindow && !AudioCapture::ProcessLoopbackSupported();
@@ -1252,11 +1326,7 @@ void App::DrawExportPanel(Rect r) {
         ui_.Text(head, L"인코딩", 12.5f, TextDim);
         Rect link = head.CutRight(90);
         bool lh = ui_.Hover(link);
-        if (ui_.Click(HashId("ex.vsettings"), link)) {
-            settingsReturn_ = screen_;
-            screen_ = Screen::Settings;
-            settingsScroll_ = 10000;  // the video section
-        }
+        if (ui_.Click(HashId("ex.vsettings"), link)) OpenSettings(kTabVideo);
         ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
         in.CutTop(4);
         ui_.Text(in.CutTop(22), VideoSummary(), 12.5f, TextColor);
@@ -1407,34 +1477,91 @@ void App::SettingSection(Rect& area, std::wstring_view title) {
     ui_.Line(area.l, area.t - 0.5f, area.r, area.t - 0.5f, Border);
 }
 
+void App::OpenSettings(int tab) {
+    if (screen_ != Screen::Settings) settingsReturn_ = screen_;
+    screen_ = Screen::Settings;
+    SetCapturingHotkey(false);
+    if (tab >= 0 && tab != settings_.settingsTab) {
+        settings_.settingsTab = tab;
+        settingsScroll_ = 0;
+        settingsDirty_ = true;
+    }
+}
+
 void App::DrawSettings(Rect r) {
     r.CutTop(20);
-    float w = std::min(800.f, r.W());
+    float w = std::min(980.f, r.W());
     Rect card = Rect(r.CX() - w / 2, r.t, r.CX() + w / 2, r.b);
     ui_.Fill(card, Surface, 14);
     ui_.Stroke(card.Inset(0.5f), Border, 14);
     Rect in = card.Inset(28, 20);
     ui_.Text(in.CutTop(36), L"설정", 20.f, TextColor, Bold());
-    std::wstring formats;
-    for (int i = 0; i < (int)Format::Mp4; ++i)
-        if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
-    ui_.Text(in.CutBottom(20), L"OzMaker 0.4 · 움짤 형식: " + formats + L" · 동영상: MP4", 12.f, TextFaint);
-    in.CutBottom(8);
+    in.CutTop(10);
 
-    // Scroll view
-    in.CutTop(4);
+    // Tabs down the left; the one viewed last comes back next time. Ctrl+Tab steps through them.
+    static constexpr struct {
+        const wchar_t* name;
+        wchar_t glyph;
+    } kTabs[kTabCount] = {{L"일반", icon::Settings},
+                          {L"녹화", icon::Record},
+                          {L"동영상", icon::Video},
+                          {L"소리", icon::Volume},
+                          {L"정보", icon::Info}};
+    int tab = settings_.settingsTab;
+    Rect list = in.CutLeft(150);
+    ui_.Line(list.r + 12.5f, list.t, list.r + 12.5f, list.b, Border);
+    in.CutLeft(28);
+    for (int i = 0; i < kTabCount; ++i) {
+        Rect item = list.CutTop(40);
+        list.CutTop(4);
+        bool on = i == tab;
+        if (ui_.Click(HashId("set.tab", i), item)) tab = i;
+        float hl = ui_.Anim(HashId("set.tabHl", i), on ? 1.f : ui_.Hover(item) ? 0.5f : 0.f);
+        if (hl > 0.01f) ui_.Fill(item, WithAlpha(Surface3, hl), 8);
+        if (on) ui_.Fill(Rect::XYWH(item.l, item.CY() - 9, 3, 18), Accent, 1.5f);
+        ui_.Icon(Rect::XYWH(item.l + 12, item.t, 20, item.H()), kTabs[i].glyph, 14.f, on ? AccentHi : TextDim);
+        ui_.Text(Rect(item.l + 42, item.t, item.r - 8, item.b), kTabs[i].name, 14.f, on ? TextColor : TextDim,
+                 on ? Bold() : TextStyle{});
+    }
+    if (ui_.In().ctrl && ui_.In().Key(VK_TAB)) tab = (tab + (ui_.In().shift ? kTabCount - 1 : 1)) % kTabCount;
+    if (tab != settings_.settingsTab) {
+        settings_.settingsTab = tab;
+        settingsScroll_ = 0;
+        settingsDirty_ = true;
+        SetCapturingHotkey(false);
+    }
+
+    // Scroll view, one per tab
     Rect view = in;
     float maxScroll = std::max(0.f, settingsContentH_ - view.H());
     if (ui_.Hover(view) && ui_.In().wheel != 0) settingsScroll_ -= ui_.In().wheel * 90.f;
     settingsScroll_ = std::clamp(settingsScroll_, 0.f, maxScroll);
-    float scroll = ui_.Anim(HashId("set.scroll"), settingsScroll_, 22.f);
+    float scroll = ui_.AnimFrom(HashId("set.scroll", tab), settingsScroll_, settingsScroll_, 22.f);
     ui_.PushClip(view);
     Rect area(view.l, view.t - scroll, view.r - (maxScroll > 0 ? 12 : 0), view.t - scroll + 100000);
     const float top = area.t;
     bool changed = false;
-    ProbeEncoders();
+    switch (tab) {
+        case kTabGeneral: SettingsGeneral(area, changed); break;
+        case kTabRecord: SettingsRecord(area, changed); break;
+        case kTabVideo: SettingsVideo(area, changed); break;
+        case kTabAudio: SettingsAudio(area, changed); break;
+        case kTabAbout: SettingsAbout(area); break;
+    }
+    settingsContentH_ = area.t - top + 8;
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(30.f, view.H() * view.H() / settingsContentH_);
+        float ty = view.t + (view.H() - th) * (scroll / maxScroll);
+        ui_.Fill(Rect::XYWH(view.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
+        // Edges show that the list continues.
+        if (scroll > 1) ui_.Line(view.l, view.t + 0.5f, view.r, view.t + 0.5f, BorderStrong);
+        if (scroll < maxScroll - 1) ui_.Line(view.l, view.b - 0.5f, view.r, view.b - 0.5f, BorderStrong);
+    }
+    if (changed) settingsDirty_ = true;
+}
 
-    SettingSection(area, L"일반");
+void App::SettingsGeneral(Rect& area, bool& changed) {
     SettingRow(area, L"저장 폴더", settings_.outDir, 196, [&](Rect c) {
         Rect a = c.CutLeft(94);
         c.CutLeft(8);
@@ -1463,6 +1590,40 @@ void App::DrawSettings(Rect r) {
         }
     });
 
+    SettingRow(area, L"Windows 시작 시 실행", L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다", 60,
+               [&](Rect c) {
+                   bool on = autostart_;
+                   if (ui_.Toggle(HashId("set.autostart"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) {
+                       if (util::SetAutostart(on))
+                           autostart_ = on;
+                       else
+                           Toast(L"시작 프로그램에 등록하지 못했습니다.", true);
+                   }
+               });
+
+    int closeIdx = settings_.closeToTray ? 0 : 1;
+    SettingRow(area, L"닫기 버튼", L"트레이로 숨기면 창을 닫아도 단축키로 녹화할 수 있습니다", 260, [&](Rect c) {
+        if (ui_.Segmented(HashId("set.close"), c, {L"트레이로 숨기기", L"종료"}, closeIdx)) {
+            settings_.closeToTray = closeIdx == 0;
+            changed = true;
+        }
+    });
+
+    SettingRow(area, L"효과음", L"녹화 시작 · 중지 · 저장 시 짧은 알림음", 60, [&](Rect c) {
+        changed |= ui_.Toggle(HashId("set.sound"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.sounds);
+    });
+
+    SettingRow(area, L"새 버전 자동 확인", L"시작할 때와 하루 한 번 GitHub에서 확인하고 새 버전을 미리 받아 둡니다", 60,
+               [&](Rect c) {
+                   if (ui_.Toggle(HashId("set.autoUpdate"), Rect::Centered(c.r - 22, c.CY(), 44, 24),
+                                  settings_.autoUpdate)) {
+                       changed = true;
+                       CheckForUpdate();
+                   }
+               });
+}
+
+void App::SettingsRecord(Rect& area, bool& changed) {
     std::wstring hkDesc = hotkeyOk_ ? L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"
                                     : L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요";
     SettingRow(area, L"녹화 단축키", hkDesc, 230, [&](Rect c) {
@@ -1487,32 +1648,10 @@ void App::DrawSettings(Rect r) {
                    changed |= ui_.Segmented(HashId("set.overlay"), c, {L"항상", L"전체화면 제외", L"숨김"},
                                             settings_.overlayMode);
                });
+}
 
-    SettingRow(area, L"효과음", L"녹화 시작 · 중지 · 저장 시 짧은 알림음", 60, [&](Rect c) {
-        changed |= ui_.Toggle(HashId("set.sound"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.sounds);
-    });
-
-    SettingRow(area, L"Windows 시작 시 실행", L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다", 60,
-               [&](Rect c) {
-                   bool on = autostart_;
-                   if (ui_.Toggle(HashId("set.autostart"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) {
-                       if (util::SetAutostart(on))
-                           autostart_ = on;
-                       else
-                           Toast(L"시작 프로그램에 등록하지 못했습니다.", true);
-                   }
-               });
-
-    int closeIdx = settings_.closeToTray ? 0 : 1;
-    SettingRow(area, L"닫기 버튼", L"트레이로 숨기면 창을 닫아도 단축키로 녹화할 수 있습니다", 260, [&](Rect c) {
-        if (ui_.Segmented(HashId("set.close"), c, {L"트레이로 숨기기", L"종료"}, closeIdx)) {
-            settings_.closeToTray = closeIdx == 0;
-            changed = true;
-        }
-    });
-
-    // ---- video
-    SettingSection(area, L"동영상 (MP4)");
+void App::SettingsVideo(Rect& area, bool& changed) {
+    ProbeEncoders();
     const bool hevcOk = !encName_[1][1].empty() || !encName_[1][0].empty();
     SettingRow(area, L"코덱",
                hevcOk ? L"H.264: 어디서나 재생 · HEVC: 같은 화질에 용량 약 절반 (일부 기기 · 메신저 미지원)"
@@ -1569,7 +1708,9 @@ void App::DrawSettings(Rect r) {
     SettingRow(area, L"인코딩 품질", L"고품질은 같은 용량에서 더 선명하지만 GPU/CPU를 더 씁니다", 260, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.vpreset"), c, {L"빠르게", L"균형", L"고품질"}, settings_.vPresetIdx);
     });
+}
 
+void App::SettingsAudio(Rect& area, bool& changed) {
     SettingRow(area, L"소리 녹음",
                AudioCapture::ProcessLoopbackSupported()
                    ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리"
@@ -1585,16 +1726,57 @@ void App::DrawSettings(Rect r) {
     SettingRow(area, L"샘플레이트", L"영상 편집에는 48 kHz가 표준입니다", 230, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.arate"), c, {L"44.1 kHz", L"48 kHz"}, settings_.aRateIdx);
     });
+}
 
-    settingsContentH_ = area.t - top + 8;
-    ui_.PopClip();
-    if (maxScroll > 0) {
-        float th = std::max(30.f, view.H() * view.H() / settingsContentH_);
-        float ty = view.t + (view.H() - th) * (scroll / maxScroll);
-        ui_.Fill(Rect::XYWH(view.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
-        // Edges show that the list continues.
-        if (scroll > 1) ui_.Line(view.l, view.t + 0.5f, view.r, view.t + 0.5f, BorderStrong);
-        if (scroll < maxScroll - 1) ui_.Line(view.l, view.b - 0.5f, view.r, view.b - 0.5f, BorderStrong);
+void App::SettingsAbout(Rect& area) {
+    Rect head = area.CutTop(84);
+    ui_.Logo(Rect::XYWH(head.l, head.CY() - 24, 48, 48));
+    ui_.Text(Rect(head.l + 64, head.CY() - 24, head.r, head.CY() + 2), L"OzMaker", 20.f, TextColor, Bold());
+    ui_.Text(Rect(head.l + 64, head.CY() + 2, head.r, head.CY() + 24), L"움짤 메이커 · 버전 " OZ_VERSION_WSTR, 13.f,
+             TextDim);
+    ui_.Line(area.l, area.t - 0.5f, area.r, area.t - 0.5f, Border);
+
+    std::wstring formats;
+    for (int i = 0; i < (int)Format::Mp4; ++i)
+        if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
+    SettingRow(area, L"지원 형식", L"움짤: " + formats + L" · 동영상: MP4", 0, [](Rect) {});
+
+    Updater::Status st = updater_.Get();
+    std::wstring desc;
+    switch (st.state) {
+        case Updater::State::Idle: desc = L"아직 확인하지 않았습니다"; break;
+        case Updater::State::Checking: desc = L"확인 중…"; break;
+        case Updater::State::UpToDate: desc = L"최신 버전입니다"; break;
+        case Updater::State::Downloading:
+            desc = util::Format(L"새 버전 %s 받는 중… %d%%", st.version.c_str(), (int)(st.progress * 100));
+            break;
+        case Updater::State::Ready: desc = L"새 버전 " + st.version + L" 준비 완료 · 다시 시작하면 바뀝니다"; break;
+        case Updater::State::Available:
+            desc = L"새 버전 " + st.version + L" · 이 폴더에는 직접 바꿀 수 없어 내려받기 페이지에서 받아 주세요";
+            break;
+        case Updater::State::Failed: desc = L"확인하지 못했습니다: " + st.error; break;
     }
-    if (changed) settingsDirty_ = true;
+    if (st.state == Updater::State::Checking || st.state == Updater::State::Downloading) RequestWake(ui_.Now() + 0.2);
+    SettingRow(area, L"업데이트", desc, 200, [&](Rect c) {
+        if (st.state == Updater::State::Ready) {
+            bool en = rec_ == RecState::Idle && !exporter_.Busy();
+            if (ui_.Button(HashId("set.install"), c, L"다시 시작해서 업데이트", BtnStyle::Primary, 0, en, 13.f))
+                InstallUpdate();
+        } else if (st.state == Updater::State::Available) {
+            if (ui_.Button(HashId("set.updPage"), c, L"내려받기 페이지", BtnStyle::Secondary, icon::OpenFile, true, 13.f))
+                util::ShellOpen(Updater::ReleasePage(st.version));
+        } else if (ui_.Button(HashId("set.check"), c, L"지금 확인", BtnStyle::Secondary, icon::Refresh,
+                              !updater_.Busy(), 13.f)) {
+            updater_.Check();
+        }
+    });
+
+    SettingRow(area, L"프로젝트", L"소스 코드 · 바뀐 점 · 오픈소스 라이선스", 260, [&](Rect c) {
+        Rect a = c.CutLeft((c.W() - 8) / 2);
+        c.CutLeft(8);
+        if (ui_.Button(HashId("set.github"), a, L"GitHub", BtnStyle::Secondary, icon::OpenFile, true, 13.f))
+            util::ShellOpen(kRepoUrl);
+        if (ui_.Button(HashId("set.licenses"), c, L"라이선스", BtnStyle::Secondary, 0, true, 13.f))
+            util::ShellOpen(std::wstring(kRepoUrl) + L"/blob/main/THIRD-PARTY-NOTICES.md");
+    });
 }

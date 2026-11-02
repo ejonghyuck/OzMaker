@@ -6,6 +6,7 @@
 #include "Overlays.h"
 #include "Settings.h"
 #include "Ui.h"
+#include "Updater.h"
 #include "WindowList.h"
 
 enum class Screen { Home, Editor, Settings };
@@ -33,10 +34,11 @@ private:
         WM_APP_FRAME,
         WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
         WM_APP_ESTIMATE,
+        WM_APP_UPDATE,
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
-    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh };
+    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate };
     enum class RecState { Idle, Countdown, Recording };
 
     // ---- window plumbing (App.cpp)
@@ -76,10 +78,18 @@ private:
     void DrawTransport(Rect r);
     void DrawTimeline(Rect r);
     void DrawExportPanel(Rect r);
+    void OpenSettings(int tab = -1);  // -1: the tab viewed last
     void DrawSettings(Rect r);
+    void SettingsGeneral(Rect& area, bool& changed);
+    void SettingsRecord(Rect& area, bool& changed);
+    void SettingsVideo(Rect& area, bool& changed);
+    void SettingsAudio(Rect& area, bool& changed);
+    void SettingsAbout(Rect& area);
     void DrawToast(Rect client);
     void DrawFilesButton(Rect& right);
     void DrawFilesPopover(Rect client);
+    void DrawUpdateButton(Rect& right);
+    void DrawUpdatePopover(Rect client);
     void SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
                     const std::function<void(Rect)>& control);
     void SettingSection(Rect& area, std::wstring_view title);
@@ -118,7 +128,7 @@ private:
     void RefreshRecent();
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
-    bool ConfirmQuit();
+    bool ConfirmQuit(bool restart = false);  // asks about unsaved recordings, if any
 
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
@@ -163,6 +173,11 @@ private:
     void TrayMenu();
     void TrayBalloon(const std::wstring& title, const std::wstring& text);
 
+    // ---- updates (#31)
+    void CheckForUpdate();  // when one is due (timer), or now from the settings
+    bool UpdateReady() const;
+    void InstallUpdate();   // swap the exe and restart into it
+
     // ---- test helpers (SelfTest)
     int RunScreenshots(const std::wstring& dir);
     int RunSelfTest(const std::wstring& dir);
@@ -172,6 +187,7 @@ private:
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
+    int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
 
@@ -288,6 +304,10 @@ private:
     double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
     uint64_t exportEstimate_ = 0;
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
+
+    Updater updater_;
+    bool updateOpen_ = false;  // the popover under the update button
+    Rect updateBtn_;
 
     Exporter exporter_;
     ExportResult lastResult_;

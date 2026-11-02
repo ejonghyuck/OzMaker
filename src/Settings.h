@@ -29,6 +29,7 @@ enum Source { kSourceWindow = 0, kSourceDisplay = 1, kSourceRegion = 2 };
 enum Output { kOutputClip = 0, kOutputVideo = 1 };
 enum CaptureMode { kCaptureAuto = 0, kCaptureWindow = 1, kCaptureDisplay = 2 };
 enum OverlayMode { kOverlayAlways = 0, kOverlayExceptFullscreen = 1, kOverlayNever = 2 };
+enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout, kTabCount };
 
 struct Settings {
     // what and how
@@ -47,7 +48,9 @@ struct Settings {
     int overlayMode = kOverlayExceptFullscreen;
     bool sounds = true;
     bool closeToTray = true;
+    bool autoUpdate = true;  // check GitHub for a new version (#31)
     bool trayHintShown = false;
+    int settingsTab = kTabGeneral;  // the settings tab viewed last
     RECT window{};  // main window's restored position (workspace pixels); empty = centre on the primary monitor
     bool windowMax = false;
     UINT hkMods = MOD_CONTROL | MOD_ALT;

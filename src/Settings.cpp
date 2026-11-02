@@ -67,7 +67,9 @@ void Settings::Load() {
     overlayMode = ReadInt(ini, L"Overlay", overlayMode, 0, 2);
     sounds = ReadInt(ini, L"Sounds", sounds, 0, 1) != 0;
     closeToTray = ReadInt(ini, L"CloseToTray", closeToTray, 0, 1) != 0;
+    autoUpdate = ReadInt(ini, L"AutoUpdate", autoUpdate, 0, 1) != 0;
     trayHintShown = ReadInt(ini, L"TrayHintShown", trayHintShown, 0, 1) != 0;
+    settingsTab = ReadInt(ini, L"SettingsTab", settingsTab, 0, kTabCount - 1);
     window.left = ReadSigned(ini, L"WindowL");
     window.top = ReadSigned(ini, L"WindowT");
     window.right = ReadSigned(ini, L"WindowR");
@@ -138,7 +140,9 @@ void Settings::Save() const {
     num(L"Overlay", overlayMode);
     num(L"Sounds", sounds);
     num(L"CloseToTray", closeToTray);
+    num(L"AutoUpdate", autoUpdate);
     num(L"TrayHintShown", trayHintShown);
+    num(L"SettingsTab", settingsTab);
     num(L"WindowL", window.left);
     num(L"WindowT", window.top);
     num(L"WindowR", window.right);
