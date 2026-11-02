@@ -138,6 +138,7 @@ private:
     void RefreshRecent();
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
+    size_t RecoverRecordings();  // at startup: what a crash left behind, back among the unsaved recordings (#24)
     // Asks about unsaved recordings, if there are any, then (on yes) runs `then`.
     void AskQuit(bool restart, std::function<void()> then);
     const wchar_t* Activity() const;  // for crash reports
@@ -222,7 +223,7 @@ private:
     int RunTestWindow(double seconds);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
-    std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
+    std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps, bool finish = true);
 
     // ---- state
     HINSTANCE inst_ = nullptr;

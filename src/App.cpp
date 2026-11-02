@@ -89,6 +89,12 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     // A crash on purpose, for the self-test of the crash report (#24).
     if (args.size() >= 2 && args[0] == L"--crash-test") {
         if (args[1] == L"abort") std::abort();
+        std::shared_ptr<FrameStore> rec;
+        if (args[1] == L"record") {  // 45 frames on disk, never finished
+            rec = MakeSyntheticClip(160, 90, 45, 30, false);
+            if (rec) rec->SetNominalFps(30);  // as Capture does
+            Sleep(1000);
+        }
         volatile int* nowhere = nullptr;
         *nowhere = 1;
         return 1;
@@ -122,16 +128,28 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
         else
             Toast(L"OzMaker " OZ_VERSION_WSTR L" 버전으로 업데이트했습니다");
     }
-    // A crash report written since the user was last told: say so once (#24).
+    // A crash report written since the user was last told, and the recordings it left behind: say so once (#24).
+    bool crashed = false;
     if (auto reports = crash::List(); !reports.empty() && reports[0].name > settings_.crashSeen) {
         settings_.crashSeen = reports[0].name;
         settings_.Save();
-        if (tray)
-            TrayBalloon(L"지난번에 OzMaker가 비정상 종료되었습니다", L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
-        else
-            Toast(L"지난번에 OzMaker가 비정상 종료되었습니다. 설정 › 정보 › 충돌 기록에서 파일을 볼 수 있습니다.", true);
+        crashed = true;
     }
     crash::Prune(5);
+    if (size_t back = RecoverRecordings(); crashed || back) {
+        std::wstring title = crashed ? L"지난번에 OzMaker가 비정상 종료되었습니다" : L"저장하지 않은 녹화를 되살렸습니다";
+        std::wstring body = back ? util::Format(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다", back)
+                                 : std::wstring(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
+        if (tray) {
+            TrayBalloon(title, body);
+        } else {
+            if (back) {
+                clipName_ = held_[0].name;
+                OpenEditor(held_[0].clip);
+            }
+            Toast(title + L". " + body + L".", crashed);
+        }
+    }
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
@@ -1298,9 +1316,7 @@ void App::TogglePause() {
 
 std::wstring App::RecordingDir() const {
     if (recVideo_) return settings_.outDir;
-    wchar_t tmp[MAX_PATH + 1] = {};
-    GetTempPathW(_countof(tmp), tmp);  // where FrameStore keeps the clip
-    return tmp;
+    return FrameStore::Dir();
 }
 
 void App::CheckLimits() {
@@ -1536,6 +1552,15 @@ void App::HoldRecording(std::shared_ptr<Clip> clip) {
         held_.resize(kMaxHeld);
         Toast(util::Format(L"저장하지 않은 녹화가 %zu개를 넘어 가장 오래된 것을 지웠습니다.", kMaxHeld), true);
     }
+}
+
+size_t App::RecoverRecordings() {
+    auto found = FrameStore::Recover();  // newest first
+    double now = util::NowSeconds();
+    for (auto it = found.rbegin(); it != found.rend(); ++it)
+        held_.insert(held_.begin(), {it->clip, now - it->age, L"복구한 녹화"});
+    if (held_.size() > kMaxHeld) held_.resize(kMaxHeld);  // the oldest go, with their files
+    return found.size();
 }
 
 void App::DropHeld(const Clip* clip) {

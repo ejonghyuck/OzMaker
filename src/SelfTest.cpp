@@ -318,7 +318,7 @@ ExportResult ExportSync(Exporter& ex, ExportJob job) {
 
 }  // namespace
 
-std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, double fps) {
+std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, double fps, bool finish) {
     auto s = std::make_shared<FrameStore>();
     std::wstring err;
     if (!s->Open(w, h, err)) return nullptr;
@@ -327,7 +327,7 @@ std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, dou
         DrawSynthetic(buf->data(), w, h, i / fps);
         while (!s->Submit(buf, (int64_t)(i * 1e7 / fps))) Sleep(1);
     }
-    s->Finish((int64_t)(frames * 1e7 / fps));
+    if (finish) s->Finish((int64_t)(frames * 1e7 / fps));
     return s;
 }
 
@@ -847,6 +847,46 @@ int App::RunSelfTest(const std::wstring& dir) {
                              kind, code, reports.size()));
             crash::Prune(0);
         }
+    }
+    // Crash-safe 움짤 recording (#24): what a run that crashed mid-recording had on disk comes back frame for frame,
+    // and goes with its files once dropped. This run's own recordings stay where they are.
+    {
+        auto rcheck = [&](bool ok, const std::wstring& what) {
+            if (!ok) ++failures;
+            log((ok ? L"recovery: ok   " : L"recovery: FAIL ") + what);
+        };
+        std::wstring cmd = L"\"" + util::ExePath() + L"\" --crash-test record";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            if (WaitForSingleObject(pi.hProcess, 30000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        crash::Prune(0);
+        auto mine = MakeSyntheticClip(32, 32, 3, 30);  // alive in this process: not taken
+        auto found = FrameStore::Recover();
+        int bad = 0;
+        if (found.size() == 1 && found[0].clip->Count() == 45) {
+            FrameStore::Reader rd(found[0].clip.get());
+            std::vector<uint8_t> want((size_t)160 * 90 * 4);
+            for (int i = 0; i < 45; ++i) {
+                DrawSynthetic(want.data(), 160, 90, i / 30.0);
+                const uint8_t* px = rd.Get(i);
+                if (!px || memcmp(px, want.data(), want.size()) != 0) ++bad;
+            }
+        }
+        rcheck(found.size() == 1 && found[0].clip->Count() == 45 && found[0].clip->Width() == 160 && bad == 0 &&
+                   std::fabs(found[0].clip->NominalFps() - 30) < 0.01,
+               util::Format(L"a crashed recording comes back: %zu found, %zu frames, %d differ", found.size(),
+                            found.empty() ? 0 : found[0].clip->Count(), bad));
+        std::wstring data = found.empty() ? L"" : found[0].clip->Path();
+        found.clear();
+        rcheck(!data.empty() && GetFileAttributesW(data.c_str()) == INVALID_FILE_ATTRIBUTES,
+               L"dropping it deletes its files");
+        std::wstring own = mine->Path();
+        mine.reset();
+        rcheck(GetFileAttributesW(own.c_str()) == INVALID_FILE_ATTRIBUTES, L"a recording dropped normally leaves nothing");
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;

@@ -1,9 +1,13 @@
 #pragma once
 #include "Clip.h"
 
-// Recorded frames live in a delete-on-close temp file, XOR-delta coded against the previous frame
-// (keyframe every kKeyInterval) and XPRESS-compressed by a few worker threads. The OS file cache keeps
-// recent data in RAM when available, so the process working set stays small even for long clips.
+// Recorded frames live in a temp file, XOR-delta coded against the previous frame (keyframe every kKeyInterval)
+// and XPRESS-compressed by a few worker threads. The OS file cache keeps recent data in RAM when available, so the
+// process working set stays small even for long clips.
+//
+// Crash-safe (#24): a journal next to the file records each frame once its data is written, so a recording outlives a
+// crash or a forced shutdown. Dropping the store deletes both files; the next start takes back what a process that
+// has gone left behind (Recover).
 class FrameStore : public Clip {
 public:
     static constexpr size_t kKeyInterval = 30;
@@ -15,6 +19,16 @@ public:
     FrameStore& operator=(const FrameStore&) = delete;
 
     bool Open(int width, int height, std::wstring& err);
+
+    // Where recordings live: %TEMP%\OzMaker, or next to the scratch settings in a test run.
+    static std::wstring Dir();
+    struct Recovered {
+        std::shared_ptr<FrameStore> clip;  // finished, ready to edit; its files go when it is dropped
+        double age = 0;                    // seconds since it was last written
+    };
+    // What processes that have gone left in Dir(), newest first. Files that hold no frame are deleted.
+    static std::vector<Recovered> Recover();
+    const std::wstring& Path() const { return path_; }
     // Writer side (capture thread). Acquire a frame buffer, fill it with tightly packed BGRA, submit it.
     std::shared_ptr<Buffer> Acquire();
     bool Submit(std::shared_ptr<Buffer> frame, int64_t ts100ns);
@@ -27,7 +41,7 @@ public:
     int64_t Ts(size_t i) const override { return entries_[i].ts; }
     int64_t EndTs() const override { return endTs_; }
     double NominalFps() const override { return nominalFps_; }
-    void SetNominalFps(double fps) { nominalFps_ = fps; }
+    void SetNominalFps(double fps);
     std::unique_ptr<FrameReader> NewReader() const override { return std::make_unique<Reader>(this); }
     uint64_t DiskBytes() const { return writeOffset_.load(); }
     uint32_t Dropped() const { return dropped_.load(); }
@@ -61,7 +75,20 @@ private:
     };
     void Worker();
     bool WriteAt(uint64_t off, const void* data, size_t n);
+    // The journal: a header, then one record per frame on disk, the end time and the frame rate.
+    struct JournalRecord {
+        uint32_t type = 0;  // kRecFrame, kRecEnd, kRecFps
+        uint32_t seq = 0;
+        uint64_t offset = 0;  // kRecFps: the double's bits
+        uint32_t size = 0, raw = 0;
+        int64_t ts = 0;
+    };
+    void Journal(const JournalRecord& r);  // mtx_ held
+    bool Load(const std::wstring& data, const std::wstring& journal);
 
+    std::wstring path_;  // the data file; the journal is the same name with .idx
+    HANDLE journal_ = INVALID_HANDLE_VALUE;
+    uint64_t journalOffset_ = 0;
     HANDLE file_ = INVALID_HANDLE_VALUE;
     int width_ = 0, height_ = 0;
     size_t frameBytes_ = 0;
