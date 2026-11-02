@@ -1406,7 +1406,7 @@ void App::DrawSettings(Rect r) {
     std::wstring formats;
     for (int i = 0; i < (int)Format::Mp4; ++i)
         if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
-    ui_.Text(in.CutBottom(20), L"OzMaker 0.3 · 움짤 형식: " + formats + L" · 동영상: MP4", 12.f, TextFaint);
+    ui_.Text(in.CutBottom(20), L"OzMaker 0.4 · 움짤 형식: " + formats + L" · 동영상: MP4", 12.f, TextFaint);
     in.CutBottom(8);
 
     // Scroll view
