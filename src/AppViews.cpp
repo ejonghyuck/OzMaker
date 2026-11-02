@@ -42,8 +42,9 @@ void App::DrawFrame(Rect client) {
     // The files list takes all input while it is open; a click anywhere else closes it.
     if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
     if (rec_ != RecState::Idle) updateOpen_ = false;
-    const bool popover = filesOpen_ || updateOpen_;
-    if (popover) ui_.SetInputBlocked(true);
+    const bool modal = question_.has_value();
+    const bool popover = !modal && (filesOpen_ || updateOpen_);
+    if (popover || modal) ui_.SetInputBlocked(true);
     Rect r = client;
     DrawHeader(r.CutTop(60));
     r = r.Inset(20, 0);
@@ -64,9 +65,63 @@ void App::DrawFrame(Rect client) {
             DrawUpdatePopover(client);
         ui_.EndFloat();
     }
+    if (modal) {
+        ui_.SetInputBlocked(false);
+        ui_.BeginFloat();
+        DrawQuestion(client);
+        ui_.EndFloat();
+    }
     ui_.BeginFloat();
     DrawToast(client);
     ui_.EndFloat();
+}
+
+void App::DrawQuestion(Rect client) {
+    const auto& in = ui_.In();
+    const Question& q = *question_;
+    const float a = ui_.AnimFrom(HashId("ask", questionSeq_), 1.f, 0.f, 18.f);
+    ui_.Fill(client, WithAlpha(Black, 0.55f * a));
+    const float W = std::min(440.f, client.W() - 40), pad = 22, iconW = 40;
+    TextStyle body;
+    body.wrap = true;
+    body.v = AlignStart;
+    float bodyH = 20;
+    DWRITE_TEXT_METRICS m{};
+    if (auto lay = Fonts::Layout(q.body, 13.f, body, W - pad * 2 - iconW, 1000); lay && SUCCEEDED(lay->GetMetrics(&m)))
+        bodyH = std::ceil(m.height);
+    const float H = pad + 26 + 6 + bodyH + 24 + 38 + pad;
+    Rect box = Rect::Centered(client.CX(), client.CY() - 24 + (1 - a) * 10, W, H);
+    ui_.Fill(box.Offset(0, 8), WithAlpha(Black, 0.45f * a), 16);
+    ui_.Fill(box, WithAlpha(Surface2, a), 14);
+    ui_.Stroke(box.Inset(0.5f), WithAlpha(BorderStrong, a), 14);
+    Rect c = box.Inset(pad);
+    const D2D1_COLOR_F tint = q.danger ? RecHi : Accent;
+    Rect mark = Rect::XYWH(c.l, c.t - 2, 30, 30);
+    ui_.Circle(mark.CX(), mark.CY(), 15, WithAlpha(tint, 0.18f * a));
+    ui_.Icon(mark, q.danger ? icon::Warning : icon::Check, 14.f, WithAlpha(tint, a));
+    Rect text(c.l + iconW, c.t, c.r, c.b);
+    ui_.Text(text.CutTop(26), q.title, 15.f, WithAlpha(TextColor, a), Bold());
+    text.CutTop(6);
+    ui_.Text(text.CutTop(bodyH), q.body, 13.f, WithAlpha(TextDim, a), body);
+
+    Rect btns = c.CutBottom(38);
+    const float yesW = std::max(96.f, ui_.Measure(q.yes, 13.f, kSemibold) + 40);
+    Rect yes = btns.CutRight(yesW);
+    btns.CutRight(8);
+    Rect no = btns.CutRight(88);
+    bool said = ui_.Button(HashId("ask.yes"), yes, q.yes, q.danger ? BtnStyle::Danger : BtnStyle::Primary, 0, true,
+                           13.f) ||
+                in.Key(VK_RETURN);
+    bool not_ = ui_.Button(HashId("ask.no"), no, L"취소", BtnStyle::Secondary, 0, true, 13.f) ||
+                in.Key(VK_ESCAPE) || (in.pressed && !box.Contains(in.mx, in.my));
+    if (said) {
+        answer_ = std::move(question_->onYes);
+        question_.reset();
+        PostMessageW(hwnd_, WM_APP_ANSWER, 0, 0);
+    } else if (not_) {
+        question_.reset();
+    }
+    if (said || not_) Invalidate();
 }
 
 void App::DrawHeader(Rect r) {
@@ -565,7 +620,7 @@ void App::DrawRegionPanel(Rect in) {
              settings_.HasRegion() ? L"영역 다시 지정" : L"영역 지정", 15.f, TextColor, Bold(AlignCenter));
     TextStyle st = Align(AlignCenter, AlignStart);
     ui_.Text(Rect(card.l + 12, card.t + 92, card.r - 12, card.b - 8),
-             L"화면에서 드래그해서 고릅니다 · 클릭하면 창 전체", 12.f, TextDim, st);
+             L"드래그해서 고르고 툴바에서 바로 녹화합니다", 12.f, TextDim, st);
     if (clicked) StartRegionPick();
 
     in.CutTop(14);
@@ -950,6 +1005,7 @@ void App::DrawEditor(Rect r) {
         hasResult_ = false;
     }
     if (in.Key(VK_ESCAPE)) cropMode_ = false;
+    if (in.Key(VK_DELETE) && CanDiscard()) ConfirmDiscard();
 
     if (playing_) playhead_ = PlayheadFromClock();
     playhead_ = std::clamp(playhead_, (size_t)0, count - 1);
@@ -1112,11 +1168,23 @@ void App::DrawTransport(Rect r) {
     if (clip_->HasAudio()) {
         Rect volR = r.CutLeft(34);
         bool slow = kSpeedOptions[settings_.speedIdx] != 1.0;
+        const int vol = previewMute_ ? 0 : settings_.previewVolume;
         const wchar_t* tip = slow ? L"재생 속도가 1×일 때만 소리가 나옵니다"
-                             : previewMute_ ? L"미리보기 소리 켜기" : L"미리보기 소리 끄기";
+                             : vol == 0 ? L"미리보기 소리 켜기" : L"미리보기 소리 끄기";
         if (ui_.IconButton(HashId("tr.mute"), Rect::Centered(volR.CX(), volR.CY(), 34, 34),
-                           previewMute_ || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
-            previewMute_ = !previewMute_;
+                           vol == 0 || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
+            TogglePreviewMute();
+        // The volume (#36). Crop mode pauses the preview and needs the room.
+        if (!cropMode_) {
+            Rect volS = r.CutLeft(78);
+            Rect track(volS.l + 8, volS.t + 8, volS.r - 8, volS.b - 8);
+            UiId id = HashId("tr.vol");
+            float v = (float)vol;
+            if (ui_.Slider(id, track, v, 0.f, 100.f)) SetPreviewVolume((int)std::lround(v / 5) * 5);
+            if (ui_.In().wheel != 0 && ui_.Hover(Rect(volR.l, volS.t, volS.r, volS.b)))
+                SetPreviewVolume(vol + (ui_.In().wheel > 0 ? 5 : -5));
+            ui_.Tooltip(id, track, util::Format(L"미리보기 음량 %d%% · 휠로도 조절", vol));
+        }
     }
     r.CutLeft(10);
     std::wstring time = util::FormatClock(clip_->Ts(playhead_) / 1e7, true) + L"  /  " +
@@ -1440,6 +1508,17 @@ void App::DrawExportPanel(Rect r) {
         std::wstring label = std::wstring(FormatName(fmt)) + L"로 저장";
         if (ui_.Button(HashId("ex.save"), save, label, BtnStyle::Primary, icon::Save, avail, 15.f))
             StartExport(false);
+        // 버리기 / 삭제 (#37), for what this run recorded.
+        if (CanDiscard()) {
+            const bool video = !clip_->SourcePath().empty();
+            Rect discard = saveAs.CutRight(92);
+            saveAs.CutRight(8);
+            UiId id = HashId("ex.discard");
+            if (ui_.Button(id, discard, video ? L"삭제" : L"버리기", BtnStyle::Secondary, icon::Delete, true, 13.f))
+                ConfirmDiscard();
+            ui_.Tooltip(id, discard, video ? L"이 동영상을 휴지통으로 옮기고 홈으로 갑니다 (Delete)"
+                                           : L"이 녹화를 버리고 홈으로 갑니다 (Delete)");
+        }
         if (ui_.Button(HashId("ex.saveas"), saveAs, L"다른 이름으로 저장…", BtnStyle::Secondary, 0, avail, 13.f))
             StartExport(true);
     }
@@ -1665,7 +1744,7 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                                             settings_.maxLengthIdx);
                });
 
-    SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,
+    SettingRow(area, L"시작 카운트다운", L"녹화를 누른 뒤 시작까지의 시간 · 영역 지정 막대에서도 바꿈 (단축키는 즉시 시작)", 230,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.cd"), c, {L"없음", L"3초", L"5초"}, settings_.countdown);
                });
@@ -1750,7 +1829,7 @@ void App::SettingsVideo(Rect& area, bool& changed) {
 void App::SettingsAudio(Rect& area, bool& changed) {
     SettingRow(area, L"소리 녹음",
                AudioCapture::ProcessLoopbackSupported()
-                   ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리"
+                   ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리(OzMaker 알림음은 빼고)"
                    : L"전체 화면 · 영역: 시스템 전체 소리 · 창 캡처는 Windows 10 2004 이상에서만 녹음됩니다",
                60, [&](Rect c) {
                    changed |= ui_.Toggle(HashId("set.audio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.audio);
@@ -1774,7 +1853,10 @@ void App::SettingsAudio(Rect& area, bool& changed) {
     SettingRow(area, L"마이크 장치", micDesc, 300, [&](Rect c) {
         UiId id = HashId("set.micDevice");
         bool hov = ui_.Hover(c);
-        if (ui_.Click(id, c)) changed |= MicMenu(c);
+        if (ui_.Click(id, c) && MicMenu(c)) {
+            changed = true;
+            if (micTest_.Running()) StartMicTest();  // now on the new device
+        }
         ui_.Fill(c, hov ? Surface3 : Surface2, 8);
         ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
         Rect t(c.l + 12, c.t, c.r - 30, c.b);
@@ -1795,6 +1877,40 @@ void App::SettingsAudio(Rect& area, bool& changed) {
         st.tabular = true;
         ui_.Text(label, util::Format(L"%d%%", settings_.micVolume), 13.f, TextColor, st);
     });
+    const bool testing = micTest_.Running() || micTestShow_ >= 0;
+    SettingRow(area, L"마이크 확인",
+               testing ? (settings_.micMonitor ? L"말해 보세요 · 내 목소리가 들립니다 · 녹음하지 않습니다 · 10초 뒤 멈춥니다"
+                                               : L"말해 보세요 · 녹음하지 않습니다 · 10초 뒤 저절로 멈춥니다")
+                       : L"누르는 동안 마이크를 잠시 열어 소리 크기를 보여 줍니다 · 녹음하지 않습니다",
+               300, [&](Rect c) {
+                   Rect btn = c.CutRight(84);
+                   if (ui_.Button(HashId("set.micTest"), btn.Inset(0, 4), testing ? L"그만" : L"테스트",
+                                  BtnStyle::Secondary, testing ? icon::Stop : 0, !micDevices_.empty(), 13.f) &&
+                       micTestShow_ < 0) {
+                       if (testing)
+                           StopMicTest();
+                       else
+                           StartMicTest();
+                   }
+                   // 16 steps over -60..0 dB: green, then yellow from -19 dB, red from -7.5 dB.
+                   const int n = 16;
+                   const float gap = 3, h = 14, w0 = c.l + 4, w = (c.W() - 16 - gap * (n - 1)) / n;
+                   const float level = micTestShow_ >= 0 ? micTestShow_ : micLevel_;
+                   for (int i = 0; i < n; ++i) {
+                       Rect s = Rect::XYWH(w0 + i * (w + gap), c.CY() - h / 2, w, h);
+                       D2D1_COLOR_F on = i >= n - 2 ? Rec : i >= n - 5 ? Warning : Success;
+                       ui_.Fill(s, testing && level >= (i + 0.5f) / n ? on : Surface3, 2);
+                   }
+               });
+    SettingRow(area, L"확인할 때 내 목소리 듣기",
+               L"테스트하는 동안 마이크 소리를 바로 들려줍니다 · 스피커로 들으면 소리가 되울릴 수 있으니 이어폰을 쓰세요",
+               60, [&](Rect c) {
+                   if (ui_.Toggle(HashId("set.micMon"), Rect::Centered(c.r - 22, c.CY(), 44, 24),
+                                  settings_.micMonitor)) {
+                       changed = true;
+                       SyncMicMonitor();
+                   }
+               });
 
     SettingRow(area, L"오디오 비트레이트", L"AAC · 160 kbps면 게임 · 음악 모두 충분합니다", 260, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.abr"), c, {L"96", L"128", L"160", L"192"}, settings_.aBitrateIdx);

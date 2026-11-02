@@ -14,6 +14,7 @@ on:
       - OzMaker.vcxproj
       - tools/package.ps1
       - tools/ci-selftest.ps1
+      - tools/check-version.ps1
       - src/Updater.*
       - .github/workflows/release.yml
   workflow_dispatch:
@@ -26,6 +27,15 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      # The version files must agree, and a tag must name the version its commit carries: a tag pushed on the wrong
+      # commit stops here, before anything is built or published.
+      - name: Check version
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
+          ./tools/check-version.ps1 -Tag $tag
+
       - uses: microsoft/setup-msbuild@v2
 
       - name: Locate vcpkg
@@ -58,13 +68,12 @@ jobs:
         shell: pwsh
         run: ./tools/package.ps1 -NoBuild
 
+      # The app folder, as the zip holds it. GitHub zips an artifact for download, so a zip in it would be packed twice.
+      # The release step below takes its files from dist itself.
       - uses: actions/upload-artifact@v4
         with:
           name: OzMaker
-          path: |
-            dist/*.zip
-            dist/OzMaker.exe
-            dist/update.txt
+          path: dist/OzMaker-*-win-x64/
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')

@@ -60,6 +60,7 @@ void Settings::Load() {
     aRateIdx = ReadInt(ini, L"AudioRate", aRateIdx, 0, _countof(kAudioRateOptions) - 1);
     mic = ReadInt(ini, L"Mic", mic, 0, 1) != 0;
     micVolume = ReadInt(ini, L"MicVolume", micVolume, 0, 200);
+    micMonitor = ReadInt(ini, L"MicMonitor", micMonitor, 0, 1) != 0;
     fpsIdx = ReadInt(ini, L"Fps", fpsIdx, 0, _countof(kFpsOptions) - 1);
     sizeIdx = ReadInt(ini, L"Size", sizeIdx, 0, _countof(kSizeOptions) - 1);
     cursor = ReadInt(ini, L"Cursor", cursor, 0, 1) != 0;
@@ -92,6 +93,7 @@ void Settings::Load() {
     outFpsIdx = ReadInt(ini, L"OutFps", outFpsIdx, 0, _countof(kOutFpsOptions) - 1);
     speedIdx = ReadInt(ini, L"Speed", speedIdx, 0, _countof(kSpeedOptions) - 1);
     loopIdx = ReadInt(ini, L"LoopCount", ReadInt(ini, L"Loop", 1, 0, 1) ? 0 : 1, 0, _countof(kLoopOptions) - 1);
+    previewVolume = ReadInt(ini, L"PreviewVolume", previewVolume, 0, 100);
     holdLast = ReadInt(ini, L"HoldLast", holdLast, 0, 1) != 0;
     targetIdx = ReadInt(ini, L"TargetSize", targetIdx, 0, _countof(kTargetMB) - 1);
 
@@ -141,6 +143,7 @@ void Settings::Save() const {
     num(L"AudioRate", aRateIdx);
     num(L"Mic", mic);
     num(L"MicVolume", micVolume);
+    num(L"MicMonitor", micMonitor);
     num(L"Fps", fpsIdx);
     num(L"Size", sizeIdx);
     num(L"Cursor", cursor);
@@ -170,6 +173,7 @@ void Settings::Save() const {
     num(L"OutFps", outFpsIdx);
     num(L"Speed", speedIdx);
     num(L"LoopCount", loopIdx);
+    num(L"PreviewVolume", previewVolume);
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);

@@ -66,6 +66,7 @@ inline constexpr wchar_t Photo = 0xE91B;
 inline constexpr wchar_t Record = 0xE7C8;
 inline constexpr wchar_t ChevronDown = 0xE70D;
 inline constexpr wchar_t Download = 0xE896;
+inline constexpr wchar_t Timer = 0xE916;  // stopwatch
 }  // namespace icon
 
 }  // namespace theme

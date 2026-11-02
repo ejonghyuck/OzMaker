@@ -126,7 +126,8 @@ public:
     void RequestRedraw() { animating_ = true; }
     LPCWSTR Cursor() const { return cursor_; }
     void SetCursor(LPCWSTR c) { cursor_ = c; }
-    const UiInput& In() const { return in_; }
+    // While input is blocked (a popover or a question over the page), the page sees no keys, clicks or pointer.
+    const UiInput& In() const { return blocked_ ? none_ : in_; }
     double Now() const { return now_; }
     float Dt() const { return dt_; }
     void SetInputBlocked(bool b) { blocked_ = b; }
@@ -175,7 +176,7 @@ public:
     void Painted(const Rect& r) override;
 
 private:
-    UiInput in_;
+    UiInput in_, none_;
     double now_ = 0, last_ = 0;
     float dt_ = 0;
     UiId active_ = 0;

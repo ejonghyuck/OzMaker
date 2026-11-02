@@ -578,6 +578,20 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                         if (settings_.sounds) sound::Play(sound::Cue::Tick);
                     }
                 }
+            } else if (w == kTimerMicTest) {
+                // Only while 설정 › 소리 is in front, and 10 s at most.
+                double now = util::NowSeconds();
+                if (screen_ != Screen::Settings || settings_.settingsTab != kTabAudio || !IsWindowVisible(hwnd_) ||
+                    IsIconic(hwnd_) || rec_ != RecState::Idle || now > micTestUntil_) {
+                    StopMicTest();
+                } else {
+                    micMonitor_.SetGain(settings_.micVolume / 100.f);
+                    float peak = std::min(1.f, micPeak_.exchange(0) * settings_.micVolume / 100.f);
+                    float pos = peak > 0 ? std::clamp((20 * std::log10(peak) + 60) / 60, 0.f, 1.f) : 0.f;
+                    micLevel_ = std::max(pos, micLevel_ - (float)(now - micLevelAt_) * 1.2f);
+                    micLevelAt_ = now;
+                    Invalidate();
+                }
             } else if (w == kTimerUpdate) {
                 SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
                 CheckForUpdate();
@@ -627,6 +641,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             quitting_ = true;
             DestroyWindow(hwnd_);
             return 0;
+        case WM_APP_ANSWER:
+            if (auto f = std::exchange(answer_, nullptr)) f();
+            return 0;
         case WM_APP_CAPTURE_CLOSED:
             if (rec_ == RecState::Recording) StopRecording();
             return 0;
@@ -659,7 +676,10 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
-            if (!settings_.closeToTray && !quitting_ && !ConfirmQuit()) return 0;
+            if (!settings_.closeToTray && !quitting_) {
+                AskQuit(false, [this] { PostMessageW(hwnd_, WM_APP_QUIT, 0, 0); });
+                return 0;
+            }
             if (settings_.closeToTray && !quitting_) {
                 HideMain();
                 if (!settings_.trayHintShown) {
@@ -697,6 +717,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             fetcher_.Stop();
             ReleaseThumbnails();
             WatchWindows(false);
+            StopMicTest();
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
             TrayRemove();
@@ -786,15 +807,32 @@ void App::SetSource(int source) {
     Invalidate();
 }
 
+// The picker opens on the area picked before; its toolbar records the area at once or keeps it for Home.
 void App::StartRegionPick() {
     if (rec_ != RecState::Idle || regionPicker_.Active()) return;
     HideMain();
-    regionPicker_.Start(EnumerateCaptureWindows(), [this](bool ok, RECT r) {
-        if (ok) {
+    RECT last = settings_.HasRegion() ? settings_.region : RECT{};
+    regionPicker_.Start(EnumerateCaptureWindows(), last, settings_.countdown, [this](PickResult res, RECT r) {
+        // The toolbar's countdown is the setting in 설정 › 녹화.
+        bool save = regionPicker_.Countdown() != settings_.countdown;
+        settings_.countdown = regionPicker_.Countdown();
+        if (res != PickResult::Cancel) {
             settings_.region = r;
             settings_.source = kSourceRegion;
-            settings_.Save();
+            save = true;
             TakeRegionSnapshot();  // before our window comes back over it
+        }
+        if (save) settings_.Save();
+        if (res == PickResult::Record) {
+            RecTarget t;
+            std::wstring why;
+            if (CurrentTarget(t, &why)) {
+                StartRecording(t, false);  // Home stays hidden; the countdown starts over the area
+                return;
+            }
+            ShowMain(true);
+            Toast(why, true);
+            return;
         }
         ShowMain(true);
     });
@@ -938,8 +976,54 @@ void App::ReportError(const std::wstring& title, const std::wstring& text) {
     }
 }
 
+void App::StartMicTest() {
+    StopMicTest();
+    micPeak_ = 0;
+    micLevel_ = 0;
+    std::wstring err;
+    auto sink = [this](const int16_t* pcm, size_t frames) {
+        int peak = 0;
+        for (size_t i = 0; i < frames * 2; ++i) peak = std::max(peak, std::abs((int)pcm[i]));
+        float v = peak / 32768.f, old = micPeak_.load();
+        while (v > old && !micPeak_.compare_exchange_weak(old, v)) {
+        }
+        micMonitor_.Push(pcm, frames);  // dropped unless it plays
+    };
+    if (!micTest_.Start(AudioCapture::Source::Mic, 0, 48000, util::Qpc100ns(), sink, err, settings_.micDevice)) {
+        Toast(err, true);
+        return;
+    }
+    SyncMicMonitor();
+    micTestUntil_ = util::NowSeconds() + 10;
+    micLevelAt_ = util::NowSeconds();
+    SetTimer(hwnd_, kTimerMicTest, 33, nullptr);
+    Invalidate();
+}
+
+void App::StopMicTest() {
+    if (!micTest_.Running()) return;
+    KillTimer(hwnd_, kTimerMicTest);
+    micTest_.Stop(0);
+    micMonitor_.Stop();
+    micLevel_ = 0;
+    Invalidate();
+}
+
+void App::SyncMicMonitor() {
+    bool want = micTest_.Running() && settings_.micMonitor;
+    micMonitor_.SetGain(settings_.micVolume / 100.f);  // what the recording would get
+    if (want == micMonitor_.Running()) return;
+    std::wstring err;
+    if (!want)
+        micMonitor_.Stop();
+    else if (!micMonitor_.Start(48000, err))
+        Toast(err, true);
+}
+
 void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     if (rec_ != RecState::Idle) return;
+    StopMicTest();      // the recording opens the mic itself
+    question_.reset();  // a question about this window's state (quit, discard) no longer applies
     recFromHotkey_ = fromHotkey;
     if (exporter_.Busy()) {
         if (fromHotkey)
@@ -1438,12 +1522,24 @@ void App::DropHeld(const Clip* clip) {
     std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
 }
 
-bool App::ConfirmQuit(bool restart) {
-    if (held_.empty()) return true;
-    std::wstring msg = util::Format(restart ? L"저장하지 않은 녹화가 %zu개 있습니다.\n다시 시작하면 사라집니다. 업데이트할까요?"
-                                            : L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?",
-                                    held_.size());
-    return MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+void App::AskQuit(bool restart, std::function<void()> then) {
+    if (held_.empty()) {
+        then();
+        return;
+    }
+    Ask({util::Format(L"저장하지 않은 녹화가 %zu개 있습니다", held_.size()),
+         restart ? L"다시 시작하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요."
+                 : L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+         restart ? L"다시 시작해서 업데이트" : L"종료", true, std::move(then)});
+}
+
+void App::Ask(Question q) {
+    if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) ShowMain(true);
+    SetPlaying(false);
+    filesOpen_ = updateOpen_ = false;
+    question_ = std::move(q);
+    ++questionSeq_;
+    Invalidate();
 }
 
 // ---------------------------------------------------------------- updates
@@ -1464,7 +1560,12 @@ void App::InstallUpdate() {
         Toast(L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다.", true);
         return;
     }
-    if (!ConfirmQuit(true)) return;
+    AskQuit(true, [this] {
+        if (rec_ == RecState::Idle && !exporter_.Busy()) RestartIntoUpdate();
+    });
+}
+
+void App::RestartIntoUpdate() {
     std::wstring err;
     if (!updater_.Install(err)) {
         Toast(err, true);
@@ -1517,6 +1618,59 @@ void App::CloseEditor() {
     RefreshWindows();
 }
 
+// The editor's 버리기 (a 움짤 recording) and 삭제 (the video just recorded, into the Recycle Bin). Only what this run
+// recorded: a video opened by hand gets no button. Files exported from the recording stay.
+bool App::CanDiscard() const {
+    if (!clip_ || exporter_.Busy()) return false;
+    const std::wstring& src = clip_->SourcePath();
+    return src.empty() || (!lastVideo_.path.empty() && _wcsicmp(src.c_str(), lastVideo_.path.c_str()) == 0);
+}
+
+void App::ConfirmDiscard() {
+    if (!CanDiscard()) return;
+    bool held = std::any_of(held_.begin(), held_.end(), [&](const HeldClip& h) { return h.clip == clip_; });
+    // The editor's clip when asked: the answer applies to that one only.
+    auto discard = [this, clip = std::weak_ptr<Clip>(clip_)] {
+        if (clip.lock() == clip_) DiscardRecording();
+    };
+    if (!clip_->SourcePath().empty())
+        Ask({L"이 동영상을 휴지통으로 옮길까요?",
+             util::FileNameOf(clip_->SourcePath()) + L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.", L"휴지통으로",
+             true, discard});
+    else
+        Ask({L"이 녹화를 버릴까요?",
+             held ? L"아직 저장하지 않아서 되돌릴 수 없습니다." : L"저장한 파일은 그대로 남습니다.", L"버리기", true,
+             discard});
+}
+
+void App::DiscardRecording() {
+    if (!CanDiscard()) return;
+    const std::wstring path = clip_->SourcePath();
+    CloseEditor();
+    StopThumbnails();
+    if (!path.empty()) {
+        // Nothing may hold the file: the readers went with the editor; a size estimate in flight gets a moment.
+        for (double until = util::NowSeconds() + 3; estimator_.Busy() && util::NowSeconds() < until;) Sleep(10);
+        bool gone = testDeleteFiles_ ? DeleteFileW(path.c_str()) != 0 : util::MoveToRecycleBin(hwnd_, path);
+        if (!gone) {
+            AttachReaders();
+            screen_ = Screen::Editor;
+            Toast(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.", true);
+            Invalidate();
+            return;
+        }
+        showVideo_ = false;
+        lastVideo_ = {};
+        RefreshRecent();
+    }
+    DropHeld(clip_.get());
+    clip_.reset();
+    frameBmp_.Reset();
+    hasResult_ = resultOriginal_ = false;
+    Toast(path.empty() ? L"녹화를 버렸습니다." : L"휴지통으로 옮겼습니다 · " + util::FileNameOf(path));
+    Invalidate();
+}
+
 void App::AttachReaders() {
     if (!clip_) return;
     if (clip_->SlowSeek()) {
@@ -1564,18 +1718,42 @@ void App::UploadFrame(const uint8_t* px) {
 // A video's sound follows the preview: only while it plays at 1x in the editor and OzMaker is in front.
 void App::SyncAudioPreview() {
     auto video = std::dynamic_pointer_cast<const VideoClip>(clip_);
-    bool want = video && video->HasAudio() && !previewMute_ && playing_ && !scrubbing_ && screen_ == Screen::Editor &&
-                kSpeedOptions[settings_.speedIdx] == 1.0 && hwnd_ && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) &&
-                GetForegroundWindow() == hwnd_;
+    bool want = video && video->HasAudio() && !previewMute_ && settings_.previewVolume > 0 && playing_ &&
+                !scrubbing_ && screen_ == Screen::Editor && kSpeedOptions[settings_.speedIdx] == 1.0 && hwnd_ &&
+                IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && GetForegroundWindow() == hwnd_;
     if (!want) {
         audioPreview_.Stop();
         return;
     }
+    float v = settings_.previewVolume / 100.f;
+    audioPreview_.SetGain(v * v);  // squared, so the steps sound about even
     if (audioPreview_.Active() && audioEpoch_ == playEpoch_) return;
     audioEpoch_ = playEpoch_;
     int64_t start = clip_->Ts(inF_), end = RangeEndTs();
     int64_t t = playTs_ + (int64_t)((util::NowSeconds() - playWall_) * 1e7);
     audioPreview_.Start(video, std::clamp(t, start, end - 1), end);
+}
+
+// The speaker button. A volume dragged down to 0 comes back at 50 %.
+void App::TogglePreviewMute() {
+    if (!previewMute_ && settings_.previewVolume > 0) {
+        previewMute_ = true;
+        return;
+    }
+    previewMute_ = false;
+    if (settings_.previewVolume == 0) {
+        settings_.previewVolume = 50;
+        settingsDirty_ = true;
+    }
+}
+
+// The volume slider and the wheel over it; moving it turns the sound back on.
+void App::SetPreviewVolume(int v) {
+    v = std::clamp(v, 0, 100);
+    previewMute_ = false;
+    if (v == settings_.previewVolume) return;
+    settings_.previewVolume = v;
+    settingsDirty_ = true;
 }
 
 int64_t App::RangeEndTs() const {
@@ -2123,10 +2301,6 @@ void App::TrayMenu() {
             else
                 StopRecording();
             break;
-        case 3:
-            if (!ConfirmQuit()) break;
-            quitting_ = true;
-            DestroyWindow(hwnd_);
-            break;
+        case 3: AskQuit(false, [this] { PostMessageW(hwnd_, WM_APP_QUIT, 0, 0); }); break;
     }
 }

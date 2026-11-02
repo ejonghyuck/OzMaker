@@ -2,6 +2,8 @@
 #include "Util.h"
 
 #include <cstdarg>
+#include <exdisp.h>
+#include <shldisp.h>
 
 namespace util {
 
@@ -118,8 +120,63 @@ void OpenFolderAndSelect(const std::wstring& path) {
     }
 }
 
-void ShellOpen(const std::wstring& path) {
-    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+namespace {
+
+// Shell.Application of the desktop window: its ShellExecute runs in Explorer.
+ComPtr<IShellDispatch2> DesktopShell() {
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&windows)))) return nullptr;
+    VARIANT loc{}, empty{};
+    loc.vt = VT_I4;
+    loc.lVal = CSIDL_DESKTOP;
+    long hwnd = 0;
+    ComPtr<IDispatch> disp;
+    ComPtr<IServiceProvider> sp;
+    ComPtr<IShellBrowser> browser;
+    ComPtr<IShellView> view;
+    ComPtr<IDispatch> background, app;
+    ComPtr<IShellFolderViewDual> folder;
+    ComPtr<IShellDispatch2> shell;
+    if (FAILED(windows->FindWindowSW(&loc, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &disp)) || !disp ||
+        FAILED(disp.As(&sp)) || FAILED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) ||
+        FAILED(browser->QueryActiveShellView(&view)) ||
+        FAILED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&background))) || FAILED(background.As(&folder)) ||
+        FAILED(folder->get_Application(&app)) || !app || FAILED(app.As(&shell)))
+        return nullptr;
+    return shell;
+}
+
+}  // namespace
+
+bool ShellOpen(const std::wstring& path, const std::wstring& args) {
+    if (auto shell = DesktopShell()) {
+        BSTR file = SysAllocString(path.c_str());
+        VARIANT a{}, dir{}, op{}, show{};
+        a.vt = VT_BSTR;
+        a.bstrVal = SysAllocString(args.c_str());
+        show.vt = VT_I4;
+        show.lVal = SW_SHOWNORMAL;
+        AllowSetForegroundWindow(ASFW_ANY);  // Explorer starts it, for the user who just clicked here
+        HRESULT hr = shell->ShellExecute(file, a, dir, op, show);
+        SysFreeString(file);
+        VariantClear(&a);
+        if (SUCCEEDED(hr)) return true;
+    }
+    ShellExecuteW(nullptr, L"open", path.c_str(), args.empty() ? nullptr : args.c_str(), nullptr, SW_SHOWNORMAL);
+    return false;
+}
+
+// Where a drive has no Recycle Bin (some network and USB drives), Windows asks before it deletes for good.
+bool MoveToRecycleBin(HWND owner, const std::wstring& path) {
+    std::wstring from = path;
+    from.push_back(L'\0');  // a list, ended by two nulls
+    SHFILEOPSTRUCTW op{};
+    op.hwnd = owner;
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT;
+    if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) return false;
+    return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
 }
 
 bool CopyFileToClipboard(HWND owner, const std::wstring& path) {

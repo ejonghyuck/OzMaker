@@ -81,6 +81,7 @@ struct Settings {
     bool mic = false;        // the microphone mixed into the MP4's sound (#21)
     std::wstring micDevice;  // endpoint ID, empty = Windows' default input
     int micVolume = 100;     // %, 0-200
+    bool micMonitor = true;  // 마이크 확인 plays the mic back while it runs
 
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip
@@ -89,6 +90,7 @@ struct Settings {
     int outFpsIdx = 0;
     int speedIdx = 1;
     int loopIdx = 0;   // kLoopOptions
+    int previewVolume = 100;  // %, 0-100: the editor's sound preview, not the saved file
     int targetIdx = 0;  // kTargetMB
     bool holdLast = false;
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}

@@ -11,6 +11,7 @@ public:
     enum class Source {
         System,   // loopback: everything the default output device plays
         Process,  // loopback: only one process tree (Windows 10 2004+)
+        Others,   // loopback: everything but OzMaker itself, so its own sounds stay out (Windows 10 2004+)
         Mic,      // an input device (#21)
     };
     struct Device {
@@ -70,6 +71,31 @@ private:
     int64_t written_ = 0;  // output frames delivered so far
     std::mutex mtx_;        // origin_, pausedAt_ and the sink: Pause/Resume come from another thread
     int64_t pausedAt_ = 0;  // QPC of the pause in progress, 0 = none
+};
+
+// Plays a live stream (what the mic check hears) on the default output device with little delay: a short buffer
+// evens out the gaps between capture packets, and whatever piles up beyond it is dropped so the delay never grows.
+class AudioMonitor {
+public:
+    ~AudioMonitor() { Stop(); }
+    bool Start(int sampleRate, std::wstring& err);  // interleaved 16-bit stereo
+    void Stop();
+    bool Running() const { return thread_.joinable(); }
+    // From any thread. Dropped while not running.
+    void Push(const int16_t* pcm, size_t frames);
+    void SetGain(float g) { gain_ = std::clamp(g, 0.f, 2.f); }
+
+private:
+    void Run();
+
+    int rate_ = 48000;
+    std::thread thread_;
+    HANDLE stop_ = nullptr, ready_ = nullptr;
+    HRESULT startHr_ = S_OK;
+    std::atomic<float> gain_{1.f};
+    std::mutex mtx_;
+    bool open_ = false;        // under mtx_
+    std::vector<int16_t> q_;   // under mtx_: frames not played yet
 };
 
 // Adds up AudioCapture streams that share an origin (frame n of each plays at the same moment) into one stream:

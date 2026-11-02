@@ -4,7 +4,7 @@
 //   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause] [mic] [click]
 //                                         records a real window (or its monitor / its area) and exports it
 //   --analyze <file.mp4> <dir> [freq ...] decodes an MP4: timing, size, test-tone levels
-//   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export
+//   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export -> 삭제
 //   --video-test <dir> [w h]              synthetic MP4 -> frame index/decoding -> trimmed MP4/GIF exports, checked
 //                                         frame by frame and by the audio tone boundaries; editor screenshots
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
@@ -21,6 +21,9 @@
 #include "VideoClip.h"
 
 namespace {
+
+// Further down, with the other test-tone helpers.
+double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, double f, int rate);
 
 // The MP4 colour conversion runs on the GPU's video processor, which machines without a GPU (CI runners) lack.
 bool HasVideoProcessor() {
@@ -591,6 +594,37 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"layers, page drawn over the preview: %s %d error(s) caught", good ? L"ok" : L"FAIL",
                          ui_.LayerErrors()));
         if (!good) ++failures;
+        // A question in place of a MessageBox: it covers the window, the preview with it; Esc says no, Enter yes,
+        // and yes runs afterwards (WM_APP_ANSWER), not in the frame.
+        {
+            filesOpen_ = false;
+            toastUntil_ = 0;
+            int yes = 0;
+            auto ask = [&] {
+                Ask({L"저장하지 않은 녹화가 1개 있습니다", L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+                     L"종료", true, [&] { ++yes; }});
+            };
+            ask();
+            frames(8);
+            PreviewLayout(dest, src);
+            size_t left = PreviewParts(dest).size(), floats = ui_.Floats().size();
+            in.keys = {VK_ESCAPE};
+            frames(1);
+            in.keys.clear();
+            bool no = !question_ && !answer_ && yes == 0;
+            ask();
+            frames(3);
+            in.keys = {VK_RETURN};
+            frames(1);
+            in.keys.clear();
+            bool later = !question_ && answer_ && yes == 0;
+            if (auto f = std::exchange(answer_, nullptr)) f();
+            good = thumbWanted_ && ui_.LayerErrors() == 0 && floats >= 1 && left == 0 && no && later && yes == 1;
+            log(util::Format(L"question: %s %zu preview parts left uncovered, %d layering errors, Esc no %d, "
+                             L"Enter yes after the frame %d",
+                             good ? L"ok" : L"FAIL", left, ui_.LayerErrors(), no, later && yes == 1));
+            if (!good) ++failures;
+        }
         filesOpen_ = false;
         toastUntil_ = 0;
         recentFiles_.clear();
@@ -631,6 +665,132 @@ int App::RunSelfTest(const std::wstring& dir) {
         mix.Input(0)(low.data(), 1);
         mix.Input(1)(low.data(), 1);
         mcheck(out.size() == 4 && out[0] == 32767 && out[2] == -32768, L"loud sums clip");
+    }
+    // The editor's preview volume (#36): the samples scale by the gain, ramped from the one before.
+    {
+        auto vcheck = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"preview volume: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        std::vector<int16_t> s{1000, -1000, 32767, -32768};
+        AudioPreview::Scale(s.data(), 2, 0.25f, 0.25f);
+        vcheck(s[0] == 250 && s[1] == -250 && s[2] == 8192 && s[3] == -8192, L"scales both channels");
+        std::vector<int16_t> ramp(8, 1000);
+        AudioPreview::Scale(ramp.data(), 4, 1.f, 0.f);
+        vcheck(ramp[0] == 1000 && ramp[1] == 1000 && ramp[2] == 750 && ramp[4] == 500 && ramp[7] == 250,
+               L"ramps from the last gain");
+        std::vector<int16_t> full{1234, -1234};
+        AudioPreview::Scale(full.data(), 1, 1.f, 1.f);
+        vcheck(full[0] == 1234 && full[1] == -1234, L"100 % leaves the samples alone");
+    }
+    // OzMaker's own sounds stay out of a recording of everything that plays (the start cue was recorded), and the
+    // mic check plays the mic back. A quiet made-up tone stands in for the mic: a loopback of OzMaker alone hears
+    // it, the recording's source (everything but OzMaker) doesn't. Whatever else plays on this PC is in that
+    // source too: measured at the tone's pitch before the tone, it can't be told apart when it is that loud.
+    // Only levels are kept.
+    if (!AudioCapture::ProcessLoopbackSupported()) {
+        log(L"own sound: skipped (needs Windows 10 2004 or later)");
+    } else {
+        std::mutex m;
+        std::vector<int16_t> self, others;
+        auto into = [&m](std::vector<int16_t>& v) {
+            return [&m, &v](const int16_t* p, size_t n) {
+                std::lock_guard lk(m);
+                v.insert(v.end(), p, p + n * 2);
+            };
+        };
+        AudioMonitor mon;
+        AudioCapture a, b;
+        std::wstring err;
+        const int64_t origin = util::Qpc100ns();
+        bool started = mon.Start(48000, err) &&
+                       a.Start(AudioCapture::Source::Process, GetCurrentProcessId(), 48000, origin, into(self), err) &&
+                       b.Start(AudioCapture::Source::Others, 0, 48000, origin, into(others), err);
+        if (!started) {
+            log(L"own sound: skipped (no audio output: " + err + L")");
+        } else {
+            const double f = 3517;  // high, where music has little
+            const size_t total = 48000 * 6 / 10;  // 0.6 s, pushed in 10 ms blocks a little ahead of real time
+            Sleep(600);
+            size_t mark;  // frames of the recording's source before the tone
+            {
+                std::lock_guard lk(m);
+                mark = others.size() / 2;
+            }
+            std::vector<int16_t> block(480 * 2);
+            double phase = 0, t0 = util::NowSeconds();
+            for (size_t pushed = 0; pushed < total; Sleep(2)) {
+                size_t due = (size_t)((util::NowSeconds() - t0) * 48000) + 960;
+                for (; pushed < due && pushed < total; pushed += 480) {
+                    for (size_t i = 0; i < 480; ++i) {
+                        phase += 2 * 3.14159265358979 * f / 48000;
+                        block[2 * i] = block[2 * i + 1] = (int16_t)(0.02 * std::sin(phase) * 32767);
+                    }
+                    mon.Push(block.data(), 480);
+                }
+            }
+            Sleep(300);
+            mon.Stop();
+            a.Stop(0);
+            b.Stop(0);
+            auto loudest = [&](const std::vector<int16_t>& v, size_t from, size_t to) {  // frames
+                double best = 0;
+                for (size_t i = from; i + 19200 <= to && (i + 19200) * 2 <= v.size(); i += 2400)
+                    best = std::max(best, ToneLevel(v, i, 19200, f, 48000));
+                return best;
+            };
+            double heard = loudest(self, 0, self.size() / 2), before = loudest(others, 0, mark),
+                   recorded = loudest(others, mark, others.size() / 2);
+            // Without the exclusion the recording hears the tone as loudly as OzMaker's own loopback does.
+            bool ok = heard > 0.005 && recorded < heard * 0.5;
+            if (heard > 0.005 && before >= heard * 0.25) {
+                log(util::Format(L"own sound: skipped (other sound at the test pitch, %.4f)", before));
+            } else {
+                if (!ok) ++failures;
+                log(util::Format(L"own sound: %s the mic playback comes out of OzMaker (level %.4f) and stays out of "
+                                 L"the recording's sound (%.4f, %.4f before it from whatever else plays)",
+                                 ok ? L"ok  " : L"FAIL", heard, recorded, before));
+            }
+        }
+    }
+    // What OzMaker opens (a video in its player, a page in the browser) is Explorer's child, not this process's:
+    // the recording sound leaves out OzMaker's process tree and must still hear that player or browser.
+    {
+        std::wstring out = dir + L"\\parent.txt";
+        DeleteFileW(out.c_str());
+        if (!util::ShellOpen(util::ExePath(), L"--report-parent \"" + out + L"\"")) {
+            log(L"open through Explorer: skipped (no Explorer desktop)");
+        } else {
+            DWORD parent = 0;
+            for (double until = util::NowSeconds() + 10; util::NowSeconds() < until; Sleep(50)) {
+                std::string text;
+                if (FILE* f = _wfsopen(out.c_str(), L"rb", _SH_DENYNO)) {
+                    char buf[32] = {};
+                    text.assign(buf, fread(buf, 1, sizeof(buf) - 1, f));
+                    fclose(f);
+                }
+                if (!text.empty()) {
+                    parent = (DWORD)strtoul(text.c_str(), nullptr, 10);
+                    break;
+                }
+            }
+            bool ok = parent != 0 && parent != GetCurrentProcessId();
+            if (!ok) ++failures;
+            log(util::Format(L"open through Explorer: %s what it starts is not OzMaker's child (parent %s)",
+                             ok ? L"ok  " : L"FAIL", parent == 0 ? L"unknown" : parent == GetCurrentProcessId() ? L"OzMaker" : L"another process"));
+        }
+    }
+    // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
+    {
+        auto clip = MakeSyntheticClip(320, 180, 10, 30);
+        size_t before = held_.size();
+        HoldRecording(clip);
+        OpenEditor(clip);
+        bool can = CanDiscard();
+        DiscardRecording();
+        bool ok = can && !clip_ && held_.size() == before && screen_ == Screen::Home && clip.use_count() == 1;
+        if (!ok) ++failures;
+        log(util::Format(L"discard: %s an unsaved recording goes from the editor", ok ? L"ok  " : L"FAIL"));
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
@@ -754,7 +914,17 @@ int App::RunScreenshots(const std::wstring& dir) {
             p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
             p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
-            regionPicker_.PaintTest(p, mr, a, c, true);
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Adjust);
+        });
+        // Opened again on the area picked before, with the toolbar's countdown menu open.
+        gfx_.RenderToPng((dir + L"\\region_last.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
+            p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
+            POINT a{mr.left + mw * 30 / 100, mr.top + mh * 30 / 100}, c{mr.left + mw * 58 / 100, mr.top + mh * 62 / 100};
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Last);
         });
     }
 
@@ -785,8 +955,15 @@ int App::RunScreenshots(const std::wstring& dir) {
     for (int i = 0; i < kTabCount; ++i) {
         settings_.settingsTab = i;
         settingsScroll_ = 0;
+        micTestShow_ = i == kTabAudio ? 0.6f : -1;  // the mic check running, on a made-up level
         shot(tabShots[i], 96);
     }
+    settings_.settingsTab = kTabAudio;  // the mic rows at the bottom, testing, with the playback switch
+    settingsScroll_ = 10000;
+    micTestShow_ = 0.6f;
+    shot(L"settings_audio_mic.png", 96);
+    settingsScroll_ = 0;
+    micTestShow_ = -1;
     settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));
@@ -824,6 +1001,13 @@ int App::RunScreenshots(const std::wstring& dir) {
     shot(L"editor_toast_long.png", 96);
     toastError_ = false;
     toastUntil_ = 0;
+    // Questions inside the window instead of MessageBox.
+    ConfirmDiscard();
+    shot(L"editor_ask.png", 96);
+    Ask({L"이 동영상을 휴지통으로 옮길까요?", L"OzMaker_20261102_142311.mp4\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.",
+         L"휴지통으로", true, nullptr});
+    shot(L"editor_ask_video.png", 96);
+    question_.reset();
     CloseEditor();
 
     // Files list: two recordings not exported yet and a few recent files (names only, nothing on disk).
@@ -1697,23 +1881,28 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
             });
         }
     };
+    settings_.previewVolume = 60;
     shot(L"editor_video.png");
     hasResult_ = resultOriginal_ = true;
     lastResult_ = {};
     lastResult_.ok = true;
     lastResult_.path = src;
     lastResult_.bytes = util::FileSize(src);
+    lastVideo_.path = src;  // as if just recorded: 삭제 shows
     shot(L"editor_video_saved.png");
     settings_.speedIdx = 3;
     hasResult_ = false;
     shot(L"editor_video_fast.png");
     settings_.speedIdx = 1;
+    settings_.previewVolume = 100;
+    lastVideo_ = {};
     CloseEditor();
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
 
-// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys.
+// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys, the
+// toolbar's countdown, save and record, and opening on the area picked before.
 int App::RunRegionTest(const std::wstring& dir) {
     util::EnsureDir(dir);
     Log log(dir + L"\\region.log");
@@ -1726,7 +1915,8 @@ int App::RunRegionTest(const std::wstring& dir) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
     const int ox = mi.rcMonitor.left, oy = mi.rcMonitor.top;
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    bool done = false, ok = false;
+    bool done = false;
+    PickResult res = PickResult::Cancel;
     RECT got{};
     auto pump = [&](double s) {
         double until = util::NowSeconds() + s;
@@ -1739,11 +1929,12 @@ int App::RunRegionTest(const std::wstring& dir) {
             Sleep(5);
         }
     };
-    auto start = [&](std::vector<WinInfo> cands = {}) {
-        done = ok = false;
-        regionPicker_.Start(std::move(cands), [&](bool o, RECT r) {
+    auto start = [&](std::vector<WinInfo> cands = {}, RECT last = {}) {
+        done = false;
+        res = PickResult::Cancel;
+        regionPicker_.Start(std::move(cands), last, 1, [&](PickResult o, RECT r) {
             done = true;
-            ok = o;
+            res = o;
             got = r;
         });
         pump(0.15);
@@ -1762,6 +1953,11 @@ int App::RunRegionTest(const std::wstring& dir) {
     auto key = [&](UINT vk) {
         PostMessageW(regionPicker_.Hwnd(), WM_KEYDOWN, vk, 0);
         pump(0.08);
+    };
+    auto click = [&](RECT b) {  // a toolbar button, in screen pixels
+        post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
+        post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
+        pump(0.12);
     };
     auto rel = [&](RECT r) {
         return util::Format(L"%d,%d-%d,%d", r.left - ox, r.top - oy, r.right - ox, r.bottom - oy);
@@ -1795,10 +1991,7 @@ int App::RunRegionTest(const std::wstring& dir) {
     post(WM_MOUSEMOVE, 700, 500);
     pump(0.08);
     stale(L"handle hover");
-    RECT b = regionPicker_.ToolbarButton(3);  // 16:9
-    post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
-    post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
-    pump(0.12);
+    click(regionPicker_.ToolbarButton(3));  // 16:9
     s = regionPicker_.AdjustedArea();
     check(is(s, 300, 201, 1151, 680), L"16:9 keeps width and centre: " + rel(s));
     drag(s.right - ox, s.bottom - oy, s.right - ox + 100, s.bottom - oy + 20);
@@ -1817,7 +2010,8 @@ int App::RunRegionTest(const std::wstring& dir) {
     s = regionPicker_.AdjustedArea();
     check(s.left == before.left + 1 && s.right == before.right + 1 && s.top == before.top, L"arrow key moves 1px: " + rel(s));
     key(VK_RETURN);
-    check(done && ok && EqualRect(&got, &s) && !regionPicker_.Active(), L"Enter confirms: " + rel(got));
+    check(done && res == PickResult::Record && EqualRect(&got, &s) && !regionPicker_.Active(),
+          L"Enter records: " + rel(got));
 
     start();
     post(WM_MOUSEMOVE, 400, 300);
@@ -1827,7 +2021,45 @@ int App::RunRegionTest(const std::wstring& dir) {
     s = regionPicker_.AdjustedArea();
     check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click (no window) takes the screen: " + rel(s));
     key(VK_ESCAPE);
-    check(done && !ok && !regionPicker_.Active(), L"Esc cancels");
+    check(done && res == PickResult::Cancel && !regionPicker_.Active(), L"Esc cancels");
+
+    // The toolbar: its countdown menu, then "저장만" keeps the area without recording.
+    start();
+    drag(200, 150, 1000, 600);
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarCountdown));
+    check(regionPicker_.MenuOpen(), L"the countdown button opens its menu");
+    stale(L"countdown menu");
+    key(VK_ESCAPE);
+    check(!done && !regionPicker_.MenuOpen() && regionPicker_.Countdown() == 1, L"Esc closes only the menu");
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarCountdown));
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarMenu + 2));
+    check(!done && !regionPicker_.MenuOpen() && regionPicker_.Countdown() == 2, L"the menu picks 5 s and closes");
+    stale(L"menu closed");
+    s = regionPicker_.AdjustedArea();
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarSave));
+    check(done && res == PickResult::Save && EqualRect(&got, &s), L"save only: " + rel(got));
+
+    // Opened on the area picked before: the record button takes it as it is.
+    RECT last{ox + 320, oy + 240, ox + 960, oy + 600};
+    start({}, last);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &last), L"opens on the last area: " + rel(s));
+    stale(L"last area");
+    click(regionPicker_.ToolbarButton(RegionPicker::kBarRecord));
+    check(done && res == PickResult::Record && EqualRect(&got, &last), L"record button: " + rel(got));
+    // A click outside it starts over: no window there, so the whole monitor.
+    start({}, last);
+    post(WM_MOUSEMOVE, 100, 100);
+    post(WM_LBUTTONDOWN, 100, 100, MK_LBUTTON);
+    post(WM_LBUTTONUP, 100, 100);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click outside it takes the screen: " + rel(s));
+    key(VK_ESCAPE);
+    // Not when it no longer lies on a screen.
+    start({}, RECT{vx - 3000, vy - 3000, vx - 2000, vy - 2400});
+    check(!done && !regionPicker_.Adjusting(), L"a last area off the screens opens empty");
+    key(VK_ESCAPE);
 
     // Hovering windows (made up here, not the user's): the area and its label follow the one under the cursor.
     WinInfo wa, wb;
@@ -1919,6 +2151,24 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
           util::Format(L"plays through the fetcher: frame %zu -> %zu, foreground %d, sound preview %d", first, shown_,
                        fg, audioPreview_.Active()));
     if (fg) check(audioPreview_.Active(), L"sound preview runs while playing in front");
+    // The volume (#36): 0 stops the sound like mute, and the speaker button brings it back at 50 %.
+    settings_.previewVolume = 0;
+    SyncAudioPreview();
+    check(!audioPreview_.Active(), L"volume 0 stops the sound preview");
+    TogglePreviewMute();
+    SyncAudioPreview();
+    check(!previewMute_ && settings_.previewVolume == 50 && (!fg || audioPreview_.Active()),
+          util::Format(L"the speaker button turns a volume of 0 back on (%d%%)", settings_.previewVolume));
+    TogglePreviewMute();
+    SyncAudioPreview();
+    check(previewMute_ && settings_.previewVolume == 50 && !audioPreview_.Active(),
+          L"the speaker button mutes and keeps the volume");
+    SetPreviewVolume(70);
+    SyncAudioPreview();
+    check(!previewMute_ && settings_.previewVolume == 70 && (!fg || audioPreview_.Active()),
+          L"moving the volume turns the sound back on");
+    SetPreviewVolume(140);
+    check(settings_.previewVolume == 100, L"the volume stops at 100 %");
 
     key(VK_SPACE);
     check(!playing_ && !audioPreview_.Active(), L"space pauses (sound stops)");
@@ -1995,6 +2245,40 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         ReleaseDC(nullptr, screen);
         SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         log(L"home card with a window preview: home_card.png");
+    }
+    // 삭제 in the editor (#37), on a copy: the video just recorded goes with its home card (the test deletes it
+    // outright instead of filling the Recycle Bin); a video opened by hand gets no button.
+    std::wstring copy = dir + L"\\delete_test.mp4";
+    if (CopyFileW(path.c_str(), copy.c_str(), FALSE)) {
+        r.path = copy;
+        r.bytes = util::FileSize(copy);
+        OnVideoSaved(r);
+        pump(0.5);
+        check(screen_ == Screen::Editor && CanDiscard(), L"the video just recorded can be deleted in the editor");
+        testDeleteFiles_ = true;
+        // Delete asks inside the window; the editor under the question takes no keys; Esc says no, Enter yes.
+        key(VK_DELETE);
+        pump(0.3);
+        bool asked = question_.has_value() && question_->danger;
+        key(VK_SPACE);
+        pump(0.3);
+        bool still = !playing_ && question_.has_value();
+        key(VK_ESCAPE);
+        pump(0.3);
+        check(asked && still && !question_ && screen_ == Screen::Editor && GetFileAttributesW(copy.c_str()) != INVALID_FILE_ATTRIBUTES,
+              util::Format(L"Delete asks in the window (asked %d, the editor ignored Space %d); Esc keeps the video",
+                           asked, still));
+        key(VK_DELETE);
+        pump(0.3);
+        key(VK_RETURN);
+        pump(0.5);
+        check(screen_ == Screen::Home && !clip_ && !showVideo_ && !question_ &&
+                  GetFileAttributesW(copy.c_str()) == INVALID_FILE_ATTRIBUTES && util::FileSize(path) > 0,
+              L"Enter on the question: 삭제 removes the video and its card and goes home");
+        check(OpenVideo(path) && !CanDiscard(), L"a video opened by hand has no 삭제");
+        CloseEditor();
+    } else {
+        check(false, L"copy for the 삭제 check");
     }
     exporter_.Cancel();
     quitting_ = true;

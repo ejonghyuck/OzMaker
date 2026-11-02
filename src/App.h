@@ -35,10 +35,11 @@ private:
         WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
         WM_APP_ESTIMATE,
         WM_APP_UPDATE,
+        WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
-    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate };
+    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest };
     enum class RecState { Idle, Countdown, Recording };
     enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
 
@@ -137,7 +138,24 @@ private:
     void RefreshRecent();
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
-    bool ConfirmQuit(bool restart = false);  // asks about unsaved recordings, if any
+    // Asks about unsaved recordings, if there are any, then (on yes) runs `then`.
+    void AskQuit(bool restart, std::function<void()> then);
+    bool CanDiscard() const;  // the editor's 버리기 / 삭제: a recording from this run, nothing exporting
+    void ConfirmDiscard();
+    void DiscardRecording();
+
+    // A question inside the window instead of a MessageBox: a card over the dimmed window, Enter for yes, Esc (or a
+    // click outside) for no. The window comes to the front for it.
+    struct Question {
+        std::wstring title, body, yes;
+        bool danger = false;  // yes destroys something: a red button
+        std::function<void()> onYes;
+    };
+    void Ask(Question q);
+    void DrawQuestion(Rect client);
+    std::optional<Question> question_;
+    std::function<void()> answer_;  // onYes of the question just answered, for WM_APP_ANSWER
+    uint32_t questionSeq_ = 0;      // a new question fades in again
 
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
@@ -149,6 +167,8 @@ private:
     void ShowFrame(size_t index);
     void UploadFrame(const uint8_t* px);
     void SyncAudioPreview();
+    void TogglePreviewMute();
+    void SetPreviewVolume(int v);
     void SetPlaying(bool play);
     void Seek(size_t index);
     size_t PlayheadFromClock();
@@ -186,7 +206,8 @@ private:
     // ---- updates (#31)
     void CheckForUpdate();  // when one is due (timer), or now from the settings
     bool UpdateReady() const;
-    void InstallUpdate();   // swap the exe and restart into it
+    void InstallUpdate();   // asks about unsaved recordings, then RestartIntoUpdate
+    void RestartIntoUpdate();  // swap the exe and restart into it
 
     // ---- test helpers (SelfTest)
     int RunScreenshots(const std::wstring& dir);
@@ -318,6 +339,7 @@ private:
     double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
     uint64_t exportEstimate_ = 0;
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
+    bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
 
     Updater updater_;
     bool updateOpen_ = false;  // the popover under the update button
@@ -338,6 +360,16 @@ private:
     bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
     std::vector<AudioCapture::Device> micDevices_;  // 설정 › 소리, listed when the tab is opened
     bool micListed_ = false;
+    // 설정 › 소리 "마이크 확인": the chosen mic opened for up to 10 s to show its level. Nothing is recorded.
+    void StartMicTest();
+    void StopMicTest();
+    std::atomic<float> micPeak_{0};  // loudest sample since the meter last looked, 0..1, before the mic volume
+    AudioMonitor micMonitor_;        // plays the mic back while testing (settings_.micMonitor)
+    AudioCapture micTest_;           // after micPeak_ and micMonitor_: its thread writes to them until it is destroyed
+    void SyncMicMonitor();           // micMonitor_ on while testing with settings_.micMonitor
+    float micLevel_ = 0;             // the meter: 0..1 over -60..0 dB, falling back slowly
+    double micTestUntil_ = 0, micLevelAt_ = 0;
+    float micTestShow_ = -1;         // screenshots: a made-up level, no device opened
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;
