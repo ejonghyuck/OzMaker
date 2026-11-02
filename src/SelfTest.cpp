@@ -15,6 +15,17 @@
 
 namespace {
 
+// The MP4 colour conversion runs on the GPU's video processor, which machines without a GPU (CI runners) lack.
+bool HasVideoProcessor() {
+    ComPtr<ID3D11Device> dev;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0,
+                                 D3D11_SDK_VERSION, &dev, nullptr, nullptr)))
+        return false;
+    ComPtr<ID3D11VideoDevice> vd;
+    return SUCCEEDED(dev.As(&vd));
+}
+
 class Log {
 public:
     explicit Log(const std::wstring& path) { f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO); }
@@ -139,6 +150,10 @@ int App::RunSelfTest(const std::wstring& dir) {
         Format fmt = (Format)f;
         if (!FormatAvailable(fmt)) {
             log(std::wstring(FormatName(fmt)) + L": not built");
+            continue;
+        }
+        if (fmt == Format::Mp4 && !HasVideoProcessor()) {
+            log(L"MP4: skipped (no GPU video processor)");
             continue;
         }
         ExportJob job;
