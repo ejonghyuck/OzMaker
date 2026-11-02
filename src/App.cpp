@@ -123,8 +123,25 @@ bool App::CreateMainWindow(int show) {
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(mon, &mi);
     float s = dx / 96.f;
-    int w = (int)(1120 * s), h = (int)(780 * s);
-    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2, y = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;
+    // Shrunk to fit small or highly scaled screens (1920×1080 at 150% leaves under 700 DIP of height).
+    const RECT& wa = mi.rcWork;
+    int w = std::min((int)(1120 * s), (int)(wa.right - wa.left)), h = std::min((int)(780 * s), (int)(wa.bottom - wa.top));
+    int x = (wa.left + wa.right - w) / 2, y = std::max(wa.top, (wa.top + wa.bottom - h) / 2);
+    // The last position, as long as its title bar is still on a screen (monitors come and go).
+    const RECT& saved = settings_.window;
+    bool restored = false;
+    if (saved.right - saved.left >= 200 && saved.bottom - saved.top >= 150) {
+        RECT bar{saved.left, saved.top, saved.right, saved.top + 32}, vis;
+        MONITORINFO sm{sizeof(sm)};
+        HMONITOR m = MonitorFromRect(&bar, MONITOR_DEFAULTTONULL);
+        if (m && GetMonitorInfoW(m, &sm) && IntersectRect(&vis, &bar, &sm.rcWork) && vis.right - vis.left >= 100) {
+            x = saved.left;
+            y = std::max(saved.top, sm.rcWork.top);
+            w = std::min(saved.right - saved.left, sm.rcWork.right - sm.rcWork.left);
+            h = std::min(saved.bottom - saved.top, sm.rcWork.bottom - sm.rcWork.top);
+            restored = true;
+        }
+    }
 
     hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"OzMaker", WS_OVERLAPPEDWINDOW, x, y, w, h, nullptr, nullptr, inst_,
                             this);
@@ -142,6 +159,8 @@ bool App::CreateMainWindow(int show) {
     RegisterRecordHotkey();
     RefreshWindows();
     SetTimer(hwnd_, kTimerRefresh, 2500, nullptr);
+    if (restored && settings_.windowMax && show != SW_HIDE && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE)
+        show = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd_, show);
     return true;
 }
@@ -257,6 +276,18 @@ void App::ShowMain(bool activate) {
 void App::HideMain() {
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
     SyncAudioPreview();
+}
+
+void App::RememberPlacement() {
+    WINDOWPLACEMENT wp{sizeof(wp)};
+    if (!hwnd_ || !GetWindowPlacement(hwnd_, &wp)) return;
+    // rcNormalPosition is in workspace coordinates: relative to the primary monitor's work area.
+    MONITORINFO pm{sizeof(pm)};
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &pm);
+    RECT r = wp.rcNormalPosition;
+    OffsetRect(&r, pm.rcWork.left, pm.rcWork.top);
+    settings_.window = r;
+    settings_.windowMax = IsZoomed(hwnd_) || (IsIconic(hwnd_) && (wp.flags & WPF_RESTORETOMAXIMIZED));
 }
 
 void App::Toast(std::wstring text, bool error) {
@@ -492,8 +523,23 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             }
             DestroyWindow(hwnd_);
             return 0;
+        case WM_QUERYENDSESSION:
+            return TRUE;
+        case WM_ENDSESSION:
+            // Logoff or shutdown ends the process without WM_DESTROY: finish the MP4 being recorded now.
+            if (w && rec_ == RecState::Recording) {
+                KillTimer(hwnd_, kTimerRec);
+                capture_.Stop();
+                rec_ = RecState::Idle;
+            }
+            if (w) {
+                RememberPlacement();
+                settings_.Save();
+            }
+            return 0;
         case WM_DESTROY:
             if (rec_ == RecState::Recording) capture_.Stop();
+            RememberPlacement();
             overlay_.Hide();
             exporter_.Cancel();
             StopThumbnails();
@@ -1158,13 +1204,9 @@ double App::EffectiveOutFps() const {
             if (avg <= r * 1.03) return r;
         return 120.0;
     }
+    // Output frames per second (after the speed change), capped at what the format plays back reliably.
     double maxF = FormatMaxFps((Format)fmt_);
-    if (limit == 0 || limit > maxF) {
-        // Only cap when the recording actually exceeds what the format can play.
-        if (clip_ && clip_->AverageFps() * kSpeedOptions[settings_.speedIdx] > maxF + 0.5) return maxF;
-        return limit;
-    }
-    return limit;
+    return limit == 0 || limit > maxF ? maxF : limit;
 }
 
 // MP4 keeps the video's sound unless the speed changes (no time-stretching).

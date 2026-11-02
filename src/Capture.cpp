@@ -530,13 +530,15 @@ CaptureResult Capture::Stop() {
         res.path = opt_.video->path;
         res.notice = notice_;
         res.seconds = (stopQpc - startQpc_) / 1e7;
-        std::wstring err = videoError_;
-        if (err.empty()) {
-            res.ok = writer_->Finish(err);
-        } else {
-            writer_->Abort();
+        // An error mid-recording keeps what was encoded before it.
+        std::wstring finishErr;
+        res.ok = writer_->Finish(finishErr);
+        if (res.ok && !videoError_.empty()) {
+            res.seconds = (double)writer_->VideoFrames() / std::max(1, opt_.fps);
+            std::wstring kept = videoError_ + L" 오류 전까지(" + util::FormatClock(res.seconds, false) + L") 저장했습니다.";
+            res.notice = res.notice.empty() ? kept : kept + L" " + res.notice;
         }
-        res.error = err;
+        res.error = res.ok ? std::wstring() : !videoError_.empty() ? videoError_ : finishErr;
         res.encoder = writer_->EncoderName();
         res.hardware = writer_->HardwareEncoder();
         res.audio = res.ok && writer_->HasAudio();

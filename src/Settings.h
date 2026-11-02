@@ -38,6 +38,8 @@ struct Settings {
     bool sounds = true;
     bool closeToTray = true;
     bool trayHintShown = false;
+    RECT window{};  // main window's restored position (workspace pixels); empty = centre on the primary monitor
+    bool windowMax = false;
     UINT hkMods = MOD_CONTROL | MOD_ALT;
     UINT hkVk = 'R';
     std::wstring outDir;

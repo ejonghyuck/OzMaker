@@ -47,6 +47,7 @@ private:
     float Scale() const { return dpi_ / 96.f; }
     void ShowMain(bool activate);
     void HideMain();
+    void RememberPlacement();  // into settings_, for the next start
     void Toast(std::wstring text, bool error = false);
     void ApplyThumbnail();
 

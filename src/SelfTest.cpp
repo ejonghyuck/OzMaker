@@ -26,6 +26,42 @@ bool HasVideoProcessor() {
     return SUCCEEDED(dev.As(&vd));
 }
 
+// Sum of a GIF's frame delays in 1/100 s, read from its graphic control extensions; -1 if unreadable.
+int GifDurationCs(const std::wstring& path) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    if (d.size() < 13) return -1;
+    size_t p = 13;
+    if (d[10] & 0x80) p += 3u << ((d[10] & 7) + 1);
+    auto skipSubBlocks = [&] {
+        while (p < d.size() && d[p]) p += d[p] + 1;
+        ++p;
+    };
+    int total = 0;
+    while (p < d.size()) {
+        uint8_t b = d[p++];
+        if (b == 0x3B) return total;
+        if (b == 0x21 && p < d.size()) {
+            uint8_t label = d[p++];
+            if (label == 0xF9 && p + 4 < d.size()) total += d[p + 2] | (d[p + 3] << 8);
+            skipSubBlocks();
+        } else if (b == 0x2C && p + 9 <= d.size()) {
+            uint8_t flags = d[p + 8];
+            p += 9;
+            if (flags & 0x80) p += 3u << ((flags & 7) + 1);
+            ++p;  // LZW minimum code size
+            skipSubBlocks();
+        } else {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 class Log {
 public:
     explicit Log(const std::wstring& path) { f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO); }
@@ -144,6 +180,13 @@ int App::RunSelfTest(const std::wstring& dir) {
     auto plan15 = PlanFrames(*clip, 0, N - 1, 15, 1.0);
     log(util::Format(L"plan 15fps: %zu frames", plan15.size()));
     if (plan15.size() < 44 || plan15.size() > 46) ++failures;
+    // The limit counts output frames: 30 fps at 2× would play at 60 fps, so a 50 fps cap keeps 50 a second
+    // of the 1.5 s result and the duration stays half the source.
+    auto plan2x = PlanFrames(*clip, 0, N - 1, 50, 2.0);
+    double total2x = 0;
+    for (auto& p : plan2x) total2x += p.durationMs;
+    log(util::Format(L"plan 2x capped at 50fps: %zu frames, %.1f ms", plan2x.size(), total2x));
+    if (plan2x.size() < 73 || plan2x.size() > 77 || std::fabs(total2x - N * 500 / fps) > 1) ++failures;
 
     Exporter ex;
     for (int f = 0; f < (int)Format::Count; ++f) {
@@ -189,9 +232,31 @@ int App::RunSelfTest(const std::wstring& dir) {
         job.quality = 70;
         job.path = dir + L"\\selftest_small.gif";
         ExportResult r = ExportSync(ex, job);
-        log(util::Format(L"GIF small: %s %s, %d frames, %.2fs %s", r.ok ? L"ok" : L"FAIL",
-                         util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds, r.error.c_str()));
-        if (!r.ok) ++failures;
+        int cs = GifDurationCs(job.path);
+        log(util::Format(L"GIF small: %s %s, %d frames, %.2fs (file plays %.2fs) %s", r.ok ? L"ok" : L"FAIL",
+                         util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds, cs / 100.0, r.error.c_str()));
+        // 61 source frames (2.03 s) at 2× and 15 output fps: about 15 frames over 1.02 s.
+        if (!r.ok || r.frames < 14 || r.frames > 17 || std::fabs(cs / 100.0 - 61 / fps / 2) > 0.03) ++failures;
+    }
+    // 2× with no limit: the 50 fps cap of GIF delays must not stretch the result back to 1×.
+    {
+        ExportJob job;
+        job.clip = clip;
+        job.first = 0;
+        job.last = N - 1;
+        job.crop = {0, 0, W, H};
+        job.outW = W / 2;
+        job.outH = H / 2;
+        job.fpsLimit = FormatMaxFps(Format::Gif);
+        job.speed = 2.0;
+        job.format = Format::Gif;
+        job.quality = 70;
+        job.path = dir + L"\\selftest_2x.gif";
+        ExportResult r = ExportSync(ex, job);
+        int cs = GifDurationCs(job.path);
+        log(util::Format(L"GIF 2x: %s %d frames, file plays %.2fs %s", r.ok ? L"ok" : L"FAIL", r.frames, cs / 100.0,
+                         r.error.c_str()));
+        if (!r.ok || std::fabs(cs / 100.0 - N / fps / 2) > 0.03) ++failures;
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;

@@ -23,8 +23,19 @@ LONG ReadSigned(const std::wstring& ini, const wchar_t* key) {
     return std::clamp<long>(wcstol(buf, nullptr, 10), -100000, 100000);
 }
 
-void WriteInt(const std::wstring& ini, const wchar_t* key, int v) {
-    WritePrivateProfileStringW(L"OzMaker", key, std::to_wstring(v).c_str(), ini.c_str());
+// The whole file in one go, as UTF-16 with a BOM (WritePrivateProfileString would create an ANSI file, turning
+// characters outside the code page in paths into '?'), through a temporary file so a crash never leaves half of it.
+void WriteIni(const std::wstring& ini, const std::wstring& text) {
+    std::wstring tmp = ini + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    const wchar_t bom = 0xFEFF;
+    DWORD n = 0;
+    bool ok = WriteFile(h, &bom, sizeof(bom), &n, nullptr) &&
+              WriteFile(h, text.data(), (DWORD)(text.size() * sizeof(wchar_t)), &n, nullptr);
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(tmp.c_str(), ini.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileW(tmp.c_str());
 }
 }  // namespace
 
@@ -57,6 +68,11 @@ void Settings::Load() {
     sounds = ReadInt(ini, L"Sounds", sounds, 0, 1) != 0;
     closeToTray = ReadInt(ini, L"CloseToTray", closeToTray, 0, 1) != 0;
     trayHintShown = ReadInt(ini, L"TrayHintShown", trayHintShown, 0, 1) != 0;
+    window.left = ReadSigned(ini, L"WindowL");
+    window.top = ReadSigned(ini, L"WindowT");
+    window.right = ReadSigned(ini, L"WindowR");
+    window.bottom = ReadSigned(ini, L"WindowB");
+    windowMax = ReadInt(ini, L"WindowMax", windowMax, 0, 1) != 0;
     hkMods = (UINT)ReadInt(ini, L"HotkeyMods", (int)hkMods, 0, 0xF);
     hkVk = (UINT)ReadInt(ini, L"HotkeyKey", (int)hkVk, 1, 0xFE);
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
@@ -76,42 +92,55 @@ void Settings::Load() {
 }
 
 void Settings::Save() const {
-    std::wstring ini = IniPath();
-    WriteInt(ini, L"Source", source);
-    WriteInt(ini, L"Output", output);
-    WriteInt(ini, L"RegionL", region.left);
-    WriteInt(ini, L"RegionT", region.top);
-    WriteInt(ini, L"RegionR", region.right);
-    WriteInt(ini, L"RegionB", region.bottom);
-    WritePrivateProfileStringW(L"OzMaker", L"Monitor", monitor.c_str(), ini.c_str());
-    WriteInt(ini, L"VideoCodec", vCodec);
-    WriteInt(ini, L"VideoHardware", vHardware);
-    WriteInt(ini, L"VideoFps", vFpsIdx);
-    WriteInt(ini, L"VideoRes", vResIdx);
-    WriteInt(ini, L"VideoBitrate", vBitrateIdx);
-    WriteInt(ini, L"VideoRateControl", vRateCtrl);
-    WriteInt(ini, L"VideoKeyframe", vKeyIdx);
-    WriteInt(ini, L"VideoPreset", vPresetIdx);
-    WriteInt(ini, L"Audio", audio);
-    WriteInt(ini, L"AudioBitrate", aBitrateIdx);
-    WriteInt(ini, L"AudioRate", aRateIdx);
-    WriteInt(ini, L"Fps", fpsIdx);
-    WriteInt(ini, L"Size", sizeIdx);
-    WriteInt(ini, L"Cursor", cursor);
-    WriteInt(ini, L"ClientOnly", clientOnly);
-    WriteInt(ini, L"CaptureMode", captureMode);
-    WriteInt(ini, L"Countdown", countdown);
-    WriteInt(ini, L"Overlay", overlayMode);
-    WriteInt(ini, L"Sounds", sounds);
-    WriteInt(ini, L"CloseToTray", closeToTray);
-    WriteInt(ini, L"TrayHintShown", trayHintShown);
-    WriteInt(ini, L"HotkeyMods", (int)hkMods);
-    WriteInt(ini, L"HotkeyKey", (int)hkVk);
-    WriteInt(ini, L"Format", format);
-    for (int i = 0; i < (int)_countof(quality); ++i) WriteInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i]);
-    WriteInt(ini, L"Scale", scaleIdx);
-    WriteInt(ini, L"OutFps", outFpsIdx);
-    WriteInt(ini, L"Speed", speedIdx);
-    WriteInt(ini, L"Loop", loop);
-    WritePrivateProfileStringW(L"OzMaker", L"OutDir", outDir.c_str(), ini.c_str());
+    std::wstring s = L"[OzMaker]\r\n";
+    auto put = [&](const wchar_t* key, const std::wstring& v) {
+        s += key;
+        s += L'=';
+        s += v;
+        s += L"\r\n";
+    };
+    auto num = [&](const wchar_t* key, long v) { put(key, std::to_wstring(v)); };
+    num(L"Source", source);
+    num(L"Output", output);
+    num(L"RegionL", region.left);
+    num(L"RegionT", region.top);
+    num(L"RegionR", region.right);
+    num(L"RegionB", region.bottom);
+    put(L"Monitor", monitor);
+    num(L"VideoCodec", vCodec);
+    num(L"VideoHardware", vHardware);
+    num(L"VideoFps", vFpsIdx);
+    num(L"VideoRes", vResIdx);
+    num(L"VideoBitrate", vBitrateIdx);
+    num(L"VideoRateControl", vRateCtrl);
+    num(L"VideoKeyframe", vKeyIdx);
+    num(L"VideoPreset", vPresetIdx);
+    num(L"Audio", audio);
+    num(L"AudioBitrate", aBitrateIdx);
+    num(L"AudioRate", aRateIdx);
+    num(L"Fps", fpsIdx);
+    num(L"Size", sizeIdx);
+    num(L"Cursor", cursor);
+    num(L"ClientOnly", clientOnly);
+    num(L"CaptureMode", captureMode);
+    num(L"Countdown", countdown);
+    num(L"Overlay", overlayMode);
+    num(L"Sounds", sounds);
+    num(L"CloseToTray", closeToTray);
+    num(L"TrayHintShown", trayHintShown);
+    num(L"WindowL", window.left);
+    num(L"WindowT", window.top);
+    num(L"WindowR", window.right);
+    num(L"WindowB", window.bottom);
+    num(L"WindowMax", windowMax);
+    num(L"HotkeyMods", (long)hkMods);
+    num(L"HotkeyKey", (long)hkVk);
+    num(L"Format", format);
+    for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
+    num(L"Scale", scaleIdx);
+    num(L"OutFps", outFpsIdx);
+    num(L"Speed", speedIdx);
+    num(L"Loop", loop);
+    put(L"OutDir", outDir);
+    WriteIni(IniPath(), s);
 }

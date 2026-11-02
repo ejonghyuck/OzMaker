@@ -8,7 +8,7 @@ struct ExportJob {
     size_t first = 0, last = 0;  // inclusive frame range
     RECT crop{};                 // in clip pixels
     int outW = 0, outH = 0;
-    double fpsLimit = 0;         // 0 = keep recorded rate; MP4: the constant output rate
+    double fpsLimit = 0;         // most frames per second of output (after speed); 0 = all; MP4: the constant rate
     double speed = 1.0;
     Format format = Format::Gif;
     int quality = 80;
