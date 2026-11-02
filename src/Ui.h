@@ -20,6 +20,8 @@ struct Rect {
     Rect Inset(float d) const { return {l + d, t + d, r - d, b - d}; }
     Rect Inset(float dx, float dy) const { return {l + dx, t + dy, r - dx, b - dy}; }
     Rect Offset(float dx, float dy) const { return {l + dx, t + dy, r + dx, b + dy}; }
+    Rect Intersect(const Rect& o) const { return {std::max(l, o.l), std::max(t, o.t), std::min(r, o.r), std::min(b, o.b)}; }
+    Rect Union(const Rect& o) const { return {std::min(l, o.l), std::min(t, o.t), std::max(r, o.r), std::max(b, o.b)}; }
 
     // RectCut-style layout: slice a strip off one side and shrink this rect.
     Rect CutTop(float h) { Rect o{l, t, r, std::min(b, t + h)}; t = o.b; return o; }
@@ -73,6 +75,9 @@ public:
     void Logo(const Rect& r);
     // Crosshair glyph drawn with lines (MDL2 has no good "pick window" icon).
     void Crosshair(float cx, float cy, float size, D2D1_COLOR_F c);
+    // Bounds of everything drawn, as it is drawn (Ui checks layering with them). Drawing done on the render target
+    // directly (bitmaps) reports itself here.
+    virtual void Painted(const Rect&) {}
 
 private:
     ID2D1RenderTarget* rt_ = nullptr;
@@ -156,6 +161,19 @@ public:
     void Tooltip(UiId id, const Rect& r, std::wstring_view text);
     void ProgressBar(const Rect& r, float t, D2D1_COLOR_F c);
 
+    // Layers. The page is drawn first; anything drawn over it (popovers, toasts, tooltips) goes between BeginFloat
+    // and EndFloat, and the bounds of what each float draws are kept for the frame. A native layer is something DWM
+    // composites above everything drawn in the window (the live window preview): its owner cuts it out under every
+    // float, and anything else drawn over it, which it would hide, is counted as a layering error. Declare a native
+    // layer once what lies under it has been drawn.
+    void BeginFloat();
+    void EndFloat();
+    void NativeLayer(const Rect& r) { natives_.push_back(r); }
+    const std::vector<Rect>& Floats() const { return floats_; }
+    int LayerErrors() const { return layerErrors_; }
+    const Rect& FirstLayerError() const { return layerError_; }
+    void Painted(const Rect& r) override;
+
 private:
     UiInput in_;
     double now_ = 0, last_ = 0;
@@ -173,4 +191,7 @@ private:
     std::wstring tipText_;
     Rect tipAnchor_;
     bool tipShow_ = false;
+    std::vector<Rect> floats_, natives_;
+    Rect floatBounds_, layerError_;
+    int floatDepth_ = 0, layerErrors_ = 0;
 };

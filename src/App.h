@@ -52,7 +52,12 @@ private:
     void HideMain();
     void RememberPlacement();  // into settings_, for the next start
     void Toast(std::wstring text, bool error = false);
+    // The live window preview (DWM thumbnails, which DWM draws above everything in this window).
     void ApplyThumbnail();
+    bool AddThumbnail();
+    void ReleaseThumbnails();
+    void PreviewLayout(RECT& dest, RECT& source);  // where it goes (client pixels), what of the window it shows
+    std::vector<RECT> PreviewParts(const RECT& dest);  // dest less whatever floats above it this frame
 
     // ---- views (AppViews.cpp)
     void DrawFrame(Rect client);
@@ -166,6 +171,8 @@ private:
     int RunVideoTest(const std::wstring& dir, int w, int h);
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
+    int RunPreviewTest(const std::wstring& dir);
+    void DrawPreviewStandIn(ID2D1DeviceContext* dc);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
 
     // ---- state
@@ -191,8 +198,11 @@ private:
     RECT snapRect_{};
     std::unordered_map<HWND, ComPtr<ID2D1Bitmap1>> icons_;
     uint32_t iconGen_ = 0;
-    HTHUMBNAIL thumb_ = nullptr;
+    // One thumbnail of target_; while something floats over the preview, several, each showing the part of the
+    // window around it (source rects set: thumbSplit_).
+    std::vector<HTHUMBNAIL> thumb_;
     HWND thumbSrc_ = nullptr;
+    bool thumbSplit_ = false;
     bool thumbWanted_ = false;
     Rect thumbArea_;
 

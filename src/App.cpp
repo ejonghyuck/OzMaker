@@ -90,6 +90,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--analyze") return RunAnalyzeTest(cmdLine);
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
                             args.size() >= 4 ? _wtoi(args[3].c_str()) : 360);
@@ -235,44 +236,108 @@ void App::Render() {
         SetCursor(LoadCursorW(nullptr, ui_.Cursor()));
 }
 
+// DWM draws thumbnails above everything drawn in this window, so nothing of ours can go over the preview. Instead
+// the preview is cut around whatever floats above the page this frame (popovers, toasts, tooltips: Ui floats), as
+// a thumbnail per part of the window left showing.
 void App::ApplyThumbnail() {
     bool want = thumbWanted_ && target_ && IsWindow(target_) && screen_ == Screen::Home && IsWindowVisible(hwnd_);
-    if (!want) {
-        if (thumb_) DwmUnregisterThumbnail(thumb_);
-        thumb_ = nullptr;
-        thumbSrc_ = nullptr;
-        return;
+    if (!want || thumbSrc_ != target_) ReleaseThumbnails();
+    if (!want || (thumb_.empty() && !AddThumbnail())) return;
+    // DWM reports the size of what a thumbnail shows (just the client area with 제목 표시줄 제외): that goes first.
+    DWM_THUMBNAIL_PROPERTIES area{};
+    area.dwFlags = DWM_TNP_SOURCECLIENTAREAONLY;
+    area.fSourceClientAreaOnly = settings_.clientOnly;
+    DwmUpdateThumbnailProperties(thumb_[0], &area);
+    RECT dest, src;
+    PreviewLayout(dest, src);
+    std::vector<RECT> parts = PreviewParts(dest);
+    const bool split = !(parts.size() == 1 && EqualRect(&parts[0], &dest));
+    if (!split && thumbSplit_) {  // a thumbnail given a source rect can't be told to show the whole window again
+        ReleaseThumbnails();
+        if (!AddThumbnail()) return;
     }
-    if (thumb_ && thumbSrc_ != target_) {
-        DwmUnregisterThumbnail(thumb_);
-        thumb_ = nullptr;
+    while (thumb_.size() < parts.size() && AddThumbnail()) {
     }
-    if (!thumb_) {
-        if (FAILED(DwmRegisterThumbnail(hwnd_, target_, &thumb_))) {
-            thumb_ = nullptr;
-            return;
+    const LONG dw = std::max(1L, dest.right - dest.left), dh = std::max(1L, dest.bottom - dest.top);
+    auto sx = [&](LONG x) { return src.left + (LONG)std::lround((double)(x - dest.left) * (src.right - src.left) / dw); };
+    auto sy = [&](LONG y) { return src.top + (LONG)std::lround((double)(y - dest.top) * (src.bottom - src.top) / dh); };
+    for (size_t i = 0; i < thumb_.size(); ++i) {
+        DWM_THUMBNAIL_PROPERTIES p{};
+        p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+        p.fVisible = i < parts.size();
+        p.opacity = 255;
+        p.fSourceClientAreaOnly = settings_.clientOnly;
+        if (p.fVisible) {
+            const RECT& d = parts[i];
+            p.rcDestination = d;
+            if (split) {
+                p.dwFlags |= DWM_TNP_RECTSOURCE;
+                p.rcSource = {sx(d.left), sy(d.top), sx(d.right), sy(d.bottom)};
+                thumbSplit_ = true;
+            }
         }
-        thumbSrc_ = target_;
+        DwmUpdateThumbnailProperties(thumb_[i], &p);
     }
-    SIZE src{};
-    if (settings_.clientOnly) {
-        WINDOWINFO wi{sizeof(wi)};
-        if (GetWindowInfo(target_, &wi)) src = {wi.rcClient.right - wi.rcClient.left, wi.rcClient.bottom - wi.rcClient.top};
+}
+
+bool App::AddThumbnail() {
+    HTHUMBNAIL t = nullptr;
+    if (FAILED(DwmRegisterThumbnail(hwnd_, target_, &t))) return false;
+    thumb_.push_back(t);
+    thumbSrc_ = target_;
+    return true;
+}
+
+void App::ReleaseThumbnails() {
+    for (HTHUMBNAIL t : thumb_) DwmUnregisterThumbnail(t);
+    thumb_.clear();
+    thumbSrc_ = nullptr;
+    thumbSplit_ = false;
+}
+
+void App::PreviewLayout(RECT& dest, RECT& source) {
+    // Laid out by its size on screen. Source rects are in DWM's units: the size it reports for what the thumbnail
+    // shows (smaller than on screen for a window Windows scales up, not being DPI aware), from the client area's
+    // corner, or for the whole window from its corner including the invisible resize borders, which that size
+    // leaves out. Without a thumbnail (screenshots), the size on screen.
+    SIZE shown{}, dwm{};
+    WINDOWINFO wi{sizeof(wi)};
+    if (settings_.clientOnly && GetWindowInfo(target_, &wi))
+        shown = {wi.rcClient.right - wi.rcClient.left, wi.rcClient.bottom - wi.rcClient.top};
+    if (!thumb_.empty()) DwmQueryThumbnailSourceSize(thumb_[0], &dwm);
+    if (shown.cx <= 0 || shown.cy <= 0) shown = dwm;
+    if (shown.cx <= 0 || shown.cy <= 0) {
+        RECT wr{};
+        GetWindowRect(target_, &wr);
+        shown = {wr.right - wr.left, wr.bottom - wr.top};
     }
-    if (src.cx <= 0 || src.cy <= 0) DwmQueryThumbnailSourceSize(thumb_, &src);
-    if (src.cx <= 0 || src.cy <= 0) src = {16, 9};
+    if (shown.cx <= 0 || shown.cy <= 0) shown = {16, 9};
+    if (dwm.cx <= 0 || dwm.cy <= 0) dwm = shown;
+    source = {0, 0, dwm.cx, dwm.cy};
+    RECT wr, frame;
+    if (!settings_.clientOnly && GetWindowRect(target_, &wr) &&
+        SUCCEEDED(DwmGetWindowAttribute(target_, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+        frame.right > frame.left) {
+        double k = (double)dwm.cx / (frame.right - frame.left);
+        OffsetRect(&source, (int)std::lround((frame.left - wr.left) * k), (int)std::lround((frame.top - wr.top) * k));
+    }
     float s = Scale();
     float aw = thumbArea_.W() * s, ah = thumbArea_.H() * s;
-    float f = std::min({aw / src.cx, ah / src.cy, 1.f});
-    int dw = (int)(src.cx * f), dh = (int)(src.cy * f);
+    float f = std::min({aw / shown.cx, ah / shown.cy, 1.f});
+    int dw = (int)(shown.cx * f), dh = (int)(shown.cy * f);
     int x = (int)(thumbArea_.l * s + (aw - dw) / 2), y = (int)(thumbArea_.t * s + (ah - dh) / 2);
-    DWM_THUMBNAIL_PROPERTIES p{};
-    p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-    p.rcDestination = {x, y, x + dw, y + dh};
-    p.fVisible = TRUE;
-    p.opacity = 255;
-    p.fSourceClientAreaOnly = settings_.clientOnly;
-    DwmUpdateThumbnailProperties(thumb_, &p);
+    dest = {x, y, x + dw, y + dh};
+}
+
+std::vector<RECT> App::PreviewParts(const RECT& dest) {
+    float s = Scale();
+    std::vector<RECT> holes;
+    for (const Rect& f : ui_.Floats())
+        holes.push_back({(LONG)std::floor(f.l * s), (LONG)std::floor(f.t * s), (LONG)std::ceil(f.r * s),
+                         (LONG)std::ceil(f.b * s)});
+    auto parts = util::SubtractRects(dest, holes);
+    if (parts.size() > 16) parts.clear();  // nothing floats over it that busily; just don't show it meanwhile
+    return parts;
 }
 
 void App::ShowMain(bool activate) {
@@ -593,8 +658,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             StopThumbnails();
             audioPreview_.Stop();
             fetcher_.Stop();
-            if (thumb_) DwmUnregisterThumbnail(thumb_);
-            thumb_ = nullptr;
+            ReleaseThumbnails();
             UnregisterHotKey(hwnd_, 1);
             TrayRemove();
             settings_.Save();

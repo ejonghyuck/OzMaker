@@ -217,6 +217,28 @@ bool SetAutostart(bool on) {
                            (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
 
+std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& holes) {
+    std::vector<RECT> parts{whole}, next;
+    if (IsRectEmpty(&whole)) parts.clear();
+    for (const RECT& h : holes) {
+        next.clear();
+        for (const RECT& p : parts) {
+            RECT o;
+            if (!IntersectRect(&o, &p, &h)) {
+                next.push_back(p);
+                continue;
+            }
+            // The bands above and below the hole, then what is beside it between them.
+            if (p.top < o.top) next.push_back({p.left, p.top, p.right, o.top});
+            if (o.bottom < p.bottom) next.push_back({p.left, o.bottom, p.right, p.bottom});
+            if (p.left < o.left) next.push_back({p.left, o.top, o.left, o.bottom});
+            if (o.right < p.right) next.push_back({o.right, o.top, p.right, o.bottom});
+        }
+        parts.swap(next);
+    }
+    return parts;
+}
+
 std::wstring FormatAgo(double s) {
     if (s < 60) return L"방금";
     if (s < 3600) return Format(L"%d분 전", (int)(s / 60));

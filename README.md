@@ -118,11 +118,13 @@ Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. �
 
 ```bash
 OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + 모든 인코더 검사
-OzMaker.exe --screenshot <dir>        # 각 화면을 PNG로 렌더링
+OzMaker.exe --screenshot <dir>        # 각 화면을 PNG로 렌더링(창 미리보기 자리는 파란색), 레이어 오류가 있으면 실패
 OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute]
 OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간격·테스트 톤 크기 측정
 OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계) 검사
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장
+OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드)
+OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```
 

@@ -51,11 +51,17 @@ void App::DrawFrame(Rect client) {
         case Screen::Editor: DrawEditor(r); break;
         case Screen::Settings: DrawSettings(r); break;
     }
+    // Floating surfaces last, each in a float: that is what keeps them above the page and the live window preview
+    // (a DWM thumbnail, which DWM draws above everything here) out from under them. See Ui::BeginFloat.
     if (popover) {
         ui_.SetInputBlocked(false);
+        ui_.BeginFloat();
         DrawFilesPopover(client);
+        ui_.EndFloat();
     }
+    ui_.BeginFloat();
     DrawToast(client);
+    ui_.EndFloat();
 }
 
 void App::DrawHeader(Rect r) {
@@ -379,10 +385,12 @@ void App::DrawWindowList(Rect in) {
         if (sel) ui_.Stroke(item.Inset(0.75f), WithAlpha(Accent, 0.85f), 10, 1.5f);
 
         Rect ic = Rect::XYWH(item.l + 12, item.CY() - 16, 32, 32);
-        if (ID2D1Bitmap* bmp = IconFor(w))
+        if (ID2D1Bitmap* bmp = IconFor(w)) {
+            ui_.Painted(ic);
             dc->DrawBitmap(bmp, ic, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
-        else
+        } else {
             ui_.Icon(ic, icon::AppWindow, 20.f, TextDim);
+        }
 
         ui_.Text(Rect(item.l + 56, item.t + 8, item.r - 12, item.t + 30), w.title, 13.5f, TextColor, Bold());
         std::wstring sub = w.exeName.empty() ? L"" : w.exeName;
@@ -576,6 +584,7 @@ void App::DrawCapturePreview(Rect preview) {
                 float f = std::min({area.W() / rw, area.H() / rh, 1.f});
                 (void)sz;
                 Rect dst = Rect::Centered(area.CX(), area.CY(), rw * f, rh * f);
+                ui_.Painted(dst);
                 gfx_.DC()->DrawBitmap(snapBmp_.Get(), dst, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
                 ui_.Stroke(dst.Inset(-1.f), WithAlpha(Accent, 0.8f), 0, 1.5f);
             } else {
@@ -590,6 +599,7 @@ void App::DrawCapturePreview(Rect preview) {
                 if (info && info->minimized)
                     ui_.Text(view, L"최소화된 창입니다 · 녹화를 시작하면 복원됩니다", 13.f, TextFaint,
                              Align(AlignCenter));
+                ui_.NativeLayer(thumbArea_);  // from here on, only floats may be drawn over it
             } else {
                 placeholder(L"녹화할 창을 선택하세요", L"왼쪽 목록에서 고르거나 ‘화면에서 선택’을 누르세요.\n게임 중에는 " +
                                                          hk + L" 을 누르면 지금 보고 있는 창을 바로 녹화합니다.");
@@ -873,6 +883,7 @@ void App::DrawPreview(Rect r) {
         auto mode = px < 0.99f ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
                     : px > 1.99f ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                                  : D2D1_INTERPOLATION_MODE_LINEAR;
+        ui_.Painted(dst);
         gfx_.DC()->DrawBitmap(frameBmp_.Get(), dst, 1.f, mode, nullptr);
     }
 
@@ -1077,6 +1088,7 @@ void App::DrawTimeline(Rect r) {
             float s = std::max(d.W() / bw, d.H() / bh);
             float sw = d.W() / s, sh = d.H() / s;
             D2D1_RECT_F src{(bw - sw) / 2, (bh - sh) / 2, (bw + sw) / 2, (bh + sh) / 2};
+            ui_.Painted(d);
             gfx_.DC()->DrawBitmap(thumbs_[i].Get(), d, 0.9f, D2D1_INTERPOLATION_MODE_LINEAR, &src);
         }
     }
