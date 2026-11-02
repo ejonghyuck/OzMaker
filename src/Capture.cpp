@@ -108,10 +108,13 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             }
         }
 
-        // Clips keep at most `fps` frames; video samples at a fixed rate from frames arriving up to twice as often.
+        // Clips keep at most `fps` frames. Video takes frames up to twice as often (a copy each; only the newest is
+        // scaled, once per tick) and samples them at a fixed rate.
         interval_ = 10'000'000 / std::max(1, opt.fps) / (video ? 2 : 1);
         firstTs_ = -1;
         frames_ = 0;
+        scaled_ = 0;
+        finishDue_ = false;
         pausedAt_ = 0;
         pausedTotal_ = 0;
         running_ = true;
@@ -324,11 +327,13 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     const bool mask = !covered.empty() && ctx1_;
     DeviceLock lock(mt_.Get());
 
-    // Clip mode copies into the next staging texture (through out_ when it is scaled or masked); video mode keeps
-    // the latest frame in out_.
+    // Clip mode copies into the next staging texture (through out_ when it is scaled or masked). Video mode keeps
+    // the newest frame: in out_ when it is copied as is, else in mip_ until the ticker scales it (FinishFrame), so
+    // frames arriving faster than the frame rate aren't all scaled only for most of them to be skipped.
     ID3D11Texture2D* staging = video ? nullptr : staging_[ring_].Get();
     float fx = 1.f, fy = 1.f;  // source -> output pixels
     int dx = 0, dy = 0;
+    finish_.scaled = !same;
     if (same) {
         // Same size (an odd edge is trimmed by one pixel): plain copy, no resampling.
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)(sr.left + outW_), (UINT)(sr.top + outH_), 1};
@@ -366,17 +371,56 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         }
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)sr.right, (UINT)sr.bottom, 1};
         ctx_->CopySubresourceRegion(mip_.Get(), 0, 0, 0, 0, tex, 0, &box);
-        if (lod > 0) ctx_->GenerateMips(mipSrv_.Get());
+        finish_.dx = dx;
+        finish_.dy = dy;
+        finish_.dw = dw;
+        finish_.dh = dh;
+        finish_.lod = lod;
+    }
+    finish_.mask.clear();
+    if (mask) {
+        for (const RECT& c : covered) {
+            D3D11_RECT r{dx + (LONG)std::floor(c.left * fx), dy + (LONG)std::floor(c.top * fy),
+                         dx + (LONG)std::ceil(c.right * fx), dy + (LONG)std::ceil(c.bottom * fy)};
+            r.left = std::clamp<LONG>(r.left, 0, outW_);
+            r.right = std::clamp<LONG>(r.right, 0, outW_);
+            r.top = std::clamp<LONG>(r.top, 0, outH_);
+            r.bottom = std::clamp<LONG>(r.bottom, 0, outH_);
+            if (r.right > r.left && r.bottom > r.top) finish_.mask.push_back(r);
+        }
+    }
+    if (video && finish_.scaled) {
+        finishDue_ = true;  // the ticker scales it if it is still the newest at the next tick
+        SetEvent(firstFrame_);
+        return;
+    }
+    FinishFrame();
+    if (!video && (!same || mask)) ctx_->CopyResource(staging, out_.Get());
+    if (video) {
+        SetEvent(firstFrame_);
+        return;
+    }
+    pending_.push_back({ring_, ts});
+    ring_ = (ring_ + 1) % kRing;
+    // Read back with one frame of latency so Map() doesn't stall on the copy just issued.
+    while ((int)pending_.size() >= kRing - 1) DrainOne();
+}
 
+// Under the device lock: the frame Process took, scaled into out_ (when it needs it) and masked.
+void Capture::FinishFrame() {
+    finishDue_ = false;
+    const Finish& f = finish_;
+    if (f.scaled) {
+        if (f.lod > 0) ctx_->GenerateMips(mipSrv_.Get());
         struct {
             float fx, fy, lod, pad;
-        } params{1.f / dw, 1.f / dh, (float)lod, 0.f};
+        } params{1.f / f.dw, 1.f / f.dh, (float)f.lod, 0.f};
         ctx_->UpdateSubresource(cb_.Get(), 0, nullptr, &params, 0, 0);
-        if (dw != outW_ || dh != outH_) {
+        if (f.dw != outW_ || f.dh != outH_) {
             const float black[4] = {0, 0, 0, 1};
             ctx_->ClearRenderTargetView(outRtv_.Get(), black);
         }
-        D3D11_VIEWPORT vp{(float)dx, (float)dy, (float)dw, (float)dh, 0.f, 1.f};
+        D3D11_VIEWPORT vp{(float)f.dx, (float)f.dy, (float)f.dw, (float)f.dh, 0.f, 1.f};
         ctx_->OMSetRenderTargets(1, outRtv_.GetAddressOf(), nullptr);
         ctx_->RSSetViewports(1, &vp);
         ctx_->IASetInputLayout(nullptr);
@@ -390,31 +434,12 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         ID3D11ShaderResourceView* nullSrv = nullptr;
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+        ++scaled_;
     }
-    if (mask) {
-        std::vector<D3D11_RECT> rects;
-        rects.reserve(covered.size());
-        for (const RECT& c : covered) {
-            D3D11_RECT r{dx + (LONG)std::floor(c.left * fx), dy + (LONG)std::floor(c.top * fy),
-                         dx + (LONG)std::ceil(c.right * fx), dy + (LONG)std::ceil(c.bottom * fy)};
-            r.left = std::clamp<LONG>(r.left, 0, outW_);
-            r.right = std::clamp<LONG>(r.right, 0, outW_);
-            r.top = std::clamp<LONG>(r.top, 0, outH_);
-            r.bottom = std::clamp<LONG>(r.bottom, 0, outH_);
-            if (r.right > r.left && r.bottom > r.top) rects.push_back(r);
-        }
+    if (!f.mask.empty()) {
         const float black[4] = {0, 0, 0, 1};
-        if (!rects.empty()) ctx1_->ClearView(outRtv_.Get(), black, rects.data(), (UINT)rects.size());
+        ctx1_->ClearView(outRtv_.Get(), black, f.mask.data(), (UINT)f.mask.size());
     }
-    if (!video && (!same || mask)) ctx_->CopyResource(staging, out_.Get());
-    if (video) {
-        SetEvent(firstFrame_);
-        return;
-    }
-    pending_.push_back({ring_, ts});
-    ring_ = (ring_ + 1) % kRing;
-    // Read back with one frame of latency so Map() doesn't stall on the copy just issued.
-    while ((int)pending_.size() >= kRing - 1) DrainOne();
 }
 
 void Capture::DrainOne() {
@@ -487,6 +512,10 @@ void Capture::TickLoop() {
                 if (cur > k + 2) k = cur;
             }
             // Never under mtx_: the frame callback may own the device lock while it waits for mtx_.
+            {
+                DeviceLock lock(mt_.Get());
+                if (finishDue_) FinishFrame();
+            }
             ComPtr<IMFSample> sample = writer_->Convert(out_.Get());
             if (!sample) continue;  // encoder pool momentarily full: this tick is dropped
             int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;

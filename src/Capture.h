@@ -60,6 +60,7 @@ public:
     bool Paused() const { return pausedAt_ != 0; }
     double Elapsed() const;  // recorded time, pauses left out
     size_t Frames() const;
+    size_t Scaled() const { return scaled_; }  // frames scaled on the GPU so far (tests)
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
 
@@ -70,6 +71,7 @@ private:
     bool Setup(int srcW, int srcH);
     // covered: parts of sr (relative to it) to black out.
     void Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered);
+    void FinishFrame();
     void DrainOne();
     void TickLoop();
     void Fail(std::wstring msg);
@@ -106,6 +108,15 @@ private:
     struct Pending { int idx; int64_t ts; };
     std::deque<Pending> pending_;
     std::vector<RECT> covered_;
+    // What is left to do to the frame Process took: scale it from mip_ into out_, black out what covers it.
+    // Under the device lock. Video mode leaves it to the ticker (finishDue_), which needs one frame per tick.
+    struct Finish {
+        bool scaled = false;
+        int dx = 0, dy = 0, dw = 0, dh = 0, lod = 0;
+        std::vector<D3D11_RECT> mask;
+    } finish_;
+    bool finishDue_ = false;
+    std::atomic<size_t> scaled_{0};
 
     std::shared_ptr<FrameStore> store_;
     int outW_ = 0, outH_ = 0;

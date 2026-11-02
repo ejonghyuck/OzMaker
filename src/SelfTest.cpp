@@ -1092,7 +1092,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         }
     }
     if (pause) log(util::Format(L"recorded %.2fs of %.2fs", capture_.Elapsed(), seconds));
-    log(util::Format(L"stopping after %zu frames", capture_.Frames()));
+    log(util::Format(L"stopping after %zu frames (%zu scaled on the GPU)", capture_.Frames(), capture_.Scaled()));
     t0 = util::NowSeconds();
     CaptureResult res = capture_.Stop();
     log(util::Format(L"stop took %.0f ms", (util::NowSeconds() - t0) * 1000));
