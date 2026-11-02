@@ -685,7 +685,8 @@ int App::RunSelfTest(const std::wstring& dir) {
     }
     // OzMaker's own sounds stay out of a recording of everything that plays (the start cue was recorded), and the
     // mic check plays the mic back. A quiet made-up tone stands in for the mic: a loopback of OzMaker alone hears
-    // it, the recording's source (everything but OzMaker) doesn't. Only tone levels are kept, nothing else.
+    // it, the recording's source (everything but OzMaker) doesn't. Whatever else plays on this PC is in that
+    // source too, so its level at the tone's pitch before the tone is the yardstick. Only levels are kept.
     if (!AudioCapture::ProcessLoopbackSupported()) {
         log(L"own sound: skipped (needs Windows 10 2004 or later)");
     } else {
@@ -709,6 +710,12 @@ int App::RunSelfTest(const std::wstring& dir) {
         } else {
             const double f = 1733;
             const size_t total = 48000 * 6 / 10;  // 0.6 s, pushed in 10 ms blocks a little ahead of real time
+            Sleep(600);
+            size_t mark;  // frames of the recording's source before the tone
+            {
+                std::lock_guard lk(m);
+                mark = others.size() / 2;
+            }
             std::vector<int16_t> block(480 * 2);
             double phase = 0, t0 = util::NowSeconds();
             for (size_t pushed = 0; pushed < total; Sleep(2)) {
@@ -725,18 +732,20 @@ int App::RunSelfTest(const std::wstring& dir) {
             mon.Stop();
             a.Stop(0);
             b.Stop(0);
-            auto loudest = [&](const std::vector<int16_t>& v) {
+            auto loudest = [&](const std::vector<int16_t>& v, size_t from, size_t to) {  // frames
                 double best = 0;
-                for (size_t i = 0; (i + 19200) * 2 <= v.size(); i += 2400)
+                for (size_t i = from; i + 19200 <= to && (i + 19200) * 2 <= v.size(); i += 2400)
                     best = std::max(best, ToneLevel(v, i, 19200, f, 48000));
                 return best;
             };
-            double heard = loudest(self), recorded = loudest(others);
-            bool ok = heard > 0.005 && recorded < heard * 0.1;
+            double heard = loudest(self, 0, self.size() / 2), before = loudest(others, 0, mark),
+                   recorded = loudest(others, mark, others.size() / 2);
+            // Without the exclusion the recording would hear the tone as loudly as OzMaker's own loopback does.
+            bool ok = heard > 0.005 && recorded < heard * 0.5 && recorded < std::max(heard * 0.1, before * 2.5);
             if (!ok) ++failures;
             log(util::Format(L"own sound: %s the mic playback comes out of OzMaker (level %.4f) and stays out of the "
-                             L"recording's sound (%.4f)",
-                             ok ? L"ok  " : L"FAIL", heard, recorded));
+                             L"recording's sound (%.4f, %.4f before it from whatever else plays)",
+                             ok ? L"ok  " : L"FAIL", heard, recorded, before));
         }
     }
     // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
