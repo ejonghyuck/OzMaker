@@ -38,6 +38,8 @@
 
 창 소리만 따로 녹음하는 기능은 Windows 10 2004(빌드 19041) 이상에서 동작합니다. 그보다 낮은 버전에서는 창 녹화가 전체 소리로 바뀌지 않고 소리 없이 녹화됩니다.
 
+**마이크**(홈의 토글 · 설정 › 소리, 기본 끔)를 켜면 내 목소리를 위의 소리와 한 트랙으로 섞어 녹음합니다. 장치는 Windows 기본 장치(바꾸면 따라감) 또는 특정 장치를 고르고, 음량은 0–200%로 조절합니다. 마이크를 열지 못하면 마이크 없이 녹화하고 알려 줍니다.
+
 ### 동영상 편집 (구간 자르기)
 
 - **MP4로 저장**하면 고른 구간이 `<원본 이름>_trim.mp4`로 새로 저장됩니다. 프레임 단위로 정확하게 자르고(다시 인코딩), 코덱·비트레이트·하드웨어 인코딩은 설정 › 동영상을 따릅니다. 원본 파일은 건드리지 않습니다.
@@ -65,6 +67,7 @@
 | 키프레임 간격 | 2초 | 1 / 2 / 5초 |
 | 인코딩 품질 | 균형 | 빠르게 / 균형 / 고품질 |
 | 소리 | 켬, AAC 160 kbps, 48 kHz | 96 / 128 / 160 / 192 kbps, 44.1 / 48 kHz |
+| 마이크 | 끔, 기본 장치, 100% | 입력 장치 선택, 음량 0–200% |
 
 ## 동작 방식
 
@@ -74,7 +77,7 @@
 | 축소 | GPU에서 밉맵 + 4탭 박스 필터 |
 | 움짤 임시 저장 | 이전 프레임과 XOR 후 Windows 내장 XPRESS 압축, delete-on-close 임시 파일(키프레임 30장마다). 1프레임 지연 읽기로 GPU가 멈추지 않음 |
 | 동영상 | 화면이 바뀔 때만 오는 프레임을 1/fps마다 샘플링해 고정 프레임 레이트로 만들고, GPU 비디오 프로세서로 NV12(BT.709) 변환 → Media Foundation 싱크 라이터(H.264/HEVC 하드웨어 인코더 + AAC) → MP4. 영상이 GPU 메모리를 벗어나지 않음 |
-| 소리 | WASAPI 루프백(시스템) / 프로세스 루프백(`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`, 창). QPC 타임스탬프로 영상과 맞추고, 아무 소리도 없는 구간은 무음으로 채움 |
+| 소리 | WASAPI 루프백(시스템) / 프로세스 루프백(`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`, 창). QPC 타임스탬프로 영상과 맞추고, 아무 소리도 없는 구간은 무음으로 채움. 마이크는 같은 시간축의 WASAPI 캡처를 표본 단위로 더해 한 트랙으로 |
 | 동영상 편집 | MP4의 샘플 테이블(stts/ctts/stss)에서 프레임 시각과 키프레임을 바로 읽어 디코딩 없이 색인(5분 영상 7 ms). 미리보기는 별도 스레드에서 GPU 디코딩(소스 리더 + D3D11)하며 가장 최근에 요청한 프레임만, 가능하면 앞으로 이어서, 아니면 직전 키프레임부터 디코딩. 내보내기는 고정 프레임 레이트로 다시 인코딩하고 소리는 같은 구간을 잘라 AAC로 |
 | UI | Direct2D/DirectWrite로 직접 그린 즉시 모드 UI. 입력·애니메이션이 있을 때만 그려서 대기 중 CPU 0% |
 | GIF | 자체 인코더: 바뀐 픽셀만 다시 인코딩(투명 + 영역 크롭), 프레임마다 Wu 양자화 + k-means 보정 팔레트, 바뀐 영역에만 Floyd–Steinberg 디더링, 누적 반올림으로 정확한 재생 시간 |
@@ -122,7 +125,8 @@ Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. �
 ```bash
 OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + 모든 인코더 검사
 OzMaker.exe --screenshot <dir>        # 각 화면을 PNG로 렌더링(창 미리보기 자리는 파란색), 레이어 오류가 있으면 실패
-OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute]
+OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute] [pause] [mic]
+                                      # mic: 기본 마이크를 섞어 녹음(방 소리가 녹음되므로 직접 실행할 때만)
 OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간격·테스트 톤 크기 측정
 OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계) 검사
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장

@@ -1025,18 +1025,23 @@ void App::BeginCapture() {
             v.path = base + util::Format(L"_%d.mp4", i);
         o.fps = kVideoFpsOptions[settings_.vFpsIdx];
         v.video = VideoSettings(o.fps);
-        v.audio.enabled = settings_.audio;
+        v.sound = settings_.audio;
+        v.mic = settings_.mic;
+        v.micDevice = settings_.micDevice;
+        v.micGain = settings_.micVolume / 100.f;
         v.audio.sampleRate = kAudioRateOptions[settings_.aRateIdx];
         v.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
         // A window records only its own sound; screens and regions record what the speakers play.
         v.processAudio = window;
         if (window) {
             v.audioPid = AudioCapture::AudioProcessOf(recTarget_.hwnd);
-            if (v.audio.enabled && !AudioCapture::ProcessLoopbackSupported()) {
-                v.audio.enabled = false;
-                recNotice_ = L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.";
+            if (v.sound && !AudioCapture::ProcessLoopbackSupported()) {
+                v.sound = false;
+                recNotice_ = v.mic ? L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다."
+                                   : L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.";
             }
         }
+        v.audio.enabled = v.sound || v.mic;
         o.maxEdge = v.video.hevc ? 8192 : 4096;  // encoder limits
         if (int res = kVideoResOptions[settings_.vResIdx]) {
             o.boxShort = res;
@@ -1280,10 +1285,50 @@ std::wstring App::VideoSummary() const {
 }
 
 std::wstring App::AudioSummary(int source) const {
-    if (!settings_.audio) return L"소리 끔";
-    if (source == kSourceWindow)
-        return AudioCapture::ProcessLoopbackSupported() ? L"이 창의 소리만 녹음" : L"창 소리 녹음 불가 (Windows 10 2004 이상)";
-    return L"시스템 전체 소리 녹음";
+    std::wstring s;
+    if (settings_.audio)
+        s = source != kSourceWindow                         ? L"시스템 전체 소리 녹음"
+            : AudioCapture::ProcessLoopbackSupported() ? L"이 창의 소리만 녹음"
+                                                       : L"창 소리 녹음 불가 (Windows 10 2004 이상)";
+    if (settings_.mic) s = s.empty() ? L"마이크만 녹음" : s + L" + 마이크";
+    return s.empty() ? L"소리 끔" : s;
+}
+
+std::wstring App::MicDeviceName() const {
+    for (const auto& d : micDevices_)
+        if (settings_.micDevice.empty() ? d.isDefault : d.id == settings_.micDevice)
+            return settings_.micDevice.empty() ? L"기본 장치 · " + d.name : d.name;
+    return settings_.micDevice.empty() ? L"기본 장치" : L"연결되지 않은 장치";
+}
+
+// The input devices as a native menu under `anchor` (DIPs): Windows' default, then each by name.
+bool App::MicMenu(const Rect& anchor) {
+    if (!testWindowsOnly_) micDevices_ = AudioCapture::InputDevices();
+    auto escape = [](std::wstring s) {
+        for (size_t i = 0; (i = s.find(L'&', i)) != std::wstring::npos; i += 2) s.insert(i, 1, L'&');
+        return s;
+    };
+    HMENU menu = CreatePopupMenu();
+    std::wstring def = L"Windows 기본 장치";
+    for (const auto& d : micDevices_)
+        if (d.isDefault) def += L" (" + d.name + L")";
+    AppendMenuW(menu, MF_STRING | (settings_.micDevice.empty() ? MF_CHECKED : 0), 1, escape(def).c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    for (size_t i = 0; i < micDevices_.size(); ++i)
+        AppendMenuW(menu, MF_STRING | (micDevices_[i].id == settings_.micDevice ? MF_CHECKED : 0), 100 + (UINT)i,
+                    escape(micDevices_[i].name).c_str());
+    if (micDevices_.empty()) AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, L"연결된 마이크가 없습니다");
+    POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
+    ClientToScreen(hwnd_, &pt);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
+                              nullptr);
+    DestroyMenu(menu);
+    std::wstring pick = settings_.micDevice;
+    if (cmd == 1) pick.clear();
+    if (cmd >= 100 && cmd - 100 < micDevices_.size()) pick = micDevices_[cmd - 100].id;
+    if (pick == settings_.micDevice) return false;
+    settings_.micDevice = pick;
+    return true;
 }
 
 // ---------------------------------------------------------------- editor

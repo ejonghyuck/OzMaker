@@ -825,18 +825,29 @@ void App::DrawCapturePanel(Rect r) {
                                  {L"원본", L"1280", L"960", L"720", L"480"}, settings_.sizeIdx);
     }
 
-    // Toggles: cursor, (window) title bar, (video) sound.
-    Rect toggles = controls.CutTop(44);
-    int n = 1 + (src == kSourceWindow) + video;
-    float tw = (toggles.W() - 10 * (n - 1)) / n;
-    changed |= ui_.ToggleRow(HashId("home.cursor"), toggles.CutLeft(tw), L"마우스 커서", settings_.cursor);
-    if (src == kSourceWindow) {
-        toggles.CutLeft(10);
-        changed |= ui_.ToggleRow(HashId("home.client"), toggles.CutLeft(tw), L"제목 표시줄 제외", settings_.clientOnly);
-    }
+    // Toggles: cursor, (window) title bar, (video) sound and mic. Each as wide as its label needs, with the room
+    // left shared out evenly (or all narrowed alike when there is too little).
+    struct ToggleItem {
+        UiId id;
+        const wchar_t* label;
+        bool* v;
+    };
+    std::vector<ToggleItem> items{{HashId("home.cursor"), L"마우스 커서", &settings_.cursor}};
+    if (src == kSourceWindow) items.push_back({HashId("home.client"), L"제목 표시줄 제외", &settings_.clientOnly});
     if (video) {
-        toggles.CutLeft(10);
-        changed |= ui_.ToggleRow(HashId("home.audio"), toggles.CutLeft(tw), L"소리 녹음", settings_.audio);
+        items.push_back({HashId("home.audio"), L"소리 녹음", &settings_.audio});
+        items.push_back({HashId("home.mic"), L"마이크", &settings_.mic});
+    }
+    Rect toggles = controls.CutTop(44);
+    const float n = (float)items.size(), avail = toggles.W() - 10 * (n - 1);
+    float need = 0;
+    for (const auto& it : items) need += ui_.Measure(it.label, 13.f) + 64;  // ToggleRow: padding, label, switch
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) toggles.CutLeft(10);
+        float w = ui_.Measure(items[i].label, 13.f) + 64;
+        w = need <= avail ? w + (avail - need) / n : w * avail / need;
+        changed |= ui_.ToggleRow(items[i].id, i + 1 == items.size() ? toggles : toggles.CutLeft(w), items[i].label,
+                                 *items[i].v);
     }
     controls.CutTop(10);
 
@@ -1487,6 +1498,7 @@ void App::OpenSettings(int tab) {
     if (screen_ != Screen::Settings) settingsReturn_ = screen_;
     screen_ = Screen::Settings;
     SetCapturingHotkey(0);
+    micListed_ = false;
     if (tab >= 0 && tab != settings_.settingsTab) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
@@ -1738,6 +1750,46 @@ void App::SettingsAudio(Rect& area, bool& changed) {
                60, [&](Rect c) {
                    changed |= ui_.Toggle(HashId("set.audio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.audio);
                });
+
+    SettingRow(area, L"마이크 녹음", L"내 목소리를 동영상(MP4)에 함께 녹음합니다 · 위의 소리와 한 트랙으로 섞입니다", 60,
+               [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.mic"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.mic);
+               });
+    if (!micListed_) {
+        // Tests show a made-up device, not this PC's.
+        micDevices_ = testWindowsOnly_ ? std::vector<AudioCapture::Device>{{L"test", L"마이크(USB 테스트 장치)", true}}
+                                       : AudioCapture::InputDevices();
+        micListed_ = true;
+    }
+    bool micKnown = settings_.micDevice.empty();
+    for (const auto& d : micDevices_) micKnown |= d.id == settings_.micDevice;
+    std::wstring micDesc = micDevices_.empty() ? L"연결된 마이크가 없습니다"
+                           : !micKnown         ? L"고른 장치가 연결되어 있지 않습니다 · 연결하거나 다른 장치를 고르세요"
+                                               : L"기본 장치로 두면 Windows에서 기본 장치를 바꿀 때 함께 바뀝니다";
+    SettingRow(area, L"마이크 장치", micDesc, 300, [&](Rect c) {
+        UiId id = HashId("set.micDevice");
+        bool hov = ui_.Hover(c);
+        if (ui_.Click(id, c)) changed |= MicMenu(c);
+        ui_.Fill(c, hov ? Surface3 : Surface2, 8);
+        ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
+        Rect t(c.l + 12, c.t, c.r - 30, c.b);
+        ui_.PushClip(t);
+        ui_.Text(t, MicDeviceName(), 13.f, micKnown ? TextColor : Warning);
+        ui_.PopClip();
+        ui_.Icon(Rect(c.r - 30, c.t, c.r - 8, c.b), icon::ChevronDown, 10.f, TextDim);
+    });
+    SettingRow(area, L"마이크 음량", L"목소리가 작거나 크게 들리면 조절하세요 · 100%는 장치 그대로", 300, [&](Rect c) {
+        Rect label = c.CutRight(52);
+        float v = (float)settings_.micVolume;
+        if (ui_.Slider(HashId("set.micVol"), c.Inset(8, 0), v, 0.f, 200.f)) {
+            int nv = (int)std::lround(v / 5) * 5;  // in steps of 5 %
+            changed |= nv != settings_.micVolume;
+            settings_.micVolume = nv;
+        }
+        TextStyle st = Align(AlignEnd);
+        st.tabular = true;
+        ui_.Text(label, util::Format(L"%d%%", settings_.micVolume), 13.f, TextColor, st);
+    });
 
     SettingRow(area, L"오디오 비트레이트", L"AAC · 160 kbps면 게임 · 음악 모두 충분합니다", 260, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.abr"), c, {L"96", L"128", L"160", L"192"}, settings_.aBitrateIdx);

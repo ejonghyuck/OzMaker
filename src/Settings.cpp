@@ -58,6 +58,8 @@ void Settings::Load() {
     audio = ReadInt(ini, L"Audio", audio, 0, 1) != 0;
     aBitrateIdx = ReadInt(ini, L"AudioBitrate", aBitrateIdx, 0, _countof(kAudioBitrateOptions) - 1);
     aRateIdx = ReadInt(ini, L"AudioRate", aRateIdx, 0, _countof(kAudioRateOptions) - 1);
+    mic = ReadInt(ini, L"Mic", mic, 0, 1) != 0;
+    micVolume = ReadInt(ini, L"MicVolume", micVolume, 0, 200);
     fpsIdx = ReadInt(ini, L"Fps", fpsIdx, 0, _countof(kFpsOptions) - 1);
     sizeIdx = ReadInt(ini, L"Size", sizeIdx, 0, _countof(kSizeOptions) - 1);
     cursor = ReadInt(ini, L"Cursor", cursor, 0, 1) != 0;
@@ -97,6 +99,8 @@ void Settings::Load() {
     monitor = buf;
     GetPrivateProfileStringW(L"OzMaker", L"OutDir", L"", buf, _countof(buf), ini.c_str());
     outDir = buf;
+    GetPrivateProfileStringW(L"OzMaker", L"MicDevice", L"", buf, _countof(buf), ini.c_str());
+    micDevice = buf;
     recent.clear();
     for (size_t i = 0; i < kMaxRecent; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
@@ -134,6 +138,8 @@ void Settings::Save() const {
     num(L"Audio", audio);
     num(L"AudioBitrate", aBitrateIdx);
     num(L"AudioRate", aRateIdx);
+    num(L"Mic", mic);
+    num(L"MicVolume", micVolume);
     num(L"Fps", fpsIdx);
     num(L"Size", sizeIdx);
     num(L"Cursor", cursor);
@@ -165,6 +171,7 @@ void Settings::Save() const {
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);
+    put(L"MicDevice", micDevice);
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);

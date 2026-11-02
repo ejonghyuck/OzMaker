@@ -38,6 +38,9 @@ DWORD OsBuild() {
 
 constexpr REFERENCE_TIME kBufferDuration = 5'000'000;  // 500 ms of headroom if the thread is starved
 
+// PKEY_Device_FriendlyName ("Microphone (USB Audio)").
+constexpr PROPERTYKEY kFriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+
 }  // namespace
 
 bool AudioCapture::ProcessLoopbackSupported() { return OsBuild() >= 19041; }
@@ -68,10 +71,48 @@ DWORD AudioCapture::AudioProcessOf(HWND hwnd) {
     return pid;
 }
 
-bool AudioCapture::Start(Source src, DWORD pid, int sampleRate, int64_t originQpc, Sink sink, std::wstring& err) {
+std::vector<AudioCapture::Device> AudioCapture::InputDevices() {
+    std::vector<Device> out;
+    ComPtr<IMMDeviceEnumerator> en;
+    ComPtr<IMMDeviceCollection> all;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) ||
+        FAILED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &all)))
+        return out;
+    std::wstring def;
+    ComPtr<IMMDevice> d;
+    LPWSTR id = nullptr;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &d)) && SUCCEEDED(d->GetId(&id))) {
+        def = id;
+        CoTaskMemFree(id);
+    }
+    UINT n = 0;
+    all->GetCount(&n);
+    for (UINT i = 0; i < n; ++i) {
+        ComPtr<IMMDevice> dev;
+        ComPtr<IPropertyStore> props;
+        if (FAILED(all->Item(i, &dev)) || FAILED(dev->GetId(&id))) continue;
+        Device e;
+        e.id = id;
+        CoTaskMemFree(id);
+        e.isDefault = e.id == def;
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && SUCCEEDED(props->GetValue(kFriendlyName, &pv)) &&
+            pv.vt == VT_LPWSTR)
+            e.name = pv.pwszVal;
+        PropVariantClear(&pv);
+        if (e.name.empty()) e.name = L"이름 없는 장치";
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+bool AudioCapture::Start(Source src, DWORD pid, int sampleRate, int64_t originQpc, Sink sink, std::wstring& err,
+                         const std::wstring& device) {
     Stop(0);
     src_ = src;
     pid_ = pid;
+    device_ = device;
     rate_ = sampleRate;
     origin_ = originQpc;
     sink_ = std::move(sink);
@@ -92,7 +133,8 @@ bool AudioCapture::Start(Source src, DWORD pid, int sampleRate, int64_t originQp
         stop_ = ready_ = nullptr;
         sink_ = nullptr;
         err = util::Format(src == Source::Process ? L"이 창의 소리를 녹음할 수 없습니다. (0x%08X)"
-                                                  : L"시스템 소리를 녹음할 수 없습니다. (0x%08X)",
+                           : src == Source::Mic       ? L"마이크를 녹음할 수 없습니다. (0x%08X)"
+                                                      : L"시스템 소리를 녹음할 수 없습니다. (0x%08X)",
                            (unsigned)startHr_);
         return false;
     }
@@ -162,15 +204,20 @@ HRESULT AudioCapture::Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureCli
                                     kBufferDuration, 0, &want, nullptr);
         }
     } else {
+        // System: the default output device, looped back. Mic: the chosen input device, else the default one.
+        const bool mic = src_ == Source::Mic;
+        const DWORD loopback = mic ? 0 : AUDCLNT_STREAMFLAGS_LOOPBACK;
         ComPtr<IMMDeviceEnumerator> en;
         ComPtr<IMMDevice> dev;
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en));
-        if (SUCCEEDED(hr)) hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+        if (SUCCEEDED(hr))
+            hr = mic && !device_.empty() ? en->GetDevice(device_.c_str(), &dev)
+                                         : en->GetDefaultAudioEndpoint(mic ? eCapture : eRender, eConsole, &dev);
         if (SUCCEEDED(hr)) hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client);
         if (SUCCEEDED(hr)) {
             hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                                        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                    loopback | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                                     kBufferDuration, 0, &want, nullptr);
             if (FAILED(hr)) {
                 // The engine wouldn't convert: take its mix format and convert here.
@@ -189,8 +236,7 @@ HRESULT AudioCapture::Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureCli
                     if ((isFloat && srcBits_ != 32) || (!isFloat && srcBits_ != 16 && srcBits_ != 32) || srcChannels_ < 1)
                         hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
                     else
-                        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, loopback | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                                 kBufferDuration, 0, mix, nullptr);
                     convert_ = true;
                     CoTaskMemFree(mix);
@@ -349,4 +395,62 @@ void AudioCapture::Append(const int16_t* pcm, size_t frames) {
         sink_(pcm, frames);
     }
     written_ += frames;
+}
+
+// ---------------------------------------------------------------- AudioMix
+
+void AudioMix::Reset(int inputs, AudioCapture::Sink out) {
+    std::lock_guard lk(mtx_);
+    in_.assign(inputs, In{});
+    out_ = std::move(out);
+}
+
+void AudioMix::SetGain(int input, float gain) {
+    std::lock_guard lk(mtx_);
+    in_[input].gain = gain;
+}
+
+void AudioMix::Drop(int input) {
+    std::lock_guard lk(mtx_);
+    in_[input].live = false;
+    in_[input].q.clear();
+    size_t n = SIZE_MAX;
+    for (const In& i : in_)
+        if (i.live) n = std::min(n, i.q.size() / 2);
+    if (n != SIZE_MAX) Emit(n);
+}
+
+void AudioMix::Flush() {
+    std::lock_guard lk(mtx_);
+    size_t n = 0;
+    for (const In& i : in_)
+        if (i.live) n = std::max(n, i.q.size() / 2);
+    for (In& i : in_)
+        if (i.live) i.q.resize(n * 2, 0);
+    Emit(n);
+}
+
+void AudioMix::Push(int input, const int16_t* pcm, size_t frames) {
+    std::lock_guard lk(mtx_);
+    In& in = in_[input];
+    if (!in.live) return;
+    in.q.insert(in.q.end(), pcm, pcm + frames * 2);
+    size_t n = SIZE_MAX;
+    for (const In& i : in_)
+        if (i.live) n = std::min(n, i.q.size() / 2);
+    Emit(n);
+}
+
+void AudioMix::Emit(size_t frames) {
+    if (frames == 0 || !out_) return;
+    mixed_.resize(frames * 2);
+    for (size_t k = 0; k < frames * 2; ++k) {
+        float s = 0;
+        for (const In& i : in_)
+            if (i.live) s += i.q[k] * i.gain;
+        mixed_[k] = (int16_t)std::clamp((int)std::lround(s), -32768, 32767);
+    }
+    for (In& i : in_)
+        if (i.live) i.q.erase(i.q.begin(), i.q.begin() + frames * 2);
+    out_(mixed_.data(), frames);
 }

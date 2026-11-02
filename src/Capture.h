@@ -9,9 +9,13 @@ enum class CaptureSource { Window, Monitor, Region };
 struct VideoOptions {
     std::wstring path;
     VideoConfig video;          // size and frame rate are filled in by Capture
-    AudioConfig audio;          // enabled = record sound
+    AudioConfig audio;          // enabled = an audio track: sound, the mic or both mixed
+    bool sound = false;         // what plays
     bool processAudio = false;  // only the target process tree (window capture) instead of the system mix
     DWORD audioPid = 0;
+    bool mic = false;           // the microphone mixed in (#21)
+    std::wstring micDevice;     // endpoint ID, empty = Windows' default input
+    float micGain = 1;
 };
 
 struct CaptureOptions {
@@ -131,7 +135,8 @@ private:
 
     // video mode
     std::unique_ptr<Mp4Writer> writer_;
-    AudioCapture audio_;
+    AudioCapture audio_, mic_;
+    AudioMix mix_;  // audio_ (input 0) and mic_ (input 1) into the writer
     std::thread ticker_;
     HANDLE tickStop_ = nullptr, firstFrame_ = nullptr, resumed_ = nullptr;
     std::wstring videoError_, notice_;

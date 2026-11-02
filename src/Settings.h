@@ -77,6 +77,9 @@ struct Settings {
     bool audio = true;
     int aBitrateIdx = 2;
     int aRateIdx = 1;
+    bool mic = false;        // the microphone mixed into the MP4's sound (#21)
+    std::wstring micDevice;  // endpoint ID, empty = Windows' default input
+    int micVolume = 100;     // %, 0-200
 
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip

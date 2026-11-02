@@ -127,14 +127,27 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             writer_ = std::make_unique<Mp4Writer>();
             VideoOptions& vo = *opt_.video;
             if (vo.audio.enabled) {
-                std::wstring aerr;
-                auto src = vo.processAudio ? AudioCapture::Source::Process : AudioCapture::Source::System;
                 Mp4Writer* w = writer_.get();
-                if (!audio_.Start(src, vo.audioPid, vo.audio.sampleRate, startQpc_,
-                                  [w](const int16_t* pcm, size_t n) { w->PushAudio(pcm, n); }, aerr)) {
-                    vo.audio.enabled = false;  // never fall back to a different audio source
-                    notice_ = aerr + L" 소리 없이 녹화했습니다.";
-                }
+                mix_.Reset(2, [w](const int16_t* pcm, size_t n) { w->PushAudio(pcm, n); });
+                mix_.SetGain(1, vo.micGain);
+                std::wstring aerr, merr;
+                bool sound = vo.sound, mic = vo.mic;
+                // A source that fails is left out; never a different source in its place.
+                auto src = vo.processAudio ? AudioCapture::Source::Process : AudioCapture::Source::System;
+                if (sound && !audio_.Start(src, vo.audioPid, vo.audio.sampleRate, startQpc_, mix_.Input(0), aerr))
+                    sound = false;
+                if (!sound) mix_.Drop(0);
+                if (mic && !mic_.Start(AudioCapture::Source::Mic, 0, vo.audio.sampleRate, startQpc_, mix_.Input(1), merr,
+                                       vo.micDevice))
+                    mic = false;
+                if (!mic) mix_.Drop(1);
+                vo.audio.enabled = sound || mic;
+                std::wstring lost = vo.sound && !sound ? aerr : L"";
+                if (vo.mic && !mic) lost += (lost.empty() ? L"" : L" ") + merr;
+                if (!lost.empty())
+                    notice_ = lost + (!vo.audio.enabled ? L" 소리 없이 녹화했습니다."
+                                      : !sound      ? L" 마이크 소리만 녹음했습니다."
+                                                    : L" 마이크 없이 녹화했습니다.");
             }
             tickStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             firstFrame_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -155,6 +168,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
                 *h = nullptr;
             }
         audio_.Stop(0);
+        mic_.Stop(0);
         writer_.reset();
         ReleaseGpu();
         return false;
@@ -174,12 +188,14 @@ void Capture::SetPaused(bool on) {
     if (on) {
         if (resumed_) ResetEvent(resumed_);
         pausedAt_ = now;
-        if (opt_.video) audio_.Pause(now);
+        for (AudioCapture* a : {&audio_, &mic_})
+            if (opt_.video && a->Running()) a->Pause(now);
     } else {
         // The total first: the ticker reads pausedAt_, then the total.
         pausedTotal_ += now - pausedAt_;
         pausedAt_ = 0;
-        if (opt_.video) audio_.Resume(now);
+        for (AudioCapture* a : {&audio_, &mic_})
+            if (opt_.video && a->Running()) a->Resume(now);
         if (resumed_) SetEvent(resumed_);
     }
 }
@@ -600,6 +616,8 @@ CaptureResult Capture::Stop() {
         SetEvent(tickStop_);
         if (ticker_.joinable()) ticker_.join();
         audio_.Stop(stopQpc);  // pads silence up to the stop press
+        mic_.Stop(stopQpc);
+        mix_.Flush();
         { std::lock_guard lk(mtx_); }  // lets a frame callback that is still running finish
         res.video = true;
         res.path = opt_.video->path;

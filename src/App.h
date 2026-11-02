@@ -127,6 +127,8 @@ private:
     void ProbeEncoders();
     std::wstring VideoSummary() const;
     std::wstring AudioSummary(int source) const;
+    std::wstring MicDeviceName() const;
+    bool MicMenu(const Rect& anchor);
 
     // ---- files: opening videos, recent files, recordings not exported yet
     void OpenMediaFile(const std::wstring& path);
@@ -334,6 +336,8 @@ private:
     bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
     std::vector<HWINEVENTHOOK> winHooks_;
     bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
+    std::vector<AudioCapture::Device> micDevices_;  // 설정 › 소리, listed when the tab is opened
+    bool micListed_ = false;
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;

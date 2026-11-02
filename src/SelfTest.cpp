@@ -598,6 +598,40 @@ int App::RunSelfTest(const std::wstring& dir) {
         DestroyWindow(standIn);
     }
     failures += UpdaterChecks(dir + L"\\update", log);
+
+    // Mic mixing (#21), on made-up streams: frame n of each input adds up (the mic with its gain) once both have
+    // it, an input left out never holds the other back, Flush pads the shorter one, loud sums clip.
+    {
+        std::vector<int16_t> out;
+        auto collect = [&](const int16_t* p, size_t n) { out.insert(out.end(), p, p + n * 2); };
+        auto mcheck = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"mix: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        AudioMix mix;
+        mix.Reset(2, collect);
+        mix.SetGain(1, 0.5f);
+        std::vector<int16_t> sound(200, 1000), mic(100, 3000);  // 100 and 50 frames
+        mix.Input(0)(sound.data(), 100);
+        mcheck(out.empty(), L"waits for the other input");
+        mix.Input(1)(mic.data(), 50);
+        mcheck(out.size() == 100 && out.front() == 2500 && out.back() == 2500, L"adds up the frames both have, mic at 50 %");
+        mix.Flush();
+        mcheck(out.size() == 200 && out[100] == 1000 && out.back() == 1000, L"flush pads the shorter input");
+        out.clear();
+        mix.Reset(2, collect);
+        mix.Drop(0);
+        mix.Input(1)(mic.data(), 50);
+        mcheck(out.size() == 100 && out.front() == 3000, L"an input left out doesn't hold back the other");
+        out.clear();
+        mix.Reset(2, collect);
+        std::vector<int16_t> loud(2, 30000), low(2, -30000);
+        mix.Input(0)(loud.data(), 1);
+        mix.Input(1)(loud.data(), 1);
+        mix.Input(0)(low.data(), 1);
+        mix.Input(1)(low.data(), 1);
+        mcheck(out.size() == 4 && out[0] == 32767 && out[2] == -32768, L"loud sums clip");
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -1054,7 +1088,10 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         v.video.hardware = !software;
         v.video.hevc = hevc;
         v.video.gopFrames = o.fps * 2;
-        v.audio.enabled = audio;
+        v.sound = audio;
+        // mic (anywhere after the mode): the default input mixed in. Never in automated runs: it records the room.
+        v.mic = std::find(a.begin() + std::min<size_t>(a.size(), 8), a.end(), L"mic") != a.end();
+        v.audio.enabled = v.sound || v.mic;
         v.audio.sampleRate = 48000;
         v.audio.bitrate = 160000;
         v.processAudio = o.source == CaptureSource::Window;

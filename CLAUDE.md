@@ -34,3 +34,4 @@ The live window preview on Home is a DWM thumbnail. DWM composites it above ever
 - **Window lists:** tests list and record only the "OzMaker Test Window" (`testWindowsOnly_`). Never save or show other windows' titles or contents.
 - **Screen grabs:** capture only OzMaker's own window, kept topmost.
 - **User settings:** never touch the user's `%APPDATA%\OzMaker\settings.ini` or the HKCU Run key from tests.
+- **Microphone:** tests never open the real microphone (it records the room). `--selftest` checks the mixer on made-up streams, screenshots show a made-up device, and `--record-test ... mic` is for the user to run by hand.
