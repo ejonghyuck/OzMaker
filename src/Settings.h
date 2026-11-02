@@ -96,6 +96,7 @@ struct Settings {
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 
     std::vector<std::wstring> recent;  // saved and opened files, newest first
+    std::wstring crashSeen;            // the newest crash report the user was told about (crash::Report::name)
 
     void AddRecent(const std::wstring& path);
     void Load();

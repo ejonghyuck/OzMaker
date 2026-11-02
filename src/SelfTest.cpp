@@ -15,6 +15,7 @@
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 #include "Resize.h"
 #include "Util.h"
 #include "Version.h"
@@ -810,6 +811,43 @@ int App::RunSelfTest(const std::wstring& dir) {
         GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
         pcheck(!Settings::Portable() && Settings::FilePath() == env, L"a test run keeps OZMAKER_SETTINGS");
     }
+    // Crash reports (#24): a child run that crashes on purpose leaves a dump and a log and ends without the Windows
+    // error dialog. It shares this run's OZMAKER_SETTINGS, so the report lands in this test's folder.
+    {
+        crash::Prune(0);
+        for (const wchar_t* kind : {L"access", L"abort"}) {
+            std::wstring cmd = L"\"" + util::ExePath() + L"\" --crash-test " + kind;
+            STARTUPINFOW si{sizeof(si)};
+            PROCESS_INFORMATION pi{};
+            DWORD code = 0, waited = WAIT_FAILED;
+            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                waited = WaitForSingleObject(pi.hProcess, 30000);
+                if (waited != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            auto reports = crash::List();
+            std::string text;
+            if (!reports.empty() && !reports[0].log.empty()) {
+                HANDLE f = CreateFileW(reports[0].log.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                                       nullptr);
+                if (f != INVALID_HANDLE_VALUE) {
+                    char buf[4096];
+                    DWORD n = 0;
+                    if (ReadFile(f, buf, sizeof(buf), &n, nullptr)) text.assign(buf, n);
+                    CloseHandle(f);
+                }
+            }
+            const char* want = kind[1] == L'c' ? "(access violation) at OzMaker.exe+" : "(abort";
+            bool ok = waited == WAIT_OBJECT_0 && reports.size() == 1 && util::FileSize(reports[0].dump) > 0 &&
+                      text.find(want) != std::string::npos && text.find("OzMaker " OZ_VERSION_STR) != std::string::npos;
+            if (!ok) ++failures;
+            log(util::Format(L"crash report: %s %s: a dump and a log (exit 0x%08lX, %zu report(s))", ok ? L"ok  " : L"FAIL",
+                             kind, code, reports.size()));
+            crash::Prune(0);
+        }
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -988,6 +1026,15 @@ int App::RunScreenshots(const std::wstring& dir) {
     settings_.settingsTab = kTabAbout;
     shot(L"settings_about_portable.png", 96);
     portableForTest_ = false;
+    {
+        // A crash report on file (an empty stand-in in this test's own crash folder).
+        CreateDirectoryW(crash::Dir().c_str(), nullptr);
+        std::wstring fake = crash::Dir() + L"\\crash_20261102_142311_" OZ_VERSION_WSTR L".dmp";
+        HANDLE f = CreateFileW(fake.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        shot(L"settings_about_crash.png", 96);
+        DeleteFileW(fake.c_str());
+    }
     settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));

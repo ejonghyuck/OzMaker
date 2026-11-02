@@ -12,7 +12,7 @@ Win32 + Direct2D, immediate-mode UI (`src/Ui.*`). Views are in `src/AppViews.cpp
 ## Versions and releases
 
 - **Version number:** `src/Version.h` holds it. `res/OzMaker.rc` reads it from there; `res/app.manifest` and `vcpkg.json` repeat it. `tools/package.ps1` warns when they differ; the release workflow runs `tools/check-version.ps1`, which stops when they differ or when the tag isn't `v` + that version.
-- **Release assets:** every release carries the zip, `OzMaker.exe` and `update.txt`. Keep those names. Installed copies look for `releases/latest/download/update.txt` and the exe it names (`src/Updater.h`).
+- **Release assets:** every release carries the zip, `OzMaker.exe` and `update.txt`. Keep those names. `OzMaker-<version>-pdb.zip` goes with them, for reading crash reports (`src/Crash.h`). Installed copies look for `releases/latest/download/update.txt` and the exe it names (`src/Updater.h`).
 - **Updater tests:** `--update-test <dir>` (also part of `--selftest`) uses a fake release folder through `OZMAKER_UPDATE_URL` and a copy standing in for the exe. Never point it at the running exe.
 - **Settings screen:** settings are split into tabs (`SettingsTab`). New settings go into the tab they belong to.
 

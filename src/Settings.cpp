@@ -105,6 +105,8 @@ void Settings::Load() {
     outDir = buf;
     GetPrivateProfileStringW(L"OzMaker", L"MicDevice", L"", buf, _countof(buf), ini.c_str());
     micDevice = buf;
+    GetPrivateProfileStringW(L"OzMaker", L"CrashSeen", L"", buf, _countof(buf), ini.c_str());
+    crashSeen = buf;
     recent.clear();
     for (size_t i = 0; i < kMaxRecent; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
@@ -178,6 +180,7 @@ void Settings::Save() const {
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);
+    put(L"CrashSeen", crashSeen);
     put(L"MicDevice", micDevice);
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);

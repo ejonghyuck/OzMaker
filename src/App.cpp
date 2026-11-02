@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 #include "Resize.h"
 #include "Sound.h"
 #include "Util.h"
@@ -85,6 +86,13 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     regionPicker_.Init(inst, gfx_.D2D());
 
     auto args = SplitArgs(cmdLine);
+    // A crash on purpose, for the self-test of the crash report (#24).
+    if (args.size() >= 2 && args[0] == L"--crash-test") {
+        if (args[1] == L"abort") std::abort();
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
+        return 1;
+    }
     if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
@@ -114,6 +122,16 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
         else
             Toast(L"OzMaker " OZ_VERSION_WSTR L" 버전으로 업데이트했습니다");
     }
+    // A crash report written since the user was last told: say so once (#24).
+    if (auto reports = crash::List(); !reports.empty() && reports[0].name > settings_.crashSeen) {
+        settings_.crashSeen = reports[0].name;
+        settings_.Save();
+        if (tray)
+            TrayBalloon(L"지난번에 OzMaker가 비정상 종료되었습니다", L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
+        else
+            Toast(L"지난번에 OzMaker가 비정상 종료되었습니다. 설정 › 정보 › 충돌 기록에서 파일을 볼 수 있습니다.", true);
+    }
+    crash::Prune(5);
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
@@ -195,6 +213,7 @@ bool App::CreateMainWindow(int show) {
 void App::Loop() {
     MSG msg;
     for (;;) {
+        crash::SetState(Activity());
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) return;
             TranslateMessage(&msg);
@@ -1617,6 +1636,17 @@ void App::CloseEditor() {
     SyncAudioPreview();
     DetachReaders();
     RefreshWindows();
+}
+
+const wchar_t* App::Activity() const {
+    if (rec_ == RecState::Recording) return recVideo_ ? L"녹화 중 · 동영상" : L"녹화 중 · 움짤";
+    if (rec_ == RecState::Countdown) return L"녹화 카운트다운";
+    if (exporter_.Busy()) return L"내보내기 중";
+    switch (screen_) {
+        case Screen::Editor: return L"편집 화면";
+        case Screen::Settings: return L"설정";
+        default: return L"홈";
+    }
 }
 
 // The editor's 버리기 (a 움짤 recording) and 삭제 (the video just recorded, into the Recycle Bin). Only what this run

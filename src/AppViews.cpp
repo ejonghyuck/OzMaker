@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 #include "Util.h"
 #include "Version.h"
 
@@ -1949,6 +1950,22 @@ void App::SettingsAbout(Rect& area) {
                    if (ui_.Button(HashId("set.iniDir"), c, L"열기", BtnStyle::Secondary, icon::Folder, true, 13.f))
                        util::OpenFolderAndSelect(Settings::FilePath());
                });
+
+    // Crash reports (#24): only on this PC, for the user to attach to an issue.
+    auto reports = crash::List();
+    std::wstring crashDesc = L"없음 · 비정상 종료되면 덤프와 로그를 이 PC에만 남깁니다";
+    if (!reports.empty()) {
+        const std::wstring& n = reports[0].name;  // crash_yyyymmdd_hhmmss_<version>
+        std::wstring when = n.size() >= 21 ? n.substr(6, 4) + L"-" + n.substr(10, 2) + L"-" + n.substr(12, 2) + L" " +
+                                                 n.substr(15, 2) + L":" + n.substr(17, 2)
+                                           : n;
+        crashDesc = util::Format(L"%zu개 · 최근 %s · 이슈에 첨부해 알려 주시면 고치는 데 도움이 됩니다", reports.size(),
+                                 when.c_str());
+    }
+    SettingRow(area, L"충돌 기록", crashDesc, 94, [&](Rect c) {
+        if (ui_.Button(HashId("set.crash"), c, L"열기", BtnStyle::Secondary, icon::Folder, !reports.empty(), 13.f))
+            util::OpenFolderAndSelect(reports[0].dump);
+    });
 
     Updater::Status st = updater_.Get();
     std::wstring desc;

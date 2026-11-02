@@ -140,6 +140,7 @@ private:
     void DropHeld(const Clip* clip);
     // Asks about unsaved recordings, if there are any, then (on yes) runs `then`.
     void AskQuit(bool restart, std::function<void()> then);
+    const wchar_t* Activity() const;  // for crash reports
     bool CanDiscard() const;  // the editor's 버리기 / 삭제: a recording from this run, nothing exporting
     void ConfirmDiscard();
     void DiscardRecording();

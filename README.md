@@ -85,6 +85,7 @@
 | GIF | 자체 인코더: 바뀐 픽셀만 다시 인코딩(투명 + 영역 크롭), 프레임마다 Wu 양자화 + k-means 보정 팔레트, 바뀐 영역에만 Floyd–Steinberg 디더링, 누적 반올림으로 정확한 재생 시간 |
 | WebP / AVIF | libwebp(WebPAnimEncoder) / libavif + aom. vcpkg가 있을 때만 빌드에 포함됩니다 |
 | 업데이트 | 시작할 때와 하루 한 번 GitHub 최신 릴리스의 `update.txt`(버전 · 크기 · SHA-256)를 WinHTTP로 읽고, 새 버전이면 exe를 옆에 `OzMaker.exe.new`로 받아 검증해 둠. 누르면 실행 중인 exe를 `.old`로 이름 바꾸고 새 exe를 넣은 뒤 다시 시작(쓰기 권한이 없는 폴더면 릴리스 페이지를 엶) |
+| 충돌 기록 | 처리하지 못한 예외 · abort · CRT 오류가 나면 작은 미니덤프(스레드와 스택만, 화면 내용 없음)와 짧은 로그를 설정 파일이 있는 폴더의 `crash`에 남기고 Windows 오류 창 없이 끝냄. 아무 데도 보내지 않고 다음 실행 때 한 번 알림(설정 › 정보 › 충돌 기록, 최근 5개만 남김). 덤프는 그 릴리스의 `OzMaker-<버전>-pdb.zip`으로 읽음 |
 
 ## 빌드
 

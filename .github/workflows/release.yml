@@ -81,8 +81,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          $zip = Get-ChildItem dist\OzMaker-*-win-x64.zip | Select-Object -First 1
+          $files = @($zip.FullName, 'dist\OzMaker.exe', 'dist\update.txt')
+          # The PDB reads crash reports from this build.
+          $pdb = Get-ChildItem dist\OzMaker-*-pdb.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($pdb) { $files += $pdb.FullName }
           # --notes is prepended to the generated list of changes.
           $notes = Get-Content .github/release-notes.md -Raw -Encoding utf8
           # The updater reads releases/latest/download/update.txt and then the exe it names.
-          gh release create $env:GITHUB_REF_NAME $zip.FullName dist\OzMaker.exe dist\update.txt --title "OzMaker $env:GITHUB_REF_NAME" --notes $notes --generate-notes
+          gh release create $env:GITHUB_REF_NAME @files --title "OzMaker $env:GITHUB_REF_NAME" --notes $notes --generate-notes
