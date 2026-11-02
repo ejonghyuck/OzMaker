@@ -17,6 +17,7 @@ std::wstring Format(const wchar_t* fmt, ...);
 
 std::wstring KnownFolder(REFKNOWNFOLDERID id);
 std::wstring ExePath();
+std::wstring ExeDir();                   // the folder ExePath is in
 std::wstring AppDataDir();               // %APPDATA%\OzMaker, created on demand
 bool EnsureDir(const std::wstring& dir);
 std::wstring TimestampName();            // 20261102_142311

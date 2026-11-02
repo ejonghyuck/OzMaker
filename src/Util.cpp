@@ -89,6 +89,11 @@ std::wstring ExePath() {
     return std::wstring(exe, n);
 }
 
+std::wstring ExeDir() {
+    std::wstring p = ExePath();
+    return p.substr(0, p.find_last_of(L'\\'));
+}
+
 std::wstring AppDataDir() {
     std::wstring d = KnownFolder(FOLDERID_RoamingAppData) + L"\\OzMaker";
     EnsureDir(d);

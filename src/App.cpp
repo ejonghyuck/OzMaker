@@ -102,8 +102,9 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     const bool updated = args.size() >= 3 && args[0] == L"--updated";
     const bool tray = (!args.empty() && args[0] == L"--tray") || (updated && args[2] == L"0");
     if (updated) Updater::CleanUp(util::ExePath());
-    autostart_ = util::AutostartEnabled();
-    if (autostart_) util::SetAutostart(true);  // keeps pointing at this exe if it was moved
+    // Keeps pointing at this exe if it was moved. A portable copy leaves this PC's startup programs alone.
+    autostart_ = !Settings::Portable() && util::AutostartEnabled();
+    if (autostart_) util::SetAutostart(true);
     if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
     updater_.Init(util::ExePath(), hwnd_, WM_APP_UPDATE);
     SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way

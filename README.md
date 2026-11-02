@@ -123,6 +123,7 @@ Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. �
 - 코드 서명이 없어서 처음 실행할 때 "Windows의 PC 보호" 창이 뜹니다. **추가 정보 → 실행**을 누르세요.
 - Windows 11에서 스마트 앱 컨트롤이 켜져 있으면 서명 없는 프로그램은 실행이 막힙니다(Windows 보안 › 앱 및 브라우저 컨트롤).
 - 지우려면 트레이 아이콘에서 종료한 뒤 `OzMaker.exe`와 `%APPDATA%\OzMaker` 폴더를 지우면 됩니다.
+- **포터블로 쓰려면** `OzMaker.exe` 옆에 빈 `settings.ini` 파일을 만드세요. 설정이 그 파일에 저장되어 USB 등으로 옮겨 다닐 수 있고, 이 PC의 시작 프로그램에는 등록하지 않습니다(설정 › 정보 › 설정 파일에서 확인).
 
 ## 테스트용 명령줄
 
@@ -141,7 +142,7 @@ OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업�
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```
 
-환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini` 대신 그 파일을 씁니다(테스트용). `OZMAKER_UPDATE_URL`은 업데이트를 확인할 곳(주소 또는 폴더)을 바꿉니다.
+환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini`(포터블이면 exe 옆의 `settings.ini`) 대신 그 파일을 씁니다(테스트용). `OZMAKER_UPDATE_URL`은 업데이트를 확인할 곳(주소 또는 폴더)을 바꿉니다.
 
 ## 알려진 제약
 

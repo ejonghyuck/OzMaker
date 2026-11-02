@@ -340,6 +340,7 @@ private:
     uint64_t exportEstimate_ = 0;
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
     bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
+    bool portableForTest_ = false;   // screenshots: the settings as a portable copy shows them
 
     Updater updater_;
     bool updateOpen_ = false;  // the popover under the update button

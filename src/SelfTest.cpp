@@ -792,6 +792,24 @@ int App::RunSelfTest(const std::wstring& dir) {
         if (!ok) ++failures;
         log(util::Format(L"discard: %s an unsaved recording goes from the editor", ok ? L"ok  " : L"FAIL"));
     }
+    // Portable mode (#25): a settings.ini next to the exe is the settings file; a test run keeps its scratch file.
+    {
+        auto pcheck = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"portable: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        std::wstring exeDir = dir + L"\\portable";
+        util::EnsureDir(exeDir);
+        DeleteFileW((exeDir + L"\\settings.ini").c_str());
+        pcheck(Settings::PortableFile(exeDir).empty(), L"no settings.ini next to the exe: not portable");
+        HANDLE f = CreateFileW((exeDir + L"\\settings.ini").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0,
+                               nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        pcheck(Settings::PortableFile(exeDir) == exeDir + L"\\settings.ini", L"an empty settings.ini turns it on");
+        wchar_t env[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
+        pcheck(!Settings::Portable() && Settings::FilePath() == env, L"a test run keeps OZMAKER_SETTINGS");
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -964,6 +982,12 @@ int App::RunScreenshots(const std::wstring& dir) {
     shot(L"settings_audio_mic.png", 96);
     settingsScroll_ = 0;
     micTestShow_ = -1;
+    settings_.settingsTab = kTabGeneral;
+    portableForTest_ = true;  // as a copy with settings.ini next to the exe shows it
+    shot(L"settings_portable.png", 96);
+    settings_.settingsTab = kTabAbout;
+    shot(L"settings_about_portable.png", 96);
+    portableForTest_ = false;
     settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));

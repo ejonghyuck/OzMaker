@@ -1687,8 +1687,15 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
         }
     });
 
-    SettingRow(area, L"Windows 시작 시 실행", L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다", 60,
-               [&](Rect c) {
+    const bool portable = Settings::Portable() || portableForTest_;
+    SettingRow(area, L"Windows 시작 시 실행",
+               portable ? L"포터블 모드에서는 이 PC의 시작 프로그램에 등록하지 않습니다"
+                        : L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다",
+               60, [&](Rect c) {
+                   if (portable) {
+                       ui_.Text(c, L"쓰지 않음", 13.f, TextFaint, Align(AlignEnd));
+                       return;
+                   }
                    bool on = autostart_;
                    if (ui_.Toggle(HashId("set.autostart"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) {
                        if (util::SetAutostart(on))
@@ -1933,6 +1940,15 @@ void App::SettingsAbout(Rect& area) {
     for (int i = 0; i < (int)Format::Mp4; ++i)
         if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
     SettingRow(area, L"지원 형식", L"움짤: " + formats + L" · 동영상: MP4", 0, [](Rect) {});
+
+    const bool portable = Settings::Portable() || portableForTest_;
+    SettingRow(area, L"설정 파일",
+               portable ? L"포터블 모드 · OzMaker.exe 옆의 settings.ini에 저장합니다"
+                        : L"%APPDATA%\\OzMaker\\settings.ini · OzMaker.exe 옆에 settings.ini를 만들면 포터블로 씁니다",
+               94, [&](Rect c) {
+                   if (ui_.Button(HashId("set.iniDir"), c, L"열기", BtnStyle::Secondary, icon::Folder, true, 13.f))
+                       util::OpenFolderAndSelect(Settings::FilePath());
+               });
 
     Updater::Status st = updater_.Get();
     std::wstring desc;
