@@ -60,6 +60,7 @@ void Settings::Load() {
     aRateIdx = ReadInt(ini, L"AudioRate", aRateIdx, 0, _countof(kAudioRateOptions) - 1);
     mic = ReadInt(ini, L"Mic", mic, 0, 1) != 0;
     micVolume = ReadInt(ini, L"MicVolume", micVolume, 0, 200);
+    micMonitor = ReadInt(ini, L"MicMonitor", micMonitor, 0, 1) != 0;
     fpsIdx = ReadInt(ini, L"Fps", fpsIdx, 0, _countof(kFpsOptions) - 1);
     sizeIdx = ReadInt(ini, L"Size", sizeIdx, 0, _countof(kSizeOptions) - 1);
     cursor = ReadInt(ini, L"Cursor", cursor, 0, 1) != 0;
@@ -142,6 +143,7 @@ void Settings::Save() const {
     num(L"AudioRate", aRateIdx);
     num(L"Mic", mic);
     num(L"MicVolume", micVolume);
+    num(L"MicMonitor", micMonitor);
     num(L"Fps", fpsIdx);
     num(L"Size", sizeIdx);
     num(L"Cursor", cursor);

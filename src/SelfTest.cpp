@@ -22,6 +22,9 @@
 
 namespace {
 
+// Further down, with the other test-tone helpers.
+double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, double f, int rate);
+
 // The MP4 colour conversion runs on the GPU's video processor, which machines without a GPU (CI runners) lack.
 bool HasVideoProcessor() {
     ComPtr<ID3D11Device> dev;
@@ -591,6 +594,37 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"layers, page drawn over the preview: %s %d error(s) caught", good ? L"ok" : L"FAIL",
                          ui_.LayerErrors()));
         if (!good) ++failures;
+        // A question in place of a MessageBox: it covers the window, the preview with it; Esc says no, Enter yes,
+        // and yes runs afterwards (WM_APP_ANSWER), not in the frame.
+        {
+            filesOpen_ = false;
+            toastUntil_ = 0;
+            int yes = 0;
+            auto ask = [&] {
+                Ask({L"저장하지 않은 녹화가 1개 있습니다", L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+                     L"종료", true, [&] { ++yes; }});
+            };
+            ask();
+            frames(8);
+            PreviewLayout(dest, src);
+            size_t left = PreviewParts(dest).size(), floats = ui_.Floats().size();
+            in.keys = {VK_ESCAPE};
+            frames(1);
+            in.keys.clear();
+            bool no = !question_ && !answer_ && yes == 0;
+            ask();
+            frames(3);
+            in.keys = {VK_RETURN};
+            frames(1);
+            in.keys.clear();
+            bool later = !question_ && answer_ && yes == 0;
+            if (auto f = std::exchange(answer_, nullptr)) f();
+            good = thumbWanted_ && ui_.LayerErrors() == 0 && floats >= 1 && left == 0 && no && later && yes == 1;
+            log(util::Format(L"question: %s %zu preview parts left uncovered, %d layering errors, Esc no %d, "
+                             L"Enter yes after the frame %d",
+                             good ? L"ok" : L"FAIL", left, ui_.LayerErrors(), no, later && yes == 1));
+            if (!good) ++failures;
+        }
         filesOpen_ = false;
         toastUntil_ = 0;
         recentFiles_.clear();
@@ -648,6 +682,62 @@ int App::RunSelfTest(const std::wstring& dir) {
         std::vector<int16_t> full{1234, -1234};
         AudioPreview::Scale(full.data(), 1, 1.f, 1.f);
         vcheck(full[0] == 1234 && full[1] == -1234, L"100 % leaves the samples alone");
+    }
+    // OzMaker's own sounds stay out of a recording of everything that plays (the start cue was recorded), and the
+    // mic check plays the mic back. A quiet made-up tone stands in for the mic: a loopback of OzMaker alone hears
+    // it, the recording's source (everything but OzMaker) doesn't. Only tone levels are kept, nothing else.
+    if (!AudioCapture::ProcessLoopbackSupported()) {
+        log(L"own sound: skipped (needs Windows 10 2004 or later)");
+    } else {
+        std::mutex m;
+        std::vector<int16_t> self, others;
+        auto into = [&m](std::vector<int16_t>& v) {
+            return [&m, &v](const int16_t* p, size_t n) {
+                std::lock_guard lk(m);
+                v.insert(v.end(), p, p + n * 2);
+            };
+        };
+        AudioMonitor mon;
+        AudioCapture a, b;
+        std::wstring err;
+        const int64_t origin = util::Qpc100ns();
+        bool started = mon.Start(48000, err) &&
+                       a.Start(AudioCapture::Source::Process, GetCurrentProcessId(), 48000, origin, into(self), err) &&
+                       b.Start(AudioCapture::Source::Others, 0, 48000, origin, into(others), err);
+        if (!started) {
+            log(L"own sound: skipped (no audio output: " + err + L")");
+        } else {
+            const double f = 1733;
+            const size_t total = 48000 * 6 / 10;  // 0.6 s, pushed in 10 ms blocks a little ahead of real time
+            std::vector<int16_t> block(480 * 2);
+            double phase = 0, t0 = util::NowSeconds();
+            for (size_t pushed = 0; pushed < total; Sleep(2)) {
+                size_t due = (size_t)((util::NowSeconds() - t0) * 48000) + 960;
+                for (; pushed < due && pushed < total; pushed += 480) {
+                    for (size_t i = 0; i < 480; ++i) {
+                        phase += 2 * 3.14159265358979 * f / 48000;
+                        block[2 * i] = block[2 * i + 1] = (int16_t)(0.02 * std::sin(phase) * 32767);
+                    }
+                    mon.Push(block.data(), 480);
+                }
+            }
+            Sleep(300);
+            mon.Stop();
+            a.Stop(0);
+            b.Stop(0);
+            auto loudest = [&](const std::vector<int16_t>& v) {
+                double best = 0;
+                for (size_t i = 0; (i + 19200) * 2 <= v.size(); i += 2400)
+                    best = std::max(best, ToneLevel(v, i, 19200, f, 48000));
+                return best;
+            };
+            double heard = loudest(self), recorded = loudest(others);
+            bool ok = heard > 0.005 && recorded < heard * 0.1;
+            if (!ok) ++failures;
+            log(util::Format(L"own sound: %s the mic playback comes out of OzMaker (level %.4f) and stays out of the "
+                             L"recording's sound (%.4f)",
+                             ok ? L"ok  " : L"FAIL", heard, recorded));
+        }
     }
     // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
     {
@@ -827,6 +917,11 @@ int App::RunScreenshots(const std::wstring& dir) {
         micTestShow_ = i == kTabAudio ? 0.6f : -1;  // the mic check running, on a made-up level
         shot(tabShots[i], 96);
     }
+    settings_.settingsTab = kTabAudio;  // the mic rows at the bottom, testing, with the playback switch
+    settingsScroll_ = 10000;
+    micTestShow_ = 0.6f;
+    shot(L"settings_audio_mic.png", 96);
+    settingsScroll_ = 0;
     micTestShow_ = -1;
     settings_.settingsTab = kTabGeneral;
 
@@ -865,6 +960,13 @@ int App::RunScreenshots(const std::wstring& dir) {
     shot(L"editor_toast_long.png", 96);
     toastError_ = false;
     toastUntil_ = 0;
+    // Questions inside the window instead of MessageBox.
+    ConfirmDiscard();
+    shot(L"editor_ask.png", 96);
+    Ask({L"이 동영상을 휴지통으로 옮길까요?", L"OzMaker_20261102_142311.mp4\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.",
+         L"휴지통으로", true, nullptr});
+    shot(L"editor_ask_video.png", 96);
+    question_.reset();
     CloseEditor();
 
     // Files list: two recordings not exported yet and a few recent files (names only, nothing on disk).
@@ -2113,11 +2215,25 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         pump(0.5);
         check(screen_ == Screen::Editor && CanDiscard(), L"the video just recorded can be deleted in the editor");
         testDeleteFiles_ = true;
-        DiscardRecording();
-        pump(0.2);
-        check(screen_ == Screen::Home && !clip_ && !showVideo_ &&
+        // Delete asks inside the window; the editor under the question takes no keys; Esc says no, Enter yes.
+        key(VK_DELETE);
+        pump(0.3);
+        bool asked = question_.has_value() && question_->danger;
+        key(VK_SPACE);
+        pump(0.3);
+        bool still = !playing_ && question_.has_value();
+        key(VK_ESCAPE);
+        pump(0.3);
+        check(asked && still && !question_ && screen_ == Screen::Editor && GetFileAttributesW(copy.c_str()) != INVALID_FILE_ATTRIBUTES,
+              util::Format(L"Delete asks in the window (asked %d, the editor ignored Space %d); Esc keeps the video",
+                           asked, still));
+        key(VK_DELETE);
+        pump(0.3);
+        key(VK_RETURN);
+        pump(0.5);
+        check(screen_ == Screen::Home && !clip_ && !showVideo_ && !question_ &&
                   GetFileAttributesW(copy.c_str()) == INVALID_FILE_ATTRIBUTES && util::FileSize(path) > 0,
-              L"삭제 removes the video and its card and goes home");
+              L"Enter on the question: 삭제 removes the video and its card and goes home");
         check(OpenVideo(path) && !CanDiscard(), L"a video opened by hand has no 삭제");
         CloseEditor();
     } else {

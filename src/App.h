@@ -35,6 +35,7 @@ private:
         WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
         WM_APP_ESTIMATE,
         WM_APP_UPDATE,
+        WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
@@ -137,10 +138,24 @@ private:
     void RefreshRecent();
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
-    bool ConfirmQuit(bool restart = false);  // asks about unsaved recordings, if any
+    // Asks about unsaved recordings, if there are any, then (on yes) runs `then`.
+    void AskQuit(bool restart, std::function<void()> then);
     bool CanDiscard() const;  // the editor's 버리기 / 삭제: a recording from this run, nothing exporting
     void ConfirmDiscard();
     void DiscardRecording();
+
+    // A question inside the window instead of a MessageBox: a card over the dimmed window, Enter for yes, Esc (or a
+    // click outside) for no. The window comes to the front for it.
+    struct Question {
+        std::wstring title, body, yes;
+        bool danger = false;  // yes destroys something: a red button
+        std::function<void()> onYes;
+    };
+    void Ask(Question q);
+    void DrawQuestion(Rect client);
+    std::optional<Question> question_;
+    std::function<void()> answer_;  // onYes of the question just answered, for WM_APP_ANSWER
+    uint32_t questionSeq_ = 0;      // a new question fades in again
 
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
@@ -191,7 +206,8 @@ private:
     // ---- updates (#31)
     void CheckForUpdate();  // when one is due (timer), or now from the settings
     bool UpdateReady() const;
-    void InstallUpdate();   // swap the exe and restart into it
+    void InstallUpdate();   // asks about unsaved recordings, then RestartIntoUpdate
+    void RestartIntoUpdate();  // swap the exe and restart into it
 
     // ---- test helpers (SelfTest)
     int RunScreenshots(const std::wstring& dir);
@@ -270,7 +286,6 @@ private:
     uint32_t playEpoch_ = 0, audioEpoch_ = 0;  // bumped whenever the preview clock jumps
     AudioPreview audioPreview_;
     bool previewMute_ = false;
-    bool discardAsked_ = false;  // 버리기 / 삭제 or the Delete key: asked after the frame, the dialog being modal
     int fmt_ = 0;  // export format (Format)
     bool exportAudio_ = true;
     RECT crop_{};
@@ -349,7 +364,9 @@ private:
     void StartMicTest();
     void StopMicTest();
     std::atomic<float> micPeak_{0};  // loudest sample since the meter last looked, 0..1, before the mic volume
-    AudioCapture micTest_;           // after micPeak_: its thread writes there until it is destroyed
+    AudioMonitor micMonitor_;        // plays the mic back while testing (settings_.micMonitor)
+    AudioCapture micTest_;           // after micPeak_ and micMonitor_: its thread writes to them until it is destroyed
+    void SyncMicMonitor();           // micMonitor_ on while testing with settings_.micMonitor
     float micLevel_ = 0;             // the meter: 0..1 over -60..0 dB, falling back slowly
     double micTestUntil_ = 0, micLevelAt_ = 0;
     float micTestShow_ = -1;         // screenshots: a made-up level, no device opened

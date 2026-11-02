@@ -81,6 +81,7 @@ struct Settings {
     bool mic = false;        // the microphone mixed into the MP4's sound (#21)
     std::wstring micDevice;  // endpoint ID, empty = Windows' default input
     int micVolume = 100;     // %, 0-200
+    bool micMonitor = true;  // 마이크 확인 plays the mic back while it runs
 
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip

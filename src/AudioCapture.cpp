@@ -180,11 +180,13 @@ HRESULT AudioCapture::Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureCli
     want.nAvgBytesPerSec = rate_ * 4;
 
     HRESULT hr = S_OK;
-    if (src_ == Source::Process) {
+    if (src_ == Source::Process || src_ == Source::Others) {
         AUDIOCLIENT_ACTIVATION_PARAMS ap{};
         ap.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-        ap.ProcessLoopbackParams.TargetProcessId = pid_;
-        ap.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+        ap.ProcessLoopbackParams.TargetProcessId = src_ == Source::Others ? GetCurrentProcessId() : pid_;
+        ap.ProcessLoopbackParams.ProcessLoopbackMode = src_ == Source::Others
+                                                           ? PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+                                                           : PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
         PROPVARIANT pv{};
         pv.vt = VT_BLOB;
         pv.blob.cbSize = sizeof(ap);
@@ -453,4 +455,112 @@ void AudioMix::Emit(size_t frames) {
     for (In& i : in_)
         if (i.live) i.q.erase(i.q.begin(), i.q.begin() + frames * 2);
     out_(mixed_.data(), frames);
+}
+
+bool AudioMonitor::Start(int sampleRate, std::wstring& err) {
+    Stop();
+    rate_ = sampleRate;
+    startHr_ = E_FAIL;
+    {
+        std::lock_guard lk(mtx_);
+        q_.clear();
+        open_ = true;
+    }
+    stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ready_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    thread_ = std::thread([this] { Run(); });
+    WaitForSingleObject(ready_, INFINITE);
+    if (SUCCEEDED(startHr_)) return true;
+    Stop();
+    err = util::Format(L"스피커로 들려줄 수 없습니다. (0x%08X)", (unsigned)startHr_);
+    return false;
+}
+
+void AudioMonitor::Stop() {
+    {
+        std::lock_guard lk(mtx_);
+        open_ = false;
+        q_.clear();
+    }
+    if (!thread_.joinable()) return;
+    SetEvent(stop_);
+    thread_.join();
+    CloseHandle(stop_);
+    CloseHandle(ready_);
+    stop_ = ready_ = nullptr;
+}
+
+void AudioMonitor::Push(const int16_t* pcm, size_t frames) {
+    std::lock_guard lk(mtx_);
+    if (!open_) return;
+    q_.insert(q_.end(), pcm, pcm + frames * 2);
+    // More than 80 ms waiting: the two clocks drifted or the output stalled. Back to 30 ms.
+    const size_t most = (size_t)rate_ * 2 * 80 / 1000, keep = (size_t)rate_ * 2 * 30 / 1000;
+    if (q_.size() > most) q_.erase(q_.begin(), q_.end() - keep);
+}
+
+void AudioMonitor::Run() {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    DWORD taskIdx = 0;
+    HANDLE task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    WAVEFORMATEX want{};
+    want.wFormatTag = WAVE_FORMAT_PCM;
+    want.nChannels = 2;
+    want.nSamplesPerSec = rate_;
+    want.wBitsPerSample = 16;
+    want.nBlockAlign = 4;
+    want.nAvgBytesPerSec = rate_ * 4;
+    ComPtr<IMMDeviceEnumerator> en;
+    ComPtr<IMMDevice> dev;
+    ComPtr<IAudioClient> client;
+    ComPtr<IAudioRenderClient> render;
+    UINT32 bufFrames = 0;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en));
+    if (SUCCEEDED(hr)) hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+    if (SUCCEEDED(hr)) hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client);
+    if (SUCCEEDED(hr))
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                200'000, 0, &want, nullptr);  // 20 ms
+    if (SUCCEEDED(hr)) hr = client->GetBufferSize(&bufFrames);
+    if (SUCCEEDED(hr)) hr = client->SetEventHandle(event);
+    if (SUCCEEDED(hr)) hr = client->GetService(IID_PPV_ARGS(&render));
+    if (SUCCEEDED(hr)) hr = client->Start();
+    startHr_ = hr;
+    SetEvent(ready_);
+
+    if (SUCCEEDED(hr)) {
+        // Playing starts, and starts again after running dry, once 20 ms are waiting.
+        const size_t prebuffer = (size_t)rate_ * 20 / 1000;
+        bool primed = false;
+        float applied = gain_;
+        HANDLE waits[2] = {stop_, event};
+        while (WaitForMultipleObjects(2, waits, FALSE, 50) != WAIT_OBJECT_0) {
+            UINT32 padding = 0;
+            if (FAILED(client->GetCurrentPadding(&padding))) break;
+            std::lock_guard lk(mtx_);
+            size_t have = q_.size() / 2;
+            if (!primed && have < prebuffer) continue;
+            primed = have > 0 || padding > 0;
+            UINT32 n = (UINT32)std::min<size_t>(bufFrames - padding, have);
+            BYTE* data = nullptr;
+            if (n == 0 || FAILED(render->GetBuffer(n, &data))) continue;
+            auto* out = reinterpret_cast<int16_t*>(data);
+            float g = gain_;
+            for (UINT32 i = 0; i < n * 2; ++i) {
+                float k = applied + (g - applied) * (float)(i / 2) / (float)n;  // ramped, no clicks
+                out[i] = (int16_t)std::clamp((int)std::lround(q_[i] * k), -32768, 32767);
+            }
+            applied = g;
+            q_.erase(q_.begin(), q_.begin() + n * 2);
+            render->ReleaseBuffer(n, 0);
+        }
+        client->Stop();
+    }
+    render.Reset();
+    client.Reset();
+    CloseHandle(event);
+    if (task) AvRevertMmThreadCharacteristics(task);
 }

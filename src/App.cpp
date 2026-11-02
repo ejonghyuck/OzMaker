@@ -239,7 +239,6 @@ void App::Render() {
     ApplyThumbnail();
     SyncAudioPreview();
     RequestWake(ui_.WakeAt());
-    if (std::exchange(discardAsked_, false)) ConfirmDiscard();
     if (settingsDirty_ && !input_.down) {
         settings_.Save();
         settingsDirty_ = false;
@@ -586,6 +585,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     IsIconic(hwnd_) || rec_ != RecState::Idle || now > micTestUntil_) {
                     StopMicTest();
                 } else {
+                    micMonitor_.SetGain(settings_.micVolume / 100.f);
                     float peak = std::min(1.f, micPeak_.exchange(0) * settings_.micVolume / 100.f);
                     float pos = peak > 0 ? std::clamp((20 * std::log10(peak) + 60) / 60, 0.f, 1.f) : 0.f;
                     micLevel_ = std::max(pos, micLevel_ - (float)(now - micLevelAt_) * 1.2f);
@@ -641,6 +641,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             quitting_ = true;
             DestroyWindow(hwnd_);
             return 0;
+        case WM_APP_ANSWER:
+            if (auto f = std::exchange(answer_, nullptr)) f();
+            return 0;
         case WM_APP_CAPTURE_CLOSED:
             if (rec_ == RecState::Recording) StopRecording();
             return 0;
@@ -673,7 +676,10 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
-            if (!settings_.closeToTray && !quitting_ && !ConfirmQuit()) return 0;
+            if (!settings_.closeToTray && !quitting_) {
+                AskQuit(false, [this] { PostMessageW(hwnd_, WM_APP_QUIT, 0, 0); });
+                return 0;
+            }
             if (settings_.closeToTray && !quitting_) {
                 HideMain();
                 if (!settings_.trayHintShown) {
@@ -981,11 +987,13 @@ void App::StartMicTest() {
         float v = peak / 32768.f, old = micPeak_.load();
         while (v > old && !micPeak_.compare_exchange_weak(old, v)) {
         }
+        micMonitor_.Push(pcm, frames);  // dropped unless it plays
     };
     if (!micTest_.Start(AudioCapture::Source::Mic, 0, 48000, util::Qpc100ns(), sink, err, settings_.micDevice)) {
         Toast(err, true);
         return;
     }
+    SyncMicMonitor();
     micTestUntil_ = util::NowSeconds() + 10;
     micLevelAt_ = util::NowSeconds();
     SetTimer(hwnd_, kTimerMicTest, 33, nullptr);
@@ -996,13 +1004,26 @@ void App::StopMicTest() {
     if (!micTest_.Running()) return;
     KillTimer(hwnd_, kTimerMicTest);
     micTest_.Stop(0);
+    micMonitor_.Stop();
     micLevel_ = 0;
     Invalidate();
 }
 
+void App::SyncMicMonitor() {
+    bool want = micTest_.Running() && settings_.micMonitor;
+    micMonitor_.SetGain(settings_.micVolume / 100.f);  // what the recording would get
+    if (want == micMonitor_.Running()) return;
+    std::wstring err;
+    if (!want)
+        micMonitor_.Stop();
+    else if (!micMonitor_.Start(48000, err))
+        Toast(err, true);
+}
+
 void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     if (rec_ != RecState::Idle) return;
-    StopMicTest();  // the recording opens the mic itself
+    StopMicTest();      // the recording opens the mic itself
+    question_.reset();  // a question about this window's state (quit, discard) no longer applies
     recFromHotkey_ = fromHotkey;
     if (exporter_.Busy()) {
         if (fromHotkey)
@@ -1501,12 +1522,24 @@ void App::DropHeld(const Clip* clip) {
     std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
 }
 
-bool App::ConfirmQuit(bool restart) {
-    if (held_.empty()) return true;
-    std::wstring msg = util::Format(restart ? L"저장하지 않은 녹화가 %zu개 있습니다.\n다시 시작하면 사라집니다. 업데이트할까요?"
-                                            : L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?",
-                                    held_.size());
-    return MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+void App::AskQuit(bool restart, std::function<void()> then) {
+    if (held_.empty()) {
+        then();
+        return;
+    }
+    Ask({util::Format(L"저장하지 않은 녹화가 %zu개 있습니다", held_.size()),
+         restart ? L"다시 시작하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요."
+                 : L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+         restart ? L"다시 시작해서 업데이트" : L"종료", true, std::move(then)});
+}
+
+void App::Ask(Question q) {
+    if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) ShowMain(true);
+    SetPlaying(false);
+    filesOpen_ = updateOpen_ = false;
+    question_ = std::move(q);
+    ++questionSeq_;
+    Invalidate();
 }
 
 // ---------------------------------------------------------------- updates
@@ -1527,7 +1560,12 @@ void App::InstallUpdate() {
         Toast(L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다.", true);
         return;
     }
-    if (!ConfirmQuit(true)) return;
+    AskQuit(true, [this] {
+        if (rec_ == RecState::Idle && !exporter_.Busy()) RestartIntoUpdate();
+    });
+}
+
+void App::RestartIntoUpdate() {
     std::wstring err;
     if (!updater_.Install(err)) {
         Toast(err, true);
@@ -1590,15 +1628,19 @@ bool App::CanDiscard() const {
 
 void App::ConfirmDiscard() {
     if (!CanDiscard()) return;
-    SetPlaying(false);
     bool held = std::any_of(held_.begin(), held_.end(), [&](const HeldClip& h) { return h.clip == clip_; });
-    std::wstring msg = !clip_->SourcePath().empty()
-                           ? L"이 동영상을 휴지통으로 옮길까요?\n\n" + util::FileNameOf(clip_->SourcePath()) +
-                                 L"\n\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."
-                       : held ? L"이 녹화를 버릴까요?\n아직 저장하지 않아서 되돌릴 수 없습니다."
-                              : L"이 녹화를 버릴까요?\n저장한 파일은 그대로 남습니다.";
-    if (MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
-        DiscardRecording();
+    // The editor's clip when asked: the answer applies to that one only.
+    auto discard = [this, clip = std::weak_ptr<Clip>(clip_)] {
+        if (clip.lock() == clip_) DiscardRecording();
+    };
+    if (!clip_->SourcePath().empty())
+        Ask({L"이 동영상을 휴지통으로 옮길까요?",
+             util::FileNameOf(clip_->SourcePath()) + L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.", L"휴지통으로",
+             true, discard});
+    else
+        Ask({L"이 녹화를 버릴까요?",
+             held ? L"아직 저장하지 않아서 되돌릴 수 없습니다." : L"저장한 파일은 그대로 남습니다.", L"버리기", true,
+             discard});
 }
 
 void App::DiscardRecording() {
@@ -2259,10 +2301,6 @@ void App::TrayMenu() {
             else
                 StopRecording();
             break;
-        case 3:
-            if (!ConfirmQuit()) break;
-            quitting_ = true;
-            DestroyWindow(hwnd_);
-            break;
+        case 3: AskQuit(false, [this] { PostMessageW(hwnd_, WM_APP_QUIT, 0, 0); }); break;
     }
 }

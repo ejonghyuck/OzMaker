@@ -144,7 +144,10 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
                 std::wstring aerr, merr;
                 bool sound = vo.sound, mic = vo.mic;
                 // A source that fails is left out; never a different source in its place.
-                auto src = vo.processAudio ? AudioCapture::Source::Process : AudioCapture::Source::System;
+                // The whole output, but without OzMaker's own sounds (the start and pause cues, the mic check).
+                auto src = vo.processAudio                           ? AudioCapture::Source::Process
+                           : AudioCapture::ProcessLoopbackSupported() ? AudioCapture::Source::Others
+                                                                      : AudioCapture::Source::System;
                 if (sound && !audio_.Start(src, vo.audioPid, vo.audio.sampleRate, startQpc_, mix_.Input(0), aerr))
                     sound = false;
                 if (!sound) mix_.Drop(0);

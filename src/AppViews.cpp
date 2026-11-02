@@ -42,8 +42,9 @@ void App::DrawFrame(Rect client) {
     // The files list takes all input while it is open; a click anywhere else closes it.
     if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
     if (rec_ != RecState::Idle) updateOpen_ = false;
-    const bool popover = filesOpen_ || updateOpen_;
-    if (popover) ui_.SetInputBlocked(true);
+    const bool modal = question_.has_value();
+    const bool popover = !modal && (filesOpen_ || updateOpen_);
+    if (popover || modal) ui_.SetInputBlocked(true);
     Rect r = client;
     DrawHeader(r.CutTop(60));
     r = r.Inset(20, 0);
@@ -64,9 +65,63 @@ void App::DrawFrame(Rect client) {
             DrawUpdatePopover(client);
         ui_.EndFloat();
     }
+    if (modal) {
+        ui_.SetInputBlocked(false);
+        ui_.BeginFloat();
+        DrawQuestion(client);
+        ui_.EndFloat();
+    }
     ui_.BeginFloat();
     DrawToast(client);
     ui_.EndFloat();
+}
+
+void App::DrawQuestion(Rect client) {
+    const auto& in = ui_.In();
+    const Question& q = *question_;
+    const float a = ui_.AnimFrom(HashId("ask", questionSeq_), 1.f, 0.f, 18.f);
+    ui_.Fill(client, WithAlpha(Black, 0.55f * a));
+    const float W = std::min(440.f, client.W() - 40), pad = 22, iconW = 40;
+    TextStyle body;
+    body.wrap = true;
+    body.v = AlignStart;
+    float bodyH = 20;
+    DWRITE_TEXT_METRICS m{};
+    if (auto lay = Fonts::Layout(q.body, 13.f, body, W - pad * 2 - iconW, 1000); lay && SUCCEEDED(lay->GetMetrics(&m)))
+        bodyH = std::ceil(m.height);
+    const float H = pad + 26 + 6 + bodyH + 24 + 38 + pad;
+    Rect box = Rect::Centered(client.CX(), client.CY() - 24 + (1 - a) * 10, W, H);
+    ui_.Fill(box.Offset(0, 8), WithAlpha(Black, 0.45f * a), 16);
+    ui_.Fill(box, WithAlpha(Surface2, a), 14);
+    ui_.Stroke(box.Inset(0.5f), WithAlpha(BorderStrong, a), 14);
+    Rect c = box.Inset(pad);
+    const D2D1_COLOR_F tint = q.danger ? RecHi : Accent;
+    Rect mark = Rect::XYWH(c.l, c.t - 2, 30, 30);
+    ui_.Circle(mark.CX(), mark.CY(), 15, WithAlpha(tint, 0.18f * a));
+    ui_.Icon(mark, q.danger ? icon::Warning : icon::Check, 14.f, WithAlpha(tint, a));
+    Rect text(c.l + iconW, c.t, c.r, c.b);
+    ui_.Text(text.CutTop(26), q.title, 15.f, WithAlpha(TextColor, a), Bold());
+    text.CutTop(6);
+    ui_.Text(text.CutTop(bodyH), q.body, 13.f, WithAlpha(TextDim, a), body);
+
+    Rect btns = c.CutBottom(38);
+    const float yesW = std::max(96.f, ui_.Measure(q.yes, 13.f, kSemibold) + 40);
+    Rect yes = btns.CutRight(yesW);
+    btns.CutRight(8);
+    Rect no = btns.CutRight(88);
+    bool said = ui_.Button(HashId("ask.yes"), yes, q.yes, q.danger ? BtnStyle::Danger : BtnStyle::Primary, 0, true,
+                           13.f) ||
+                in.Key(VK_RETURN);
+    bool not_ = ui_.Button(HashId("ask.no"), no, L"취소", BtnStyle::Secondary, 0, true, 13.f) ||
+                in.Key(VK_ESCAPE) || (in.pressed && !box.Contains(in.mx, in.my));
+    if (said) {
+        answer_ = std::move(question_->onYes);
+        question_.reset();
+        PostMessageW(hwnd_, WM_APP_ANSWER, 0, 0);
+    } else if (not_) {
+        question_.reset();
+    }
+    if (said || not_) Invalidate();
 }
 
 void App::DrawHeader(Rect r) {
@@ -950,7 +1005,7 @@ void App::DrawEditor(Rect r) {
         hasResult_ = false;
     }
     if (in.Key(VK_ESCAPE)) cropMode_ = false;
-    if (in.Key(VK_DELETE) && CanDiscard()) discardAsked_ = true;
+    if (in.Key(VK_DELETE) && CanDiscard()) ConfirmDiscard();
 
     if (playing_) playhead_ = PlayheadFromClock();
     playhead_ = std::clamp(playhead_, (size_t)0, count - 1);
@@ -1460,7 +1515,7 @@ void App::DrawExportPanel(Rect r) {
             saveAs.CutRight(8);
             UiId id = HashId("ex.discard");
             if (ui_.Button(id, discard, video ? L"삭제" : L"버리기", BtnStyle::Secondary, icon::Delete, true, 13.f))
-                discardAsked_ = true;
+                ConfirmDiscard();
             ui_.Tooltip(id, discard, video ? L"이 동영상을 휴지통으로 옮기고 홈으로 갑니다 (Delete)"
                                            : L"이 녹화를 버리고 홈으로 갑니다 (Delete)");
         }
@@ -1774,7 +1829,7 @@ void App::SettingsVideo(Rect& area, bool& changed) {
 void App::SettingsAudio(Rect& area, bool& changed) {
     SettingRow(area, L"소리 녹음",
                AudioCapture::ProcessLoopbackSupported()
-                   ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리"
+                   ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리(OzMaker 알림음은 빼고)"
                    : L"전체 화면 · 영역: 시스템 전체 소리 · 창 캡처는 Windows 10 2004 이상에서만 녹음됩니다",
                60, [&](Rect c) {
                    changed |= ui_.Toggle(HashId("set.audio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.audio);
@@ -1824,7 +1879,8 @@ void App::SettingsAudio(Rect& area, bool& changed) {
     });
     const bool testing = micTest_.Running() || micTestShow_ >= 0;
     SettingRow(area, L"마이크 확인",
-               testing ? L"말해 보세요 · 녹음하지 않습니다 · 10초 뒤 저절로 멈춥니다"
+               testing ? (settings_.micMonitor ? L"말해 보세요 · 내 목소리가 들립니다 · 녹음하지 않습니다 · 10초 뒤 멈춥니다"
+                                               : L"말해 보세요 · 녹음하지 않습니다 · 10초 뒤 저절로 멈춥니다")
                        : L"누르는 동안 마이크를 잠시 열어 소리 크기를 보여 줍니다 · 녹음하지 않습니다",
                300, [&](Rect c) {
                    Rect btn = c.CutRight(84);
@@ -1844,6 +1900,15 @@ void App::SettingsAudio(Rect& area, bool& changed) {
                        Rect s = Rect::XYWH(w0 + i * (w + gap), c.CY() - h / 2, w, h);
                        D2D1_COLOR_F on = i >= n - 2 ? Rec : i >= n - 5 ? Warning : Success;
                        ui_.Fill(s, testing && level >= (i + 0.5f) / n ? on : Surface3, 2);
+                   }
+               });
+    SettingRow(area, L"확인할 때 내 목소리 듣기",
+               L"테스트하는 동안 마이크 소리를 바로 들려줍니다 · 스피커로 들으면 소리가 되울릴 수 있으니 이어폰을 쓰세요",
+               60, [&](Rect c) {
+                   if (ui_.Toggle(HashId("set.micMon"), Rect::Centered(c.r - 22, c.CY(), 44, 24),
+                                  settings_.micMonitor)) {
+                       changed = true;
+                       SyncMicMonitor();
                    }
                });
 
