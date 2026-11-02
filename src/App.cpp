@@ -413,6 +413,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kTimerRec) {
                 if (rec_ == RecState::Recording) {
+                    // A window recorded through the monitor (fullscreen game) never closes its capture item.
+                    if (recTarget_.source == kSourceWindow && !IsWindow(recTarget_.hwnd)) {
+                        StopRecording();
+                        return 0;
+                    }
                     overlay_.Update(capture_.Elapsed(), capture_.Frames());
                     if (IsWindowVisible(hwnd_)) Invalidate();
                 }
