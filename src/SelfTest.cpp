@@ -795,8 +795,10 @@ int App::RunScreenshots(const std::wstring& dir) {
     for (int i = 0; i < kTabCount; ++i) {
         settings_.settingsTab = i;
         settingsScroll_ = 0;
+        micTestShow_ = i == kTabAudio ? 0.6f : -1;  // the mic check running, on a made-up level
         shot(tabShots[i], 96);
     }
+    micTestShow_ = -1;
     settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));

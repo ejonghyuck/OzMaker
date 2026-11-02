@@ -1774,7 +1774,10 @@ void App::SettingsAudio(Rect& area, bool& changed) {
     SettingRow(area, L"마이크 장치", micDesc, 300, [&](Rect c) {
         UiId id = HashId("set.micDevice");
         bool hov = ui_.Hover(c);
-        if (ui_.Click(id, c)) changed |= MicMenu(c);
+        if (ui_.Click(id, c) && MicMenu(c)) {
+            changed = true;
+            if (micTest_.Running()) StartMicTest();  // now on the new device
+        }
         ui_.Fill(c, hov ? Surface3 : Surface2, 8);
         ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
         Rect t(c.l + 12, c.t, c.r - 30, c.b);
@@ -1795,6 +1798,30 @@ void App::SettingsAudio(Rect& area, bool& changed) {
         st.tabular = true;
         ui_.Text(label, util::Format(L"%d%%", settings_.micVolume), 13.f, TextColor, st);
     });
+    const bool testing = micTest_.Running() || micTestShow_ >= 0;
+    SettingRow(area, L"마이크 확인",
+               testing ? L"말해 보세요 · 녹음하지 않습니다 · 10초 뒤 저절로 멈춥니다"
+                       : L"누르는 동안 마이크를 잠시 열어 소리 크기를 보여 줍니다 · 녹음하지 않습니다",
+               300, [&](Rect c) {
+                   Rect btn = c.CutRight(84);
+                   if (ui_.Button(HashId("set.micTest"), btn.Inset(0, 4), testing ? L"그만" : L"테스트",
+                                  BtnStyle::Secondary, testing ? icon::Stop : 0, !micDevices_.empty(), 13.f) &&
+                       micTestShow_ < 0) {
+                       if (testing)
+                           StopMicTest();
+                       else
+                           StartMicTest();
+                   }
+                   // 16 steps over -60..0 dB: green, then yellow from -19 dB, red from -7.5 dB.
+                   const int n = 16;
+                   const float gap = 3, h = 14, w0 = c.l + 4, w = (c.W() - 16 - gap * (n - 1)) / n;
+                   const float level = micTestShow_ >= 0 ? micTestShow_ : micLevel_;
+                   for (int i = 0; i < n; ++i) {
+                       Rect s = Rect::XYWH(w0 + i * (w + gap), c.CY() - h / 2, w, h);
+                       D2D1_COLOR_F on = i >= n - 2 ? Rec : i >= n - 5 ? Warning : Success;
+                       ui_.Fill(s, testing && level >= (i + 0.5f) / n ? on : Surface3, 2);
+                   }
+               });
 
     SettingRow(area, L"오디오 비트레이트", L"AAC · 160 kbps면 게임 · 음악 모두 충분합니다", 260, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.abr"), c, {L"96", L"128", L"160", L"192"}, settings_.aBitrateIdx);

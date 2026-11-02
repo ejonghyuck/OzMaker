@@ -38,7 +38,7 @@ private:
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
-    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate };
+    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest };
     enum class RecState { Idle, Countdown, Recording };
     enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
 
@@ -338,6 +338,14 @@ private:
     bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
     std::vector<AudioCapture::Device> micDevices_;  // 설정 › 소리, listed when the tab is opened
     bool micListed_ = false;
+    // 설정 › 소리 "마이크 확인": the chosen mic opened for up to 10 s to show its level. Nothing is recorded.
+    void StartMicTest();
+    void StopMicTest();
+    std::atomic<float> micPeak_{0};  // loudest sample since the meter last looked, 0..1, before the mic volume
+    AudioCapture micTest_;           // after micPeak_: its thread writes there until it is destroyed
+    float micLevel_ = 0;             // the meter: 0..1 over -60..0 dB, falling back slowly
+    double micTestUntil_ = 0, micLevelAt_ = 0;
+    float micTestShow_ = -1;         // screenshots: a made-up level, no device opened
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;

@@ -578,6 +578,19 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                         if (settings_.sounds) sound::Play(sound::Cue::Tick);
                     }
                 }
+            } else if (w == kTimerMicTest) {
+                // Only while 설정 › 소리 is in front, and 10 s at most.
+                double now = util::NowSeconds();
+                if (screen_ != Screen::Settings || settings_.settingsTab != kTabAudio || !IsWindowVisible(hwnd_) ||
+                    IsIconic(hwnd_) || rec_ != RecState::Idle || now > micTestUntil_) {
+                    StopMicTest();
+                } else {
+                    float peak = std::min(1.f, micPeak_.exchange(0) * settings_.micVolume / 100.f);
+                    float pos = peak > 0 ? std::clamp((20 * std::log10(peak) + 60) / 60, 0.f, 1.f) : 0.f;
+                    micLevel_ = std::max(pos, micLevel_ - (float)(now - micLevelAt_) * 1.2f);
+                    micLevelAt_ = now;
+                    Invalidate();
+                }
             } else if (w == kTimerUpdate) {
                 SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
                 CheckForUpdate();
@@ -697,6 +710,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             fetcher_.Stop();
             ReleaseThumbnails();
             WatchWindows(false);
+            StopMicTest();
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
             TrayRemove();
@@ -955,8 +969,39 @@ void App::ReportError(const std::wstring& title, const std::wstring& text) {
     }
 }
 
+void App::StartMicTest() {
+    StopMicTest();
+    micPeak_ = 0;
+    micLevel_ = 0;
+    std::wstring err;
+    auto sink = [this](const int16_t* pcm, size_t frames) {
+        int peak = 0;
+        for (size_t i = 0; i < frames * 2; ++i) peak = std::max(peak, std::abs((int)pcm[i]));
+        float v = peak / 32768.f, old = micPeak_.load();
+        while (v > old && !micPeak_.compare_exchange_weak(old, v)) {
+        }
+    };
+    if (!micTest_.Start(AudioCapture::Source::Mic, 0, 48000, util::Qpc100ns(), sink, err, settings_.micDevice)) {
+        Toast(err, true);
+        return;
+    }
+    micTestUntil_ = util::NowSeconds() + 10;
+    micLevelAt_ = util::NowSeconds();
+    SetTimer(hwnd_, kTimerMicTest, 33, nullptr);
+    Invalidate();
+}
+
+void App::StopMicTest() {
+    if (!micTest_.Running()) return;
+    KillTimer(hwnd_, kTimerMicTest);
+    micTest_.Stop(0);
+    micLevel_ = 0;
+    Invalidate();
+}
+
 void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     if (rec_ != RecState::Idle) return;
+    StopMicTest();  // the recording opens the mic itself
     recFromHotkey_ = fromHotkey;
     if (exporter_.Busy()) {
         if (fromHotkey)
