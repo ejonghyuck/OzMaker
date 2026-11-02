@@ -1,0 +1,64 @@
+# Full build with WebP and AVIF (vcpkg on the runner), self-test, and the distribution zip.
+# A v* tag publishes the zip as a GitHub release; a manual run only uploads it as an artifact.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          "commit=$(git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\vcpkg-cache" | Out-Null
+
+      # aom takes a long time to compile; keep vcpkg's built packages between runs.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-cache
+          key: vcpkg-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('vcpkg.json', 'triplets/**') }}
+          restore-keys: vcpkg-${{ steps.vcpkg.outputs.commit }}-
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:RUNNER_TEMP\vcpkg-cache"
+          msbuild OzMaker.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Self-test
+        shell: pwsh
+        run: ./tools/ci-selftest.ps1 -Require GIF,WebP,AVIF
+
+      - name: Package
+        shell: pwsh
+        run: ./tools/package.ps1 -NoBuild
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OzMaker
+          path: dist/*.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          # --notes is prepended to the generated list of changes.
+          $notes = Get-Content .github/release-notes.md -Raw -Encoding utf8
+          gh release create $env:GITHUB_REF_NAME $zip.FullName --title "OzMaker $env:GITHUB_REF_NAME" --notes $notes --generate-notes
