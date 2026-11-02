@@ -92,6 +92,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--test-window") return RunTestWindow(_wtof(args[1].c_str()));
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
@@ -183,7 +184,7 @@ bool App::CreateMainWindow(int show) {
                     util::HotkeyToString(settings_.hkMods, settings_.hkVk) +
                         L"을(를) 다른 프로그램이 쓰고 있습니다. 설정에서 다른 조합을 지정하세요.");
     RefreshWindows();
-    SetTimer(hwnd_, kTimerRefresh, 2500, nullptr);
+    WatchWindows(true);
     if (restored && settings_.windowMax && show != SW_HIDE && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE)
         show = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd_, show);
@@ -581,6 +582,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
                 CheckForUpdate();
             } else if (w == kTimerRefresh) {
+                // Otherwise Home refreshes when it is shown or activated again.
+                KillTimer(hwnd_, kTimerRefresh);
+                windowsDirty_ = false;
                 if (screen_ == Screen::Home && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && !picker_.Active() &&
                     !regionPicker_.Active())
                     RefreshWindows();
@@ -692,6 +696,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             audioPreview_.Stop();
             fetcher_.Stop();
             ReleaseThumbnails();
+            WatchWindows(false);
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
             TrayRemove();
@@ -717,6 +722,41 @@ void App::RefreshWindows() {
     }
     monitors_ = EnumerateMonitors();
     Invalidate();
+}
+
+namespace {
+App* g_watcher = nullptr;  // the App whose window list the WinEvent hooks keep current
+}
+
+// Other programs' windows appearing, closing, renaming, moving or minimizing refresh the window list, instead of
+// polling it. Out of context: the callbacks come in through this thread's message loop.
+void App::WatchWindows(bool on) {
+    for (HWINEVENTHOOK h : winHooks_) UnhookWinEvent(h);
+    winHooks_.clear();
+    g_watcher = on ? this : nullptr;
+    if (!on) return;
+    const std::pair<DWORD, DWORD> ranges[] = {
+        {EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE},          // destroy, show, hide
+        {EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE},  // title
+        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED},      // other virtual desktops, suspended UWP apps
+        {EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND},
+        {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
+    };
+    for (auto [from, to] : ranges)
+        if (HWINEVENTHOOK h = SetWinEventHook(from, to, nullptr, OnWinEvent, 0, 0,
+                                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS))
+            winHooks_.push_back(h);
+}
+
+void CALLBACK App::OnWinEvent(HWINEVENTHOOK, DWORD event, HWND h, LONG obj, LONG child, DWORD, DWORD) {
+    App* self = g_watcher;
+    if (!self || !h || obj != OBJID_WINDOW || child != CHILDID_SELF) return;
+    // A top-level window that may join the list, or one already in it.
+    bool appears = event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED;
+    if (appears ? GetAncestor(h, GA_ROOT) != h : !self->FindWindowInfo(h)) return;
+    if (self->windowsDirty_) return;
+    self->windowsDirty_ = true;
+    SetTimer(self->hwnd_, kTimerRefresh, 400, nullptr);
 }
 
 void App::SelectTarget(HWND h) {

@@ -98,6 +98,8 @@ private:
 
     // ---- sources
     void RefreshWindows();
+    void WatchWindows(bool on);
+    static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND h, LONG obj, LONG child, DWORD, DWORD);
     void SelectTarget(HWND h);
     const WinInfo* FindWindowInfo(HWND h) const;
     void SetSource(int source);
@@ -193,6 +195,7 @@ private:
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
+    int RunTestWindow(double seconds);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
@@ -329,6 +332,8 @@ private:
 
     int capturingHotkey_ = 0;  // the hotkey being chosen in the settings
     bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
+    std::vector<HWINEVENTHOOK> winHooks_;
+    bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;

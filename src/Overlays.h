@@ -11,6 +11,12 @@ public:
     HWND Hwnd() const { return hwnd_; }
     // rect in physical screen pixels; draw in DIPs (scale = DPI / 96). move=false keeps the current position.
     void Render(const RECT& rect, float scale, bool move, const std::function<void(Painter&)>& draw);
+    // Redraws only `dirty` (surface pixels) over what Render left, at the same place and scale. draw gets each
+    // pass's area in DIPs, to skip what lies outside it.
+    void RenderDirty(float scale, const std::vector<RECT>& dirty,
+                     const std::function<void(Painter&, const Rect&)>& draw);
+    bool HasSurface(int w, int h) const { return dib_ && rt_ && w == w_ && h == h_; }
+    const uint32_t* Bits() const { return bits_; }  // the surface, premultiplied BGRA, top-down
 
 private:
     bool EnsureSurface(int w, int h);
@@ -18,9 +24,10 @@ private:
     ID2D1Factory1* factory_ = nullptr;
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr, oldBmp_ = nullptr;
+    const uint32_t* bits_ = nullptr;
     int w_ = 0, h_ = 0;
-    ComPtr<ID2D1DCRenderTarget> rt_;
-    Painter painter_;
+    ComPtr<ID2D1DCRenderTarget> rt_, soft_;  // soft_: RenderDirty's
+    Painter painter_, softPainter_;
 };
 
 // "REC 0:12.3 ■" pill pinned to what is being recorded, the pre-roll countdown and, for screen regions, a thin
@@ -109,8 +116,30 @@ public:
     // Screenshot tests: paint a mid-drag state over `screen` (virtual-screen pixels) without a window, or with
     // `adjust` the selection anchor..cursor being fine-tuned.
     void PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, bool adjust = false);
+    // Tests: redraws everything and counts the pixels that differ from what the partial redraws left.
+    size_t StalePixels();
+    void RedrawAll() {
+        full_ = true;
+        Redraw();
+    }
+    struct Stats {
+        int full = 0, partial = 0;
+        double fullSec = 0, partialSec = 0;
+        long long partialPx = 0;
+    };
+    const Stats& RedrawStats() const { return stats_; }
+    void ResetStats() { stats_ = {}; }
 
 private:
+    // Where Paint puts things, in DIPs from the virtual screen's top-left.
+    struct Layout {
+        float scale = 1, vw = 0, vh = 0;
+        bool hole = false, adjust = false, lines = false;
+        RECT area{};  // the hole, screen pixels
+        Rect r, label, bar, slots[7], pill;
+        float tw = 0, cx = 0, cy = 0;  // title width, cursor
+        std::wstring title, dims, msg, hint;
+    };
     static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT Handle(HWND, UINT, WPARAM, LPARAM);
     void OnMove(POINT screen);
@@ -124,7 +153,11 @@ private:
     RECT Selection() const;
     RECT HoverArea() const;
     void Redraw();
-    void Paint(Painter& p, float scale);
+    Layout Arrange(float scale) const;
+    void Paint(Painter& p, const Layout& L, const Rect& clip);
+    std::vector<RECT> Marks(const Layout& L) const;
+    RECT ToSurface(const Rect& r, float scale) const;
+    RECT ToScreen(const Rect& r, float scale) const;
 
     HINSTANCE inst_ = nullptr;
     ID2D1Factory1* factory_ = nullptr;
@@ -145,4 +178,7 @@ private:
     RECT buttons_[7]{};  // toolbar in screen pixels: five ratios, cancel, confirm
     float scale_ = 1;
     DWORD lastClick_ = 0;
+    Layout last_;        // what is on screen
+    bool full_ = true;   // the next Redraw draws everything
+    Stats stats_;
 };

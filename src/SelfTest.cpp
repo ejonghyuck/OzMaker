@@ -8,7 +8,9 @@
 //   --video-test <dir> [w h]              synthetic MP4 -> frame index/decoding -> trimmed MP4/GIF exports, checked
 //                                         frame by frame and by the audio tone boundaries; editor screenshots
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
-//   --preview-test <dir>                  the live window preview on screen, with the files list open over it
+//   --preview-test <dir>                  the live window preview on screen, with the files list open over it;
+//                                         the window list following another process's window
+//   --test-window <sec>                   a pattern window in a process of its own (for --preview-test)
 //   --update-test <dir> [url|github]      the updater on a fake release folder (also part of --selftest); url: the
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
@@ -1645,9 +1647,9 @@ int App::RunRegionTest(const std::wstring& dir) {
             Sleep(5);
         }
     };
-    auto start = [&] {
+    auto start = [&](std::vector<WinInfo> cands = {}) {
         done = ok = false;
-        regionPicker_.Start({}, [&](bool o, RECT r) {
+        regionPicker_.Start(std::move(cands), [&](bool o, RECT r) {
             done = true;
             ok = o;
             got = r;
@@ -1676,16 +1678,31 @@ int App::RunRegionTest(const std::wstring& dir) {
         return r.left - ox == l && r.top - oy == t && r.right - ox == rr && r.bottom - oy == b;
     };
 
+    // Mouse moves redraw only what changed; that must leave the same pixels as drawing everything.
+    auto stale = [&](const wchar_t* what) {
+        size_t n = regionPicker_.StalePixels();
+        check(n == 0, util::Format(L"%s: %zu pixel(s) differ from a full redraw", what, n));
+    };
+
     start();
+    for (int i = 0; i < 6; ++i) post(WM_MOUSEMOVE, 300 + i * 37, 200 + i * 23);
+    pump(0.08);
+    stale(L"guide lines");
     drag(200, 150, 1000, 600);
     RECT s = regionPicker_.AdjustedArea();
     check(!done && regionPicker_.Adjusting() && is(s, 200, 150, 1001, 601), L"drag, then adjusting: " + rel(s));
+    stale(L"after the drag");
     drag(600, 375, 700, 425);
     s = regionPicker_.AdjustedArea();
     check(is(s, 300, 200, 1101, 651), L"move by 100,50: " + rel(s));
+    stale(L"after the move");
     drag(1101, 651, 1151, 681);
     s = regionPicker_.AdjustedArea();
     check(is(s, 300, 200, 1151, 681), L"bottom-right handle +50,+30: " + rel(s));
+    post(WM_MOUSEMOVE, 1151, 681);
+    post(WM_MOUSEMOVE, 700, 500);
+    pump(0.08);
+    stale(L"handle hover");
     RECT b = regionPicker_.ToolbarButton(3);  // 16:9
     post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
     post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
@@ -1702,6 +1719,7 @@ int App::RunRegionTest(const std::wstring& dir) {
     k = (s.right - s.left) / (double)(s.bottom - s.top);
     check(s.left - ox == 300 && s.right - ox == 951 && std::fabs(k - 16.0 / 9) < 0.01,
           util::Format(L"right edge drag keeps 16:9 (%.4f): ", k) + rel(s));
+    stale(L"after the ratio drags");
     RECT before = s;
     key(VK_RIGHT);
     s = regionPicker_.AdjustedArea();
@@ -1718,6 +1736,38 @@ int App::RunRegionTest(const std::wstring& dir) {
     check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click (no window) takes the screen: " + rel(s));
     key(VK_ESCAPE);
     check(done && !ok && !regionPicker_.Active(), L"Esc cancels");
+
+    // Hovering windows (made up here, not the user's): the area and its label follow the one under the cursor.
+    WinInfo wa, wb;
+    wa.title = L"OzMaker Test Window";
+    wa.frame = {ox + 100, oy + 120, ox + 700, oy + 520};
+    wb.title = L"OzMaker Test Window 2";
+    wb.frame = {ox + 900, oy + 200, ox + 1300, oy + 640};
+    start({wa, wb});
+    // First onto this monitor: a move to a monitor of another scale draws everything (on the GPU).
+    post(WM_MOUSEMOVE, 800, 700);
+    post(WM_MOUSEMOVE, 300, 300);
+    pump(0.05);
+    stale(L"hovering a window");
+    post(WM_MOUSEMOVE, 1000, 400);
+    post(WM_MOUSEMOVE, 1010, 410);
+    pump(0.05);
+    stale(L"hovering another window");
+    post(WM_MOUSEMOVE, 800, 700);
+    pump(0.05);
+    stale(L"hovering nothing");
+    regionPicker_.ResetStats();
+    for (int i = 0; i < 40; ++i) post(WM_MOUSEMOVE, 760 + i * 5, 650 + i * 3);
+    pump(0.3);
+    for (int i = 0; i < 5; ++i) regionPicker_.RedrawAll();
+    const auto& st = regionPicker_.RedrawStats();
+    double vpx = (double)GetSystemMetrics(SM_CXVIRTUALSCREEN) * GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    log(util::Format(L"redraws: %d partial, %.2f ms each, %.2f%% of the screen; %d full, %.2f ms each", st.partial,
+                     st.partial ? st.partialSec * 1000 / st.partial : 0.0,
+                     st.partial ? st.partialPx * 100.0 / st.partial / vpx : 0.0, st.full,
+                     st.full ? st.fullSec * 1000 / st.full : 0.0));
+    check(st.partial >= 40, util::Format(L"guide line moves redraw in part (%d of 40)", st.partial));
+    key(VK_ESCAPE);
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -1865,6 +1915,27 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
 // The live window preview as DWM shows it. A window of colour blocks is picked and the files list opened over the
 // preview: on screen (our window only, kept on top) the list must show where it is and the window everywhere else,
 // with the title bar hidden and shown, and closing the list must bring back the whole preview.
+int App::RunTestWindow(double seconds) {
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = PatternProc;
+    wc.hInstance = inst_;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"OzMakerTestPattern";
+    RegisterClassExW(&wc);
+    HWND h = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"OzMaker Test Window 2", WS_OVERLAPPEDWINDOW, 60, 60,
+                             420, 260, nullptr, nullptr, inst_, nullptr);
+    if (!h) return 1;
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    double end = util::NowSeconds() + seconds;
+    while (util::NowSeconds() < end) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, 0);
+    }
+    DestroyWindow(h);
+    return 0;
+}
+
 int App::RunUpdateTest(const std::wstring& dir, const std::wstring& base) {
     util::EnsureDir(dir);
     Log log(dir + L"\\updatetest.log");
@@ -2038,6 +2109,36 @@ int App::RunPreviewTest(const std::wstring& dir) {
     recentFiles_.clear();
     target_ = nullptr;
     DestroyWindow(pattern);
+
+    // The window list follows other programs' windows as they come and go, without polling. The hooks skip our
+    // own process, so the window comes from a second OzMaker.
+    {
+        auto listed = [&] {
+            for (const WinInfo& w : windows_)
+                if (w.title == L"OzMaker Test Window 2") return true;
+            return false;
+        };
+        std::wstring cmd = L"\"" + util::ExePath() + L"\" --test-window 2.5";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            double t0 = util::NowSeconds(), seen = -1, gone = -1;
+            while (util::NowSeconds() - t0 < 8 && gone < 0) {
+                pump(0.05);
+                bool in = listed();
+                if (in && seen < 0) seen = util::NowSeconds() - t0;
+                if (!in && seen >= 0) gone = util::NowSeconds() - t0;
+            }
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            // It starts (a second or so) and stays 2.5 s: listed well before a 2.5 s poll would, gone after.
+            check(seen >= 0 && seen < 2.5 && gone > seen + 2,
+                  util::Format(L"window list: another process's window listed at %.2fs, gone at %.2fs", seen, gone));
+        } else {
+            check(false, L"window list: can't start --test-window");
+        }
+    }
     quitting_ = true;
     DestroyWindow(hwnd_);
     pump(1.0);

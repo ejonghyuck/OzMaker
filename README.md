@@ -127,7 +127,7 @@ OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간�
 OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계) 검사
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장
 OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드)
-OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지
+OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지, 다른 프로그램 창이 목록에 바로 반영되는지
 OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업데이트 확인 → 받기 → 검증 → 교체(--selftest에도 포함)
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```
