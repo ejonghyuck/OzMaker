@@ -122,6 +122,19 @@ void ShellOpen(const std::wstring& path) {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// Where a drive has no Recycle Bin (some network and USB drives), Windows asks before it deletes for good.
+bool MoveToRecycleBin(HWND owner, const std::wstring& path) {
+    std::wstring from = path;
+    from.push_back(L'\0');  // a list, ended by two nulls
+    SHFILEOPSTRUCTW op{};
+    op.hwnd = owner;
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT;
+    if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) return false;
+    return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+}
+
 bool CopyFileToClipboard(HWND owner, const std::wstring& path) {
     // CF_HDROP: pasting into Explorer, Discord, messengers etc. pastes the file itself.
     size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);

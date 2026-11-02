@@ -27,6 +27,7 @@ uint64_t FreeBytes(const std::wstring& dir);  // free space on its drive for thi
 void OpenFolderAndSelect(const std::wstring& path);
 void ShellOpen(const std::wstring& path);
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
+bool MoveToRecycleBin(HWND owner, const std::wstring& path);  // false if the file is still there
 bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name,
                   const wchar_t* ext, const wchar_t* filterName, std::wstring& out);

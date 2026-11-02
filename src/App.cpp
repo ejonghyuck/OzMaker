@@ -239,6 +239,7 @@ void App::Render() {
     ApplyThumbnail();
     SyncAudioPreview();
     RequestWake(ui_.WakeAt());
+    if (std::exchange(discardAsked_, false)) ConfirmDiscard();
     if (settingsDirty_ && !input_.down) {
         settings_.Save();
         settingsDirty_ = false;
@@ -1577,6 +1578,55 @@ void App::CloseEditor() {
     SyncAudioPreview();
     DetachReaders();
     RefreshWindows();
+}
+
+// The editor's 버리기 (a 움짤 recording) and 삭제 (the video just recorded, into the Recycle Bin). Only what this run
+// recorded: a video opened by hand gets no button. Files exported from the recording stay.
+bool App::CanDiscard() const {
+    if (!clip_ || exporter_.Busy()) return false;
+    const std::wstring& src = clip_->SourcePath();
+    return src.empty() || (!lastVideo_.path.empty() && _wcsicmp(src.c_str(), lastVideo_.path.c_str()) == 0);
+}
+
+void App::ConfirmDiscard() {
+    if (!CanDiscard()) return;
+    SetPlaying(false);
+    bool held = std::any_of(held_.begin(), held_.end(), [&](const HeldClip& h) { return h.clip == clip_; });
+    std::wstring msg = !clip_->SourcePath().empty()
+                           ? L"이 동영상을 휴지통으로 옮길까요?\n\n" + util::FileNameOf(clip_->SourcePath()) +
+                                 L"\n\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."
+                       : held ? L"이 녹화를 버릴까요?\n아직 저장하지 않아서 되돌릴 수 없습니다."
+                              : L"이 녹화를 버릴까요?\n저장한 파일은 그대로 남습니다.";
+    if (MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+        DiscardRecording();
+}
+
+void App::DiscardRecording() {
+    if (!CanDiscard()) return;
+    const std::wstring path = clip_->SourcePath();
+    CloseEditor();
+    StopThumbnails();
+    if (!path.empty()) {
+        // Nothing may hold the file: the readers went with the editor; a size estimate in flight gets a moment.
+        for (double until = util::NowSeconds() + 3; estimator_.Busy() && util::NowSeconds() < until;) Sleep(10);
+        bool gone = testDeleteFiles_ ? DeleteFileW(path.c_str()) != 0 : util::MoveToRecycleBin(hwnd_, path);
+        if (!gone) {
+            AttachReaders();
+            screen_ = Screen::Editor;
+            Toast(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.", true);
+            Invalidate();
+            return;
+        }
+        showVideo_ = false;
+        lastVideo_ = {};
+        RefreshRecent();
+    }
+    DropHeld(clip_.get());
+    clip_.reset();
+    frameBmp_.Reset();
+    hasResult_ = resultOriginal_ = false;
+    Toast(path.empty() ? L"녹화를 버렸습니다." : L"휴지통으로 옮겼습니다 · " + util::FileNameOf(path));
+    Invalidate();
 }
 
 void App::AttachReaders() {

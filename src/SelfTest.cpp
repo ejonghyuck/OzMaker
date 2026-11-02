@@ -4,7 +4,7 @@
 //   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause] [mic] [click]
 //                                         records a real window (or its monitor / its area) and exports it
 //   --analyze <file.mp4> <dir> [freq ...] decodes an MP4: timing, size, test-tone levels
-//   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export
+//   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export -> 삭제
 //   --video-test <dir> [w h]              synthetic MP4 -> frame index/decoding -> trimmed MP4/GIF exports, checked
 //                                         frame by frame and by the audio tone boundaries; editor screenshots
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
@@ -648,6 +648,18 @@ int App::RunSelfTest(const std::wstring& dir) {
         std::vector<int16_t> full{1234, -1234};
         AudioPreview::Scale(full.data(), 1, 1.f, 1.f);
         vcheck(full[0] == 1234 && full[1] == -1234, L"100 % leaves the samples alone");
+    }
+    // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
+    {
+        auto clip = MakeSyntheticClip(320, 180, 10, 30);
+        size_t before = held_.size();
+        HoldRecording(clip);
+        OpenEditor(clip);
+        bool can = CanDiscard();
+        DiscardRecording();
+        bool ok = can && !clip_ && held_.size() == before && screen_ == Screen::Home && clip.use_count() == 1;
+        if (!ok) ++failures;
+        log(util::Format(L"discard: %s an unsaved recording goes from the editor", ok ? L"ok  " : L"FAIL"));
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
@@ -1733,12 +1745,14 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     lastResult_.ok = true;
     lastResult_.path = src;
     lastResult_.bytes = util::FileSize(src);
+    lastVideo_.path = src;  // as if just recorded: 삭제 shows
     shot(L"editor_video_saved.png");
     settings_.speedIdx = 3;
     hasResult_ = false;
     shot(L"editor_video_fast.png");
     settings_.speedIdx = 1;
     settings_.previewVolume = 100;
+    lastVideo_ = {};
     CloseEditor();
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
@@ -2088,6 +2102,26 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         ReleaseDC(nullptr, screen);
         SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         log(L"home card with a window preview: home_card.png");
+    }
+    // 삭제 in the editor (#37), on a copy: the video just recorded goes with its home card (the test deletes it
+    // outright instead of filling the Recycle Bin); a video opened by hand gets no button.
+    std::wstring copy = dir + L"\\delete_test.mp4";
+    if (CopyFileW(path.c_str(), copy.c_str(), FALSE)) {
+        r.path = copy;
+        r.bytes = util::FileSize(copy);
+        OnVideoSaved(r);
+        pump(0.5);
+        check(screen_ == Screen::Editor && CanDiscard(), L"the video just recorded can be deleted in the editor");
+        testDeleteFiles_ = true;
+        DiscardRecording();
+        pump(0.2);
+        check(screen_ == Screen::Home && !clip_ && !showVideo_ &&
+                  GetFileAttributesW(copy.c_str()) == INVALID_FILE_ATTRIBUTES && util::FileSize(path) > 0,
+              L"삭제 removes the video and its card and goes home");
+        check(OpenVideo(path) && !CanDiscard(), L"a video opened by hand has no 삭제");
+        CloseEditor();
+    } else {
+        check(false, L"copy for the 삭제 check");
     }
     exporter_.Cancel();
     quitting_ = true;

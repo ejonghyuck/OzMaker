@@ -950,6 +950,7 @@ void App::DrawEditor(Rect r) {
         hasResult_ = false;
     }
     if (in.Key(VK_ESCAPE)) cropMode_ = false;
+    if (in.Key(VK_DELETE) && CanDiscard()) discardAsked_ = true;
 
     if (playing_) playhead_ = PlayheadFromClock();
     playhead_ = std::clamp(playhead_, (size_t)0, count - 1);
@@ -1452,6 +1453,17 @@ void App::DrawExportPanel(Rect r) {
         std::wstring label = std::wstring(FormatName(fmt)) + L"로 저장";
         if (ui_.Button(HashId("ex.save"), save, label, BtnStyle::Primary, icon::Save, avail, 15.f))
             StartExport(false);
+        // 버리기 / 삭제 (#37), for what this run recorded.
+        if (CanDiscard()) {
+            const bool video = !clip_->SourcePath().empty();
+            Rect discard = saveAs.CutRight(92);
+            saveAs.CutRight(8);
+            UiId id = HashId("ex.discard");
+            if (ui_.Button(id, discard, video ? L"삭제" : L"버리기", BtnStyle::Secondary, icon::Delete, true, 13.f))
+                discardAsked_ = true;
+            ui_.Tooltip(id, discard, video ? L"이 동영상을 휴지통으로 옮기고 홈으로 갑니다 (Delete)"
+                                           : L"이 녹화를 버리고 홈으로 갑니다 (Delete)");
+        }
         if (ui_.Button(HashId("ex.saveas"), saveAs, L"다른 이름으로 저장…", BtnStyle::Secondary, 0, avail, 13.f))
             StartExport(true);
     }

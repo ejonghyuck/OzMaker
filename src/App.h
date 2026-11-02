@@ -138,6 +138,9 @@ private:
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
     bool ConfirmQuit(bool restart = false);  // asks about unsaved recordings, if any
+    bool CanDiscard() const;  // the editor's 버리기 / 삭제: a recording from this run, nothing exporting
+    void ConfirmDiscard();
+    void DiscardRecording();
 
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
@@ -267,6 +270,7 @@ private:
     uint32_t playEpoch_ = 0, audioEpoch_ = 0;  // bumped whenever the preview clock jumps
     AudioPreview audioPreview_;
     bool previewMute_ = false;
+    bool discardAsked_ = false;  // 버리기 / 삭제 or the Delete key: asked after the frame, the dialog being modal
     int fmt_ = 0;  // export format (Format)
     bool exportAudio_ = true;
     RECT crop_{};
@@ -320,6 +324,7 @@ private:
     double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
     uint64_t exportEstimate_ = 0;
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
+    bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
 
     Updater updater_;
     bool updateOpen_ = false;  // the popover under the update button
