@@ -155,6 +155,11 @@ double Capture::Elapsed() const { return running_ ? (util::Qpc100ns() - startQpc
 
 size_t Capture::Frames() const { return frames_.load(); }
 
+bool Capture::StoreFailed() const {
+    std::lock_guard lk(mtx_);
+    return store_ && store_->WriteFailed();
+}
+
 bool Capture::SourceRect(int cw, int ch, RECT& r) const {
     RECT full{0, 0, cw, ch};
     r = full;
@@ -261,6 +266,7 @@ bool Capture::Setup(int sw, int sh) {
         auto store = std::make_shared<FrameStore>();
         std::wstring err;
         if (!store->Open(w, h, err)) return false;
+        store->SetNominalFps(opt_.fps);
         store_ = std::move(store);
     }
     outW_ = w;

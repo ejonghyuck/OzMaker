@@ -157,6 +157,11 @@ bool App::CreateMainWindow(int show) {
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
     RegisterRecordHotkey();
+    TrayUpdate();
+    if (!hotkeyOk_)
+        TrayBalloon(L"녹화 단축키를 쓸 수 없습니다",
+                    util::HotkeyToString(settings_.hkMods, settings_.hkVk) +
+                        L"을(를) 다른 프로그램이 쓰고 있습니다. 설정에서 다른 조합을 지정하세요.");
     RefreshWindows();
     SetTimer(hwnd_, kTimerRefresh, 2500, nullptr);
     if (restored && settings_.windowMax && show != SW_HIDE && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE)
@@ -367,7 +372,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (capturingHotkey_) {
                 UINT vk = (UINT)w;
                 if (vk == VK_ESCAPE) {
-                    capturingHotkey_ = false;
+                    SetCapturingHotkey(false);
                 } else if (vk != VK_CONTROL && vk != VK_MENU && vk != VK_SHIFT && vk != VK_LWIN && vk != VK_RWIN) {
                     UINT mods = 0;
                     if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
@@ -375,13 +380,26 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     if (GetKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
                     if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
                     bool fkey = vk >= VK_F1 && vk <= VK_F24;
-                    if (mods || fkey || vk == VK_PAUSE || vk == VK_SCROLL) {
+                    if (fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) {
+                        UINT oldMods = settings_.hkMods, oldVk = settings_.hkVk;
                         settings_.hkMods = mods;
                         settings_.hkVk = vk;
-                        settings_.Save();
-                        capturingHotkey_ = false;
                         RegisterRecordHotkey();
-                        if (!hotkeyOk_) Toast(L"다른 프로그램이 이미 사용 중인 단축키입니다.", true);
+                        if (hotkeyOk_) {
+                            capturingHotkey_ = false;
+                            settings_.Save();
+                            TrayUpdate();
+                        } else {
+                            // Keep the previous key (registered again when capturing ends) and let them try another.
+                            UnregisterHotKey(hwnd_, 1);
+                            settings_.hkMods = oldMods;
+                            settings_.hkVk = oldVk;
+                            Toast(util::HotkeyToString(mods, vk) + L"은(는) 다른 프로그램이 쓰고 있습니다. 다른 조합을 눌러 주세요.",
+                                  true);
+                        }
+                    } else if (mods == MOD_SHIFT) {
+                        // Shift + a letter would swallow capital letters in every other program.
+                        Toast(L"Ctrl, Alt, Win 중 하나와 함께 누르세요. (F1~F12는 단독으로도 됩니다)", true);
                     }
                 }
                 Invalidate();
@@ -432,10 +450,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 1;
         case WM_ACTIVATE:
             if (LOWORD(w) != WA_INACTIVE && screen_ == Screen::Home) RefreshWindows();
+            if (LOWORD(w) == WA_INACTIVE) SetCapturingHotkey(false);  // keys go elsewhere now; keep the old one
             Invalidate();
             break;
         case WM_HOTKEY:
-            if (w == 1) OnHotkey();
+            if (w == 1 && !capturingHotkey_) OnHotkey();
             return 0;
         case WM_DISPLAYCHANGE:
             monitors_ = EnumerateMonitors();
@@ -445,7 +464,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (w == kTimerRec) {
                 if (rec_ == RecState::Recording) {
                     // A window recorded through the monitor (fullscreen game) never closes its capture item.
-                    if (recTarget_.source == kSourceWindow && !IsWindow(recTarget_.hwnd)) {
+                    if ((recTarget_.source == kSourceWindow && !IsWindow(recTarget_.hwnd)) || capture_.StoreFailed()) {
                         StopRecording();
                         return 0;
                     }
@@ -735,10 +754,29 @@ bool App::UseMonitorCapture(HWND target) const {
     return IsFullscreenWindow(target);  // fullscreen games capture most reliably through the display
 }
 
+// After a hotkey start with a fullscreen app in front, don't yank the user out of it: use the tray instead.
+bool App::NotifyQuietly() const {
+    HWND fg = GetForegroundWindow();
+    return recFromHotkey_ && fg && fg != hwnd_ && IsFullscreenWindow(fg);
+}
+
+void App::ReportError(const std::wstring& title, const std::wstring& text) {
+    if (NotifyQuietly()) {
+        TrayBalloon(title, text);
+    } else {
+        ShowMain(true);
+        Toast(text, true);
+    }
+}
+
 void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     if (rec_ != RecState::Idle) return;
+    recFromHotkey_ = fromHotkey;
     if (exporter_.Busy()) {
-        Toast(L"내보내기가 끝난 뒤에 녹화할 수 있습니다.", true);
+        if (fromHotkey)
+            TrayBalloon(L"녹화를 시작할 수 없습니다", L"내보내기가 끝난 뒤에 녹화할 수 있습니다.");
+        else
+            Toast(L"내보내기가 끝난 뒤에 녹화할 수 있습니다.", true);
         return;
     }
     if (target.source == kSourceWindow && (!target.hwnd || !IsWindow(target.hwnd))) {
@@ -747,7 +785,6 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
         return;
     }
     recTarget_ = target;
-    recFromHotkey_ = fromHotkey;
     recVideo_ = settings_.output == kOutputVideo;
     if (target.source == kSourceWindow) {
         if (IsIconic(target.hwnd)) {
@@ -833,9 +870,8 @@ void App::BeginCapture() {
     if (!capture_.Start(o, hwnd_, WM_APP_CAPTURE_CLOSED, err)) {
         rec_ = RecState::Idle;
         overlay_.Hide();
-        ShowMain(true);
-        Toast(err, true);
         TrayUpdate();
+        ReportError(L"녹화를 시작하지 못했습니다", err);
         return;
     }
     rec_ = RecState::Recording;
@@ -875,29 +911,30 @@ void App::StopRecording() {
     if (settings_.sounds) sound::Play(sound::Cue::Stop);
     auto clip = res.clip;
     if (!clip) {
-        ShowMain(true);
-        Toast(recTarget_.source == kSourceWindow
-                  ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
-                  : L"캡처된 화면이 없습니다.",
-              true);
+        ReportError(L"녹화 실패", recTarget_.source == kSourceWindow
+                                      ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
+                                      : L"캡처된 화면이 없습니다.");
         return;
     }
     OpenEditor(clip);
-    // Don't yank the user out of a fullscreen game: notify via the tray instead.
-    HWND fg = GetForegroundWindow();
-    if (recFromHotkey_ && fg && fg != hwnd_ && IsFullscreenWindow(fg)) {
+    std::wstring warn;
+    if (clip->WriteFailed())
+        warn = L"디스크 공간이 부족해 녹화를 멈췄습니다. 그 앞까지만 저장되어 있습니다.";
+    else if (clip->Dropped() > 0)
+        warn = util::Format(L"디스크가 느려 프레임 %u개를 건너뛰었습니다.", clip->Dropped());
+    if (NotifyQuietly()) {
         TrayBalloon(L"녹화 완료 · " + util::FormatClock(clip->Seconds(), true),
-                    L"클릭하면 편집 화면이 열립니다.");
+                    warn.empty() ? L"클릭하면 편집 화면이 열립니다." : warn);
     } else {
         ShowMain(true);
+        if (!warn.empty()) Toast(warn, true);
     }
 }
 
 void App::OnVideoSaved(const CaptureResult& r) {
     if (!r.ok) {
         if (settings_.sounds) sound::Play(sound::Cue::Stop);
-        ShowMain(true);
-        Toast(r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error, true);
+        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
         return;
     }
     if (settings_.sounds) sound::Play(sound::Cue::Saved);
@@ -920,8 +957,7 @@ void App::OnVideoSaved(const CaptureResult& r) {
         if (screen_ == Screen::Editor) CloseEditor();
     }
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
-    HWND fg = GetForegroundWindow();
-    if (recFromHotkey_ && fg && fg != hwnd_ && IsFullscreenWindow(fg))
+    if (NotifyQuietly())
         TrayBalloon(L"동영상 저장 완료 · " + util::FormatClock(r.seconds, false), info);
     else
         ShowMain(true);
@@ -953,10 +989,17 @@ void App::OnHotkey() {
     }
     HWND root = GetAncestor(fg, GA_ROOTOWNER);
     if (!root) root = fg;
+    // The desktop or taskbar is "in front" when nothing else is: there is no window to record then.
+    const bool shell = IsShellWindow(root);
     switch (settings_.source) {
-        case kSourceDisplay:
-            StartRecording(MonitorTarget(MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST)), true);
+        case kSourceDisplay: {
+            POINT pt{};
+            GetCursorPos(&pt);
+            StartRecording(MonitorTarget(shell ? MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY)
+                                               : MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST)),
+                           true);
             break;
+        }
         case kSourceRegion:
             if (CurrentTarget(t, &why))
                 StartRecording(t, true);
@@ -964,7 +1007,10 @@ void App::OnHotkey() {
                 TrayBalloon(L"영역 녹화를 시작할 수 없습니다", why);
             break;
         default:
-            StartRecording(WindowTarget(root), true);
+            if (shell)
+                TrayBalloon(L"녹화할 창이 없습니다", L"녹화할 창을 앞에 띄운 뒤 단축키를 누르세요.");
+            else
+                StartRecording(WindowTarget(root), true);
     }
 }
 
@@ -1197,9 +1243,9 @@ void App::OutputSize(int& w, int& h) const {
 double App::EffectiveOutFps() const {
     double limit = kOutFpsOptions[settings_.outFpsIdx];
     if (fmt_ == (int)Format::Mp4) {
-        // Constant rate: the chosen one, or the recording's own rounded up to a usual rate (29.4 -> 30).
+        // Constant rate: the chosen one, or the source's own rounded up to a usual rate (29.4 -> 30).
         if (limit > 0) return limit;
-        double avg = clip_ ? clip_->AverageFps() : 30.0;
+        double avg = !clip_ ? 30.0 : clip_->NominalFps() > 0 ? clip_->NominalFps() : clip_->AverageFps();
         for (double r : {10.0, 15.0, 20.0, 24.0, 25.0, 30.0, 50.0, 60.0, 90.0, 120.0})
             if (avg <= r * 1.03) return r;
         return 120.0;
@@ -1211,7 +1257,8 @@ double App::EffectiveOutFps() const {
 
 // MP4 keeps the video's sound unless the speed changes (no time-stretching).
 bool App::ExportAudio() const {
-    return fmt_ == (int)Format::Mp4 && exportAudio_ && clip_ && clip_->HasAudio() &&
+    auto* video = dynamic_cast<const VideoClip*>(clip_.get());
+    return fmt_ == (int)Format::Mp4 && exportAudio_ && video && video->HasAudio() && video->AudioExportable() &&
            kSpeedOptions[settings_.speedIdx] == 1.0;
 }
 
@@ -1352,6 +1399,22 @@ void App::RegisterRecordHotkey() {
     hotkeyOk_ = RegisterHotKey(hwnd_, 1, settings_.hkMods | MOD_NOREPEAT, settings_.hkVk) != FALSE;
 }
 
+// While a new key is being chosen the current one is released, so pressing it again reaches the window (and
+// doesn't start a recording).
+void App::SetCapturingHotkey(bool on) {
+    if (on == capturingHotkey_) return;
+    capturingHotkey_ = on;
+    if (on)
+        UnregisterHotKey(hwnd_, 1);
+    else
+        RegisterRecordHotkey();
+    Invalidate();
+}
+
+std::wstring App::HotkeyLabel() const {
+    return hotkeyOk_ ? util::HotkeyToString(settings_.hkMods, settings_.hkVk) : L"단축키 없음";
+}
+
 void App::TrayAdd() {
     nid_ = {sizeof(nid_)};
     nid_.hWnd = hwnd_;
@@ -1370,8 +1433,10 @@ void App::TrayUpdate() {
     if (!nid_.hWnd) return;
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid_.hIcon = rec_ == RecState::Recording ? iconRec_ : iconAppSmall_;
-    std::wstring tip = rec_ == RecState::Recording ? L"OzMaker · 녹화 중 (" + util::HotkeyToString(settings_.hkMods, settings_.hkVk) + L" 중지)"
-                                              : L"OzMaker · " + util::HotkeyToString(settings_.hkMods, settings_.hkVk) + L" 녹화";
+    std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+    std::wstring tip = rec_ == RecState::Recording ? L"OzMaker · 녹화 중" + (hotkeyOk_ ? L" (" + hk + L" 중지)" : L"")
+                       : hotkeyOk_                  ? L"OzMaker · " + hk + L" 녹화"
+                                                    : L"OzMaker · 녹화 단축키를 쓸 수 없음";
     wcsncpy_s(nid_.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }

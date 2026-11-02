@@ -31,16 +31,26 @@ static bool IsCloaked(HWND hwnd) {
     return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
 }
 
+bool IsShellWindow(HWND hwnd) {
+    wchar_t cls[128] = {};
+    GetClassNameW(hwnd, cls, _countof(cls));
+    static const wchar_t* shell[] = {L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"Progman", L"WorkerW",
+                                     L"Windows.UI.Core.CoreWindow", L"NotifyIconOverflowWindow",
+                                     L"TopLevelWindowForOverflowXamlIsland", L"XamlExplorerHostIslandWindow"};
+    for (auto* s : shell)
+        if (!wcscmp(cls, s)) return true;
+    return false;
+}
+
 static bool IsCandidate(HWND hwnd) {
     if (!IsWindowVisible(hwnd) || IsCloaked(hwnd)) return false;
     LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if ((ex & WS_EX_TOOLWINDOW) && !(ex & WS_EX_APPWINDOW)) return false;
     if (GetWindow(hwnd, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return false;
-    if (GetWindowTextLengthW(hwnd) == 0) return false;
+    if (GetWindowTextLengthW(hwnd) == 0 || IsShellWindow(hwnd)) return false;
     wchar_t cls[128] = {};
     GetClassNameW(hwnd, cls, _countof(cls));
-    static const wchar_t* skip[] = {L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"Progman", L"WorkerW",
-                                    L"Windows.UI.Core.CoreWindow", L"OzMakerOverlay", L"OzMakerPicker"};
+    static const wchar_t* skip[] = {L"OzMakerOverlay", L"OzMakerPicker"};
     for (auto* s : skip)
         if (!wcscmp(cls, s)) return false;
     DWORD pid = 0;

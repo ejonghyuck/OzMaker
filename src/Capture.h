@@ -54,6 +54,7 @@ public:
     CaptureResult Stop();
 
     bool Running() const { return running_; }
+    bool StoreFailed() const;  // clip mode: the temp file couldn't be written (disk full)
     double Elapsed() const;
     size_t Frames() const;
     int OutWidth() const { return outW_; }

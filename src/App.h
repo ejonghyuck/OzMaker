@@ -94,6 +94,8 @@ private:
     void StopRecording();
     void OnVideoSaved(const CaptureResult& r);
     void OnHotkey();
+    bool NotifyQuietly() const;  // a fullscreen app is in front of a hotkey recording
+    void ReportError(const std::wstring& title, const std::wstring& text);
     bool UseMonitorCapture(HWND target) const;
     void ProbeEncoders();
     std::wstring VideoSummary() const;
@@ -127,6 +129,8 @@ private:
 
     // ---- system
     void RegisterRecordHotkey();
+    void SetCapturingHotkey(bool on);
+    std::wstring HotkeyLabel() const;  // the record hotkey, or a note that there is none
     void TrayAdd();
     void TrayUpdate();
     void TrayRemove();
