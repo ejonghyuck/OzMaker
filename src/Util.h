@@ -39,4 +39,7 @@ std::wstring SafeFileName(std::wstring_view s, size_t maxLen = 80);
 bool AutostartEnabled();
 bool SetAutostart(bool on);
 
+// What is left of a rectangle with others taken out of it, as non-overlapping rectangles.
+std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& holes);
+
 }  // namespace util

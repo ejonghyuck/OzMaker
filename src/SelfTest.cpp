@@ -7,6 +7,8 @@
 //   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export
 //   --video-test <dir> [w h]              synthetic MP4 -> frame index/decoding -> trimmed MP4/GIF exports, checked
 //                                         frame by frame and by the audio tone boundaries; editor screenshots
+//   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
+//   --preview-test <dir>                  the live window preview on screen, with the files list open over it
 #include "pch.h"
 #include "App.h"
 #include "Resize.h"
@@ -26,7 +28,6 @@ bool HasVideoProcessor() {
     return SUCCEEDED(dev.As(&vd));
 }
 
-// Sum of a GIF's frame delays in 1/100 s, read from its graphic control extensions; -1 if unreadable.
 // NETSCAPE loop count of a GIF: -1 = no loop block (plays once), 0 = forever, n = repeats after the first play.
 int GifLoopCount(const std::wstring& path) {
     std::vector<uint8_t> d;
@@ -42,6 +43,64 @@ int GifLoopCount(const std::wstring& path) {
     return it[13] | (it[14] << 8);
 }
 
+// A hidden window to point the live preview at where no real one is wanted (offscreen renders).
+HWND MakeStandInWindow(HINSTANCE inst) {
+    return CreateWindowExW(0, L"STATIC", L"OzMaker Test Window", WS_POPUP, 0, 0, 800, 450, nullptr, nullptr, inst,
+                           nullptr);
+}
+
+// Eight blocks of saturated colour (nothing in the UI is that colour): a preview of it shows where each part of the
+// window went.
+const COLORREF kPatternColors[8] = {RGB(230, 40, 40),  RGB(40, 200, 60),  RGB(40, 90, 230),  RGB(240, 220, 40),
+                                    RGB(220, 50, 220), RGB(40, 220, 220), RGB(250, 140, 30), RGB(150, 90, 30)};
+
+LRESULT CALLBACK PatternProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        for (int i = 0; i < 8; ++i) {
+            RECT c{rc.right * (i % 4) / 4, rc.bottom * (i / 4) / 2, rc.right * (i % 4 + 1) / 4, rc.bottom * (i / 4 + 1) / 2};
+            HBRUSH b = CreateSolidBrush(kPatternColors[i]);
+            FillRect(dc, &c, b);
+            DeleteObject(b);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// Pixels on screen (BGRX), for checking what DWM composited. Only ever our own window's area.
+std::vector<uint32_t> GrabScreen(const RECT& r) {
+    int w = r.right - r.left, h = r.bottom - r.top;
+    std::vector<uint32_t> px((size_t)w * h);
+    HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+    for (size_t i = 0; i < px.size(); ++i) px[i] = static_cast<uint32_t*>(bits)[i] | 0xFF000000u;
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return px;
+}
+
+bool NearColor(uint32_t bgrx, COLORREF c, int tol) {
+    return std::abs((int)(bgrx >> 16 & 255) - GetRValue(c)) <= tol && std::abs((int)(bgrx >> 8 & 255) - GetGValue(c)) <= tol &&
+           std::abs((int)(bgrx & 255) - GetBValue(c)) <= tol;
+}
+
+// Sum of a GIF's frame delays in 1/100 s, read from its graphic control extensions; -1 if unreadable.
 int GifDurationCs(const std::wstring& path) {
     std::vector<uint8_t> d;
     if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
@@ -340,15 +399,121 @@ int App::RunSelfTest(const std::wstring& dir) {
         StopThumbnails();
         clip_.reset();
     }
+    // Layering. DWM draws the live window preview above everything in the window, so what floats above the page
+    // (popovers, toasts, tooltips) is cut out of it, and nothing else may be drawn over it.
+    {
+        // The cut: every pixel of the preview is in exactly one part, or under a hole.
+        RECT whole{100, 50, 740, 410};
+        std::vector<RECT> holes = {{600, 20, 900, 200}, {300, 380, 500, 470}, {350, 150, 420, 220}, {0, 0, 10, 10}};
+        auto parts = util::SubtractRects(whole, holes);
+        int bad = 0;
+        for (LONG y = whole.top; y < whole.bottom; ++y)
+            for (LONG x = whole.left; x < whole.right; ++x) {
+                POINT pt{x, y};
+                int in = 0;
+                bool hole = false;
+                for (const RECT& p : parts) in += PtInRect(&p, pt) ? 1 : 0;
+                for (const RECT& h : holes) hole |= PtInRect(&h, pt) != FALSE;
+                bad += hole ? in != 0 : in != 1;
+            }
+        log(util::Format(L"preview cut: %s %zu parts, %d pixels wrong", bad ? L"FAIL" : L"ok", parts.size(), bad));
+        if (bad) ++failures;
+    }
+    {
+        // Home with the files list open over the preview, a recent file's tooltip running past the list's edge, and
+        // a toast: three floats, all of them clear of the preview's parts, and no layering errors.
+        HWND standIn = MakeStandInWindow(inst_);
+        target_ = standIn;
+        screen_ = Screen::Home;
+        settings_.source = kSourceWindow;
+        settings_.output = kOutputClip;
+        showVideo_ = false;
+        dpi_ = 96;
+        recentFiles_ = {{dir + L"\\아주 긴 폴더 이름으로 경로가 목록보다 넓어지는 경우\\OzMaker_20261102_142311.gif", 2'345'678,
+                         300, false}};
+        filesOpen_ = true;
+        filesScroll_ = 0;
+        double clock = util::NowSeconds();
+        toast_ = L"파일을 복사했습니다. 메신저나 폴더에 붙여넣으세요.";
+        toastUntil_ = clock + 60;
+        UiInput in;
+        auto frames = [&](int passes, const std::function<void()>& after = nullptr) {
+            for (int pass = 0; pass < passes; ++pass) {
+                clock += 0.05;
+                gfx_.RenderToPng((dir + L"\\selftest_layers.png").c_str(), 1120, 780, 96, [&](ID2D1DeviceContext* dc) {
+                    ui_.Begin(dc, in, clock);
+                    thumbWanted_ = false;
+                    DrawFrame(Rect(0, 0, 1120, 780));
+                    if (after) after();
+                    ui_.End();
+                });
+            }
+        };
+        frames(1);
+        // The pointer on the first recent file (the list sits under the files button).
+        in.mx = filesBtn_.r - 300;
+        in.my = filesBtn_.b + 8 + 8 + 30 + 26;
+        frames(12);
+        RECT dest, src;
+        PreviewLayout(dest, src);
+        auto parts = PreviewParts(dest);
+        const auto& fl = ui_.Floats();
+        int clash = 0;
+        for (const Rect& f : fl) {
+            RECT h{(LONG)std::floor(f.l), (LONG)std::floor(f.t), (LONG)std::ceil(f.r), (LONG)std::ceil(f.b)}, o;
+            for (const RECT& p : parts) clash += IntersectRect(&o, &p, &h) ? 1 : 0;
+        }
+        RECT pop{}, o;
+        if (!fl.empty()) pop = {(LONG)fl[0].l, (LONG)fl[0].t, (LONG)fl[0].r, (LONG)fl[0].b};
+        bool over = IntersectRect(&o, &pop, &dest) != FALSE;
+        bool tipOut = fl.size() == 3 && (fl[2].l < fl[0].l || fl[2].r > fl[0].r || fl[2].b > fl[0].b);
+        bool good = thumbWanted_ && ui_.LayerErrors() == 0 && fl.size() == 3 && over && tipOut && clash == 0 &&
+                    !parts.empty();
+        log(util::Format(L"layers, files list + tooltip + toast: %s %zu floats (list over the preview %d, tooltip past "
+                         L"the list %d), %zu preview parts, %d overlaps, %d layering errors",
+                         good ? L"ok" : L"FAIL", fl.size(), over, tipOut, parts.size(), clash, ui_.LayerErrors()));
+        if (!good) ++failures;
+        // Drawing over the preview outside a float is caught.
+        frames(1, [&] { ui_.Fill(thumbArea_.Inset(40), theme::Rec); });
+        good = ui_.LayerErrors() > 0;
+        log(util::Format(L"layers, page drawn over the preview: %s %d error(s) caught", good ? L"ok" : L"FAIL",
+                         ui_.LayerErrors()));
+        if (!good) ++failures;
+        filesOpen_ = false;
+        toastUntil_ = 0;
+        recentFiles_.clear();
+        target_ = nullptr;
+        DestroyWindow(standIn);
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
+}
+
+// What DWM puts over the window preview, for screenshots (drawn offscreen, without it): the parts it would show,
+// drawn last as DWM does, in a flat colour that hides whatever was wrongly left under them.
+void App::DrawPreviewStandIn(ID2D1DeviceContext* dc) {
+    if (!thumbWanted_ || !target_ || !IsWindow(target_)) return;
+    RECT dest, src;
+    PreviewLayout(dest, src);
+    ComPtr<ID2D1SolidColorBrush> fill, edge;
+    dc->CreateSolidColorBrush(D2D1::ColorF(0x2F4A73), &fill);
+    dc->CreateSolidColorBrush(D2D1::ColorF(0x6F94CC), &edge);
+    const float s = Scale();
+    for (const RECT& p : PreviewParts(dest)) {
+        D2D1_RECT_F r{p.left / s, p.top / s, p.right / s, p.bottom / s};
+        dc->FillRectangle(r, fill.Get());
+        dc->DrawRectangle({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, edge.Get(), 1.f);
+    }
 }
 
 int App::RunScreenshots(const std::wstring& dir) {
     testWindowsOnly_ = true;
     util::EnsureDir(dir);
+    Log log(dir + L"\\screenshots.log");
+    int layerErrors = 0;
     const float W = 1120, H = 780;
     double clock = util::NowSeconds();
+    UiInput mouse;  // where the pointer is in the next shot
     auto shot = [&](const std::wstring& name, float dpi) {
         dpi_ = (UINT)dpi;
         UINT pw = (UINT)(W * dpi / 96), ph = (UINT)(H * dpi / 96);
@@ -356,11 +521,17 @@ int App::RunScreenshots(const std::wstring& dir) {
         for (int pass = 0; pass < 10; ++pass) {
             clock += 0.05;
             gfx_.RenderToPng((dir + L"\\" + name).c_str(), pw, ph, dpi, [&](ID2D1DeviceContext* dc) {
-                UiInput in;
-                ui_.Begin(dc, in, clock);
+                ui_.Begin(dc, mouse, clock);
                 thumbWanted_ = false;
                 DrawFrame(Rect(0, 0, W, H));
                 ui_.End();
+                if (pass == 9 && ui_.LayerErrors()) {
+                    const Rect& e = ui_.FirstLayerError();
+                    log(util::Format(L"FAIL %s: %d layering error(s), first at %.0f,%.0f-%.0f,%.0f", name.c_str(),
+                                     ui_.LayerErrors(), e.l, e.t, e.r, e.b));
+                    ++layerErrors;
+                }
+                DrawPreviewStandIn(dc);
             });
         }
     };
@@ -481,10 +652,27 @@ int App::RunScreenshots(const std::wstring& dir) {
                     {settings_.outDir + L"\\OzMaker_20261101_221940.webp", 812'004, 90000, false}};
     filesOpen_ = true;
     shot(L"files_popover.png", 96);
+    // The same over a window preview, with a recent file's tooltip and a toast: the preview (stand-in colour) is
+    // cut around all three.
+    HWND standIn = windows_.empty() ? MakeStandInWindow(inst_) : nullptr;
+    target_ = standIn ? standIn : windows_.front().hwnd;
+    settings_.source = kSourceWindow;
+    recentFiles_[0].path = settings_.outDir + L"\\아주 긴 폴더 이름으로 경로가 목록보다 넓어지는 경우\\OzMaker_20261102_142311.gif";
+    toast_ = L"파일을 복사했습니다. 메신저나 폴더에 붙여넣으세요.";
+    toastUntil_ = clock + 60;
+    shot(L"home_layers.png", 96);  // places the list (filesBtn_)
+    mouse.mx = filesBtn_.r - 300;
+    mouse.my = filesBtn_.b + 8 + 8 + 30 + 2 * 52 + 30 + 26;  // past the two recordings: the first recent file
+    shot(L"home_layers.png", 96);
+    mouse = {};
+    toastUntil_ = 0;
     filesOpen_ = false;
     held_.clear();
     recentFiles_.clear();
-    return 0;
+    target_ = nullptr;
+    if (standIn) DestroyWindow(standIn);
+    log(layerErrors ? util::Format(L"RESULT: %d screen(s) with layering errors", layerErrors) : L"RESULT: all passed");
+    return layerErrors ? 2 : 0;
 }
 
 namespace {
@@ -1511,6 +1699,171 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     quitting_ = true;
     DestroyWindow(hwnd_);
     pump(2.0);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+// The live window preview as DWM shows it. A window of colour blocks is picked and the files list opened over the
+// preview: on screen (our window only, kept on top) the list must show where it is and the window everywhere else,
+// with the title bar hidden and shown, and closing the list must bring back the whole preview.
+int App::RunPreviewTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\preview.log");
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    settings_.outDir = dir;
+    if (!CreateMainWindow(SW_SHOW)) return 1;
+    bool quit = false;
+    auto pump = [&](double seconds) {
+        double end = util::NowSeconds() + seconds;
+        while (!quit && util::NowSeconds() < end) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) quit = true;
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            double now = util::NowSeconds();
+            if (IsWindowVisible(hwnd_) && (dirty_ || ui_.Animating() || (wake_ > 0 && now >= wake_)))
+                Render();
+            else
+                MsgWaitForMultipleObjectsEx(0, nullptr, 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    };
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = PatternProc;
+    wc.hInstance = inst_;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"OzMakerTestPattern";
+    RegisterClassExW(&wc);
+    RECT wr, fr{0, 0, 800, 450};
+    GetWindowRect(hwnd_, &wr);
+    AdjustWindowRectEx(&fr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    HWND pattern = CreateWindowExW(0, wc.lpszClassName, L"OzMaker Test Window", WS_OVERLAPPEDWINDOW, wr.left + 40,
+                                   wr.top + 40, fr.right - fr.left, fr.bottom - fr.top, nullptr, nullptr, inst_, nullptr);
+    ShowWindow(pattern, SW_SHOWNOACTIVATE);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);  // the screen there is ours
+    target_ = pattern;
+    screen_ = Screen::Home;
+    settings_.source = kSourceWindow;
+    showVideo_ = false;
+    recentFiles_ = {{dir + L"\\OzMaker_20261102_142311.gif", 2'345'678, 300, false}};
+    RECT client;
+    GetClientRect(hwnd_, &client);
+    POINT o{0, 0};
+    ClientToScreen(hwnd_, &o);
+    const RECT area{o.x, o.y, o.x + client.right, o.y + client.bottom};
+    const LONG cw = client.right;
+    auto at = [&](const std::vector<uint32_t>& px, LONG x, LONG y) { return px[(size_t)y * cw + x]; };
+    auto same = [](uint32_t a, uint32_t b) {
+        for (int sh = 0; sh < 24; sh += 8)
+            if (std::abs((int)(a >> sh & 255) - (int)(b >> sh & 255)) > 24) return false;
+        return true;
+    };
+    auto isPattern = [](uint32_t c) {
+        for (COLORREF k : kPatternColors)
+            if (NearColor(c, k, 40)) return true;
+        return false;
+    };
+    auto save = [&](std::vector<uint32_t>& px, const wchar_t* name) {
+        SavePng(gfx_.Wic(), dir + L"\\" + name, reinterpret_cast<const uint8_t*>(px.data()), cw, client.bottom);
+    };
+    pump(0.5);
+    for (bool clientOnly : {true, false}) {
+        const std::wstring mode = clientOnly ? L"title bar hidden" : L"whole window";
+        settings_.clientOnly = clientOnly;
+        filesOpen_ = false;
+        Invalidate();
+        pump(0.8);
+        auto base = GrabScreen(area);
+        RECT dest, src;
+        PreviewLayout(dest, src);
+        const LONG dw = dest.right - dest.left, dh = dest.bottom - dest.top;
+        {
+            SIZE whole{};
+            if (!thumb_.empty()) DwmQueryThumbnailSourceSize(thumb_[0], &whole);
+            RECT pw, pf{}, pc;
+            GetWindowRect(pattern, &pw);
+            DwmGetWindowAttribute(pattern, DWMWA_EXTENDED_FRAME_BOUNDS, &pf, sizeof(pf));
+            GetClientRect(pattern, &pc);
+            log(util::Format(L"     %s: DWM size %dx%d, window %dx%d, frame %dx%d, client %dx%d -> source %d,%d-%d,%d at "
+                             L"%dx%d", mode.c_str(), whole.cx, whole.cy, pw.right - pw.left, pw.bottom - pw.top,
+                             pf.right - pf.left, pf.bottom - pf.top, pc.right, pc.bottom, src.left, src.top, src.right,
+                             src.bottom, dw, dh));
+        }
+        int shown = 0;
+        for (int gy = 1; gy < 10; ++gy)
+            for (int gx = 1; gx < 10; ++gx) shown += isPattern(at(base, dest.left + dw * gx / 10, dest.top + dh * gy / 10));
+        check(dw > 100 && shown >= 81 * 8 / 10, util::Format(L"%s: the preview shows the window (%d of 81 points)", mode.c_str(), shown));
+        if (clientOnly) {
+            int found = 0;
+            for (int i = 0; i < 8; ++i)
+                found += NearColor(at(base, dest.left + dw * (2 * (i % 4) + 1) / 8, dest.top + dh * (2 * (i / 4) + 1) / 4),
+                                   kPatternColors[i], 40);
+            check(found == 8, util::Format(L"%s: each block in its place (%d of 8)", mode.c_str(), found));
+        }
+
+        filesOpen_ = true;
+        Invalidate();
+        pump(0.8);
+        auto pop = GrabScreen(area);
+        Rect f = ui_.Floats().empty() ? Rect() : ui_.Floats()[0];  // the list's
+        const float s = Scale();
+        RECT hole{(LONG)std::floor(f.l * s), (LONG)std::floor(f.t * s), (LONG)std::ceil(f.r * s), (LONG)std::ceil(f.b * s)};
+        RECT inner = hole, outer = hole;
+        InflateRect(&inner, -3, -3);
+        InflateRect(&outer, 3, 3);
+        {
+            std::wstring ps;
+            for (const RECT& p : PreviewParts(dest)) ps += util::Format(L" %d,%d-%d,%d", p.left, p.top, p.right, p.bottom);
+            log(util::Format(L"     list %d,%d-%d,%d over %d,%d-%d,%d; parts%s", hole.left, hole.top, hole.right,
+                             hole.bottom, dest.left, dest.top, dest.right, dest.bottom, ps.c_str()));
+        }
+        int under = 0, underN = 0, kept = 0, keptN = 0;
+        for (LONG y = dest.top + 1; y < dest.bottom - 1; y += 3)
+            for (LONG x = dest.left + 1; x < dest.right - 1; x += 3) {
+                POINT pt{x, y};
+                if (PtInRect(&inner, pt)) {
+                    ++underN;
+                    under += isPattern(at(pop, x, y));
+                } else if (!PtInRect(&outer, pt)) {
+                    ++keptN;
+                    kept += same(at(pop, x, y), at(base, x, y));
+                }
+            }
+        // (Text on the list has ClearType's coloured fringes; the preview showing through would be most of it.)
+        check(underN > 100 && under <= underN / 50,
+              util::Format(L"%s: the files list shows above the preview (%d of %d points under it show the window, %zu "
+                           L"thumbnails)", mode.c_str(), under, underN, thumb_.size()));
+        check(keptN > 100 && kept >= keptN * 99 / 100,
+              util::Format(L"%s: the rest of the preview is as before (%d of %d points)", mode.c_str(), kept, keptN));
+        save(base, clientOnly ? L"preview_client.png" : L"preview_window.png");
+        save(pop, clientOnly ? L"preview_client_list.png" : L"preview_window_list.png");
+
+        filesOpen_ = false;
+        Invalidate();
+        pump(0.8);
+        auto after = GrabScreen(area);
+        int back = 0, backN = 0;
+        for (LONG y = dest.top + 1; y < dest.bottom - 1; y += 3)
+            for (LONG x = dest.left + 1; x < dest.right - 1; x += 3) {
+                ++backN;
+                back += same(at(after, x, y), at(base, x, y));
+            }
+        check(back >= backN * 99 / 100 && thumb_.size() == 1 && !thumbSplit_,
+              util::Format(L"%s: closing the list brings the whole preview back (%d of %d points)", mode.c_str(), back,
+                           backN));
+    }
+    recentFiles_.clear();
+    target_ = nullptr;
+    DestroyWindow(pattern);
+    quitting_ = true;
+    DestroyWindow(hwnd_);
+    pump(1.0);
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }

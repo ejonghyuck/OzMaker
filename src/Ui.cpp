@@ -76,6 +76,7 @@ ID2D1SolidColorBrush* Painter::Brush(D2D1_COLOR_F c) {
 
 void Painter::Fill(const Rect& r, D2D1_COLOR_F c, float radius) {
     if (c.a <= 0 || r.Empty()) return;
+    Painted(r);
     if (radius > 0)
         rt_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), Brush(c));
     else
@@ -84,6 +85,7 @@ void Painter::Fill(const Rect& r, D2D1_COLOR_F c, float radius) {
 
 void Painter::Stroke(const Rect& r, D2D1_COLOR_F c, float radius, float width) {
     if (c.a <= 0) return;
+    Painted(r.Inset(-width / 2));
     if (radius > 0)
         rt_->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), Brush(c), width);
     else
@@ -91,24 +93,29 @@ void Painter::Stroke(const Rect& r, D2D1_COLOR_F c, float radius, float width) {
 }
 
 void Painter::Line(float x0, float y0, float x1, float y1, D2D1_COLOR_F c, float w) {
+    Painted(Rect(std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::max(y0, y1)).Inset(-w / 2));
     rt_->DrawLine({x0, y0}, {x1, y1}, Brush(c), w);
 }
 
 void Painter::Circle(float cx, float cy, float r, D2D1_COLOR_F c) {
+    Painted(Rect(cx - r, cy - r, cx + r, cy + r));
     rt_->FillEllipse(D2D1::Ellipse({cx, cy}, r, r), Brush(c));
 }
 
 void Painter::Ring(float cx, float cy, float r, D2D1_COLOR_F c, float w) {
+    Painted(Rect(cx - r, cy - r, cx + r, cy + r).Inset(-w / 2));
     rt_->DrawEllipse(D2D1::Ellipse({cx, cy}, r, r), Brush(c), w);
 }
 
 void Painter::Text(const Rect& r, std::wstring_view s, float size, D2D1_COLOR_F c, const TextStyle& st) {
     if (s.empty() || c.a <= 0) return;
+    Painted(r);
     auto lay = Fonts::Layout(s, size, st, r.W(), r.H());
     if (lay) rt_->DrawTextLayout({r.l, r.t}, lay.Get(), Brush(c), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
 
 void Painter::Icon(const Rect& r, wchar_t glyph, float size, D2D1_COLOR_F c) {
+    Painted(r);
     wchar_t s[2] = {glyph, 0};
     TextStyle st;
     st.h = AlignCenter;
@@ -139,6 +146,7 @@ void Painter::Logo(const Rect& r) {
     logoBrush_->SetStartPoint({r.l, r.t});
     logoBrush_->SetEndPoint({r.r, r.b});
     float rad = r.W() * 0.28f;
+    Painted(r);
     rt_->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), logoBrush_.Get());
     float cx = r.CX(), cy = r.CY(), s = r.W();
     Ring(cx, cy, s * 0.27f, White, s * 0.085f);
@@ -168,10 +176,14 @@ void Ui::Begin(ID2D1RenderTarget* rt, const UiInput& in, double now) {
     cursor_ = IDC_ARROW;
     tipShow_ = false;
     clips_.clear();
+    floats_.clear();
+    natives_.clear();
+    floatDepth_ = layerErrors_ = 0;
 }
 
 void Ui::End() {
     if (tipShow_ && !tipText_.empty()) {
+        BeginFloat();
         float tw = Measure(tipText_, 12.f) + 16.f;
         Rect r = Rect::XYWH(tipAnchor_.CX() - tw / 2, tipAnchor_.b + 6, tw, 26);
         D2D1_SIZE_F sz = RT()->GetSize();
@@ -183,8 +195,33 @@ void Ui::End() {
         TextStyle st;
         st.h = AlignCenter;
         Text(r, tipText_, 12.f, TextColor, st);
+        EndFloat();
     }
     if (!in_.down || in_.released) active_ = 0;
+}
+
+void Ui::BeginFloat() {
+    if (floatDepth_++ == 0) floatBounds_ = {};
+}
+
+void Ui::EndFloat() {
+    if (--floatDepth_ == 0 && !floatBounds_.Empty()) floats_.push_back(floatBounds_);
+}
+
+void Ui::Painted(const Rect& r) {
+    Rect b = clips_.empty() ? r : r.Intersect(clips_.back());
+    if (b.Empty()) return;
+    if (floatDepth_ > 0) {
+        floatBounds_ = floatBounds_.Empty() ? b : floatBounds_.Union(b);
+        return;
+    }
+    for (const Rect& n : natives_) {
+        Rect o = b.Intersect(n);
+        if (o.W() >= 1 && o.H() >= 1) {  // an anti-aliased edge just touching it doesn't count
+            if (layerErrors_++ == 0) layerError_ = b;
+            return;
+        }
+    }
 }
 
 bool Ui::Hover(const Rect& r) const {
