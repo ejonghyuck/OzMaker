@@ -94,14 +94,26 @@ public:
     void Start(std::vector<WinInfo> windows, std::function<void(bool ok, RECT area)> done);
     void Cancel() { Finish(false, {}); }
     bool Active() const { return active_; }
-    // Screenshot tests: paint a mid-drag state over `screen` (virtual-screen pixels) without a window.
-    void PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor);
+    // Tests drive the picker with posted mouse/key messages and read the result back.
+    HWND Hwnd() const { return win_.Hwnd(); }
+    bool Adjusting() const { return adjusting_; }
+    RECT AdjustedArea() const { return sel_; }
+    RECT ToolbarButton(int i) const { return buttons_[i]; }
+    // Screenshot tests: paint a mid-drag state over `screen` (virtual-screen pixels) without a window, or with
+    // `adjust` the selection anchor..cursor being fine-tuned.
+    void PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT cursor, bool adjust = false);
 
 private:
     static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT Handle(HWND, UINT, WPARAM, LPARAM);
     void OnMove(POINT screen);
     void Finish(bool ok, RECT area);
+    // After the first drag (or click on a window) the area stays up to be moved, resized and given a ratio.
+    void StartAdjust(RECT area);
+    int HitTest(POINT pt) const;  // 0..7 handles clockwise from top-left, 8 inside, -1 outside
+    void DragTo(POINT pt);
+    void SetRatio(int index);
+    RECT KeepOnMonitor(RECT r) const;
     RECT Selection() const;
     RECT HoverArea() const;
     void Redraw();
@@ -116,4 +128,14 @@ private:
     POINT cursor_{}, anchor_{};
     int hover_ = -1;
     bool pressed_ = false, dragging_ = false, active_ = false;
+
+    bool adjusting_ = false;
+    RECT sel_{};
+    int ratio_ = 0;     // kRatios
+    int op_ = -1;       // HitTest of the press being dragged, -1 = none
+    POINT opStart_{};
+    RECT opSel_{};
+    RECT buttons_[7]{};  // toolbar in screen pixels: five ratios, cancel, confirm
+    float scale_ = 1;
+    DWORD lastClick_ = 0;
 };

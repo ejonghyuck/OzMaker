@@ -2,9 +2,19 @@
 
 inline constexpr int kFpsOptions[] = {10, 15, 20, 30, 50, 60};
 inline constexpr int kSizeOptions[] = {0, 1280, 960, 720, 480};  // longest edge, 0 = original
-inline constexpr int kScaleOptions[] = {100, 75, 50, 33, 25};    // export scale %
+// Export size: a scale of the (cropped) clip, or a width in pixels. Never enlarges.
+struct ExportSize {
+    int percent, width;
+};
+inline constexpr ExportSize kExportSizes[] = {{100, 0}, {75, 0}, {50, 0}, {33, 0}, {0, 640}, {0, 480}};
+inline constexpr int kLoopOptions[] = {0, 1, 3};  // times a 움짤 plays, 0 = forever
+inline constexpr int kTargetMB[] = {0, 5, 10, 15, 20};  // "용량 맞추기", 0 = off
+inline constexpr double kHoldLastMs = 1000;       // "끝에서 멈춤": the last frame stays this much longer
+// File name patterns offered in the settings; settings.ini may hold any other.
+inline constexpr const wchar_t* kNameTemplates[] = {L"OzMaker_{날짜}", L"{창 이름}_{날짜}", L"{날짜}"};
 inline constexpr int kOutFpsOptions[] = {0, 30, 25, 20, 15, 10};  // 0 = as recorded
 inline constexpr double kSpeedOptions[] = {0.5, 1.0, 1.5, 2.0};
+inline constexpr size_t kMaxRecent = 12;
 
 // MP4 recording
 inline constexpr int kVideoFpsOptions[] = {24, 30, 60};
@@ -60,11 +70,17 @@ struct Settings {
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip
     int quality[3] = {85, 80, 60};      // per 움짤 format
-    int scaleIdx = 0;
+    int scaleIdx = 0;  // kExportSizes
     int outFpsIdx = 0;
     int speedIdx = 1;
-    bool loop = true;
+    int loopIdx = 0;   // kLoopOptions
+    int targetIdx = 0;  // kTargetMB
+    bool holdLast = false;
+    std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 
+    std::vector<std::wstring> recent;  // saved and opened files, newest first
+
+    void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
     bool HasRegion() const { return region.right - region.left >= 16 && region.bottom - region.top >= 16; }

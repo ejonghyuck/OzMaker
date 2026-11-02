@@ -159,6 +159,72 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
     return true;
 }
 
+bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    COMDLG_FILTERSPEC filters[] = {{L"동영상", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts"},
+                                   {L"모든 파일", L"*.*"}};
+    dlg->SetFileTypes(_countof(filters), filters);
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    ComPtr<IShellItem> folder;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        dlg->SetDefaultFolder(folder.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return false;
+    PWSTR p = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return false;
+    out = p;
+    CoTaskMemFree(p);
+    return true;
+}
+
+std::wstring SafeFileName(std::wstring_view s, size_t maxLen) {
+    std::wstring out;
+    for (wchar_t c : s) {
+        if (c < 32 || wcschr(L"<>:\"/\\|?*", c)) c = L'_';
+        if (c == L' ' && (out.empty() || out.back() == L' ')) continue;
+        out += c;
+    }
+    if (out.size() > maxLen) out.resize(maxLen);
+    while (!out.empty() && (out.back() == L' ' || out.back() == L'.')) out.pop_back();
+    return out;
+}
+
+namespace {
+const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+std::wstring AutostartCommand() {
+    wchar_t exe[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, exe, _countof(exe));
+    return L"\"" + std::wstring(exe, n) + L"\" --tray";
+}
+}  // namespace
+
+bool AutostartEnabled() {
+    DWORD size = 0;
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"OzMaker", RRF_RT_REG_SZ, nullptr, nullptr, &size) == ERROR_SUCCESS;
+}
+
+bool SetAutostart(bool on) {
+    if (!on) {
+        LSTATUS s = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"OzMaker");
+        return s == ERROR_SUCCESS || s == ERROR_FILE_NOT_FOUND;
+    }
+    std::wstring cmd = AutostartCommand();
+    return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"OzMaker", REG_SZ, cmd.c_str(),
+                           (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+std::wstring FormatAgo(double s) {
+    if (s < 60) return L"방금";
+    if (s < 3600) return Format(L"%d분 전", (int)(s / 60));
+    if (s < 86400) return Format(L"%d시간 전", (int)(s / 3600));
+    if (s < 2 * 86400) return L"어제";
+    return Format(L"%d일 전", (int)(s / 86400));
+}
+
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name, const wchar_t* ext,
                   const wchar_t* filterName, std::wstring& out) {
     ComPtr<IFileSaveDialog> dlg;

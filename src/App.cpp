@@ -89,13 +89,18 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
     if (args.size() >= 2 && args[0] == L"--analyze") return RunAnalyzeTest(cmdLine);
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
+    if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
                             args.size() >= 4 ? _wtoi(args[3].c_str()) : 360);
 
-    if (!CreateMainWindow(show)) return 1;
+    const bool tray = !args.empty() && args[0] == L"--tray";  // started with Windows (HKCU Run)
+    autostart_ = util::AutostartEnabled();
+    if (autostart_) util::SetAutostart(true);  // keeps pointing at this exe if it was moved
+    if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
+    if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
     Loop();
     return 0;
 }
@@ -153,6 +158,7 @@ bool App::CreateMainWindow(int show) {
     COLORREF caption = RGB(0x0D, 0x0F, 0x13);
     DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR, Win11*/, &caption, sizeof(caption));
     if (!gfx_.AttachWindow(hwnd_)) return false;
+    DragAcceptFiles(hwnd_, TRUE);
 
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
@@ -298,7 +304,8 @@ void App::RememberPlacement() {
 void App::Toast(std::wstring text, bool error) {
     toast_ = std::move(text);
     toastError_ = error;
-    toastUntil_ = util::NowSeconds() + (error ? 5.0 : 3.0);
+    // Long enough to read: longer messages stay longer.
+    toastUntil_ = util::NowSeconds() + std::min(12.0, (error ? 5.0 : 3.0) + toast_.size() / 25.0);
     Invalidate();
 }
 
@@ -501,6 +508,24 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_SHOW:
             ShowMain(true);
             return 0;
+        case WM_COPYDATA: {
+            auto* cd = reinterpret_cast<const COPYDATASTRUCT*>(l);
+            if (!cd || cd->dwData != kCopyOpenFile || cd->cbData < sizeof(wchar_t)) return FALSE;
+            pendingOpen_.assign((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t) - 1);
+            PostMessageW(hwnd_, WM_APP_OPEN, 0, 0);
+            return TRUE;
+        }
+        case WM_APP_OPEN:
+            if (!pendingOpen_.empty()) OpenMediaFile(std::exchange(pendingOpen_, {}));
+            return 0;
+        case WM_DROPFILES: {
+            auto drop = (HDROP)w;
+            wchar_t path[MAX_PATH * 4];
+            bool got = DragQueryFileW(drop, 0, path, _countof(path)) > 0;
+            DragFinish(drop);
+            if (got) OpenMediaFile(path);
+            return 0;
+        }
         case WM_APP_QUIT:
             quitting_ = true;
             DestroyWindow(hwnd_);
@@ -510,6 +535,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_APP_EXPORT_DONE:
             OnExportDone();
+            return 0;
+        case WM_APP_ESTIMATE:
+            OnEstimate();
             return 0;
         case WM_APP_FRAME: {
             size_t idx = 0;
@@ -529,6 +557,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
+            if (!settings_.closeToTray && !quitting_ && !ConfirmQuit()) return 0;
             if (settings_.closeToTray && !quitting_) {
                 HideMain();
                 if (!settings_.trayHintShown) {
@@ -579,6 +608,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
 
 void App::RefreshWindows() {
     windows_ = EnumerateCaptureWindows();
+    if (testWindowsOnly_)
+        std::erase_if(windows_, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
     if (target_ && !IsWindow(target_)) target_ = nullptr;
     for (auto it = icons_.begin(); it != icons_.end();) {
         if (!IsWindow(it->first))
@@ -785,6 +816,18 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
         return;
     }
     recTarget_ = target;
+    if (target.source == kSourceDisplay) {
+        recName_ = L"화면";
+        for (auto& m : monitors_)
+            if (m.handle == target.monitor) recName_ = util::Format(L"화면 %d", m.number);
+    } else if (target.source == kSourceRegion) {
+        recName_ = L"영역";
+    } else {
+        int len = GetWindowTextLengthW(target.hwnd);
+        recName_.assign(len + 1, L'\0');
+        recName_.resize(GetWindowTextW(target.hwnd, recName_.data(), len + 1));
+        if (recName_.empty()) recName_ = L"창";
+    }
     recVideo_ = settings_.output == kOutputVideo;
     if (target.source == kSourceWindow) {
         if (IsIconic(target.hwnd)) {
@@ -838,7 +881,7 @@ void App::BeginCapture() {
     if (recVideo_) {
         VideoOptions v;
         util::EnsureDir(settings_.outDir);
-        std::wstring base = settings_.outDir + L"\\OzMaker_" + util::TimestampName();
+        std::wstring base = settings_.outDir + L"\\" + FileStem(recName_);
         v.path = base + L".mp4";
         for (int i = 2; GetFileAttributesW(v.path.c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
             v.path = base + util::Format(L"_%d.mp4", i);
@@ -910,6 +953,8 @@ void App::StopRecording() {
     }
     if (settings_.sounds) sound::Play(sound::Cue::Stop);
     auto clip = res.clip;
+    if (clip) HoldRecording(clip);
+    clipName_ = recName_;
     if (!clip) {
         ReportError(L"녹화 실패", recTarget_.source == kSourceWindow
                                       ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
@@ -938,6 +983,7 @@ void App::OnVideoSaved(const CaptureResult& r) {
         return;
     }
     if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    AddRecent(r.path);
     lastVideo_ = r;
     if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     showVideo_ = true;
@@ -1060,6 +1106,11 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     cropDrag_ = -1;
     ResetCrop();
     hasResult_ = resultOriginal_ = false;
+    estKey_.clear();
+    fitContent_.clear();
+    estValid_ = fitting_ = fitMissed_ = false;
+    fitBitrate_ = 0;
+    fitCorrection_ = 1;
     // A video stays a video by default; a clip starts with the last 움짤 format.
     bool video = !clip_->SourcePath().empty();
     fmt_ = video && FormatAvailable(Format::Mp4) ? (int)Format::Mp4 : settings_.format;
@@ -1069,6 +1120,84 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     StartThumbnails();
     SetPlaying(true);
     Invalidate();
+}
+
+// ---------------------------------------------------------------- files
+
+// A video dropped on the window, picked in the open dialog or the recent list, or given on the command line.
+void App::OpenMediaFile(const std::wstring& path) {
+    ShowMain(true);
+    filesOpen_ = false;
+    if (rec_ != RecState::Idle) {
+        Toast(L"녹화 중에는 파일을 열 수 없습니다.", true);
+        return;
+    }
+    if (exporter_.Busy()) {
+        Toast(L"내보내기가 끝난 뒤에 열 수 있습니다.", true);
+        return;
+    }
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        Toast(L"파일을 찾을 수 없습니다: " + util::FileNameOf(path), true);
+        return;
+    }
+    std::wstring ext = path.substr(std::min(path.size(), path.find_last_of(L'.')));
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    if (ext == L".gif" || ext == L".webp" || ext == L".avif" || ext == L".png" || ext == L".apng") {
+        Toast(L"움짤은 편집할 수 없습니다. MP4 같은 동영상 파일을 여세요.", true);
+        return;
+    }
+    if (OpenVideo(path)) AddRecent(path);
+}
+
+void App::BrowseForVideo() {
+    filesOpen_ = false;
+    std::wstring path;
+    if (util::PickVideoFile(hwnd_, settings_.outDir, path)) OpenMediaFile(path);
+}
+
+void App::AddRecent(const std::wstring& path) {
+    settings_.AddRecent(path);
+    settings_.Save();
+}
+
+void App::RefreshRecent() {
+    recentFiles_.clear();
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    auto ticks = [](const FILETIME& f) { return (int64_t)((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime); };
+    for (auto& p : settings_.recent) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa) || (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        RecentFile f;
+        f.path = p;
+        f.bytes = (uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
+        f.age = std::max<int64_t>(0, ticks(nowFt) - ticks(fa.ftLastWriteTime)) / 1e7;
+        std::wstring ext = p.substr(std::min(p.size(), p.find_last_of(L'.')));
+        for (auto& c : ext) c = (wchar_t)towlower(c);
+        f.video = ext != L".gif" && ext != L".webp" && ext != L".avif";
+        recentFiles_.push_back(std::move(f));
+    }
+}
+
+void App::HoldRecording(std::shared_ptr<Clip> clip) {
+    held_.insert(held_.begin(), {std::move(clip), util::NowSeconds(), recName_});
+    // Bounded: each one keeps a temporary file of compressed frames.
+    if (held_.size() > kMaxHeld) {
+        held_.resize(kMaxHeld);
+        Toast(util::Format(L"저장하지 않은 녹화가 %zu개를 넘어 가장 오래된 것을 지웠습니다.", kMaxHeld), true);
+    }
+}
+
+void App::DropHeld(const Clip* clip) {
+    std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
+}
+
+bool App::ConfirmQuit() {
+    if (held_.empty()) return true;
+    std::wstring msg = util::Format(L"저장하지 않은 녹화가 %zu개 있습니다.\n종료하면 사라집니다. 종료할까요?", held_.size());
+    return MessageBoxW(hwnd_, msg.c_str(), L"OzMaker", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
 }
 
 bool App::OpenVideo(const std::wstring& path) {
@@ -1194,7 +1323,7 @@ size_t App::PlayheadFromClock() {
     int64_t t = playTs_ + (int64_t)((now - playWall_) * 1e7 * speed);
     if (t < start) t = start;
     if (t >= end) {
-        if (settings_.loop) {
+        if (kLoopOptions[settings_.loopIdx] != 1) {
             t = start + (t - start) % len;
             // Restart the clock at the loop point (the sound restarts with it).
             playTs_ = t;
@@ -1232,16 +1361,16 @@ void App::ApplyCropAspect() {
     crop_ = {x, y, x + w, y + h};
 }
 
-void App::OutputSize(int& w, int& h) const {
+void App::OutputSize(int& w, int& h, int scaleIdx) const {
     int cw = crop_.right - crop_.left, ch = crop_.bottom - crop_.top;
-    int pct = kScaleOptions[settings_.scaleIdx];
-    double s = pct == 33 ? 1.0 / 3.0 : pct / 100.0;
+    const ExportSize& o = kExportSizes[scaleIdx < 0 ? settings_.scaleIdx : scaleIdx];
+    double s = o.width ? std::min(1.0, o.width / (double)std::max(1, cw)) : o.percent == 33 ? 1.0 / 3.0 : o.percent / 100.0;
     w = std::max(2, (int)std::lround(cw * s) & ~1);
     h = std::max(2, (int)std::lround(ch * s) & ~1);
 }
 
-double App::EffectiveOutFps() const {
-    double limit = kOutFpsOptions[settings_.outFpsIdx];
+double App::EffectiveOutFps(int outFpsIdx) const {
+    double limit = kOutFpsOptions[outFpsIdx < 0 ? settings_.outFpsIdx : outFpsIdx];
     if (fmt_ == (int)Format::Mp4) {
         // Constant rate: the chosen one, or the source's own rounded up to a usual rate (29.4 -> 30).
         if (limit > 0) return limit;
@@ -1275,9 +1404,24 @@ VideoConfig App::VideoSettings(int fps) const {
 }
 
 // Exports of a video are named after it ("<name>_trim.mp4", "<name>.gif"); a fresh clip gets a timestamp.
+std::wstring App::FileStem(const std::wstring& what) const {
+    std::wstring s = settings_.nameTemplate, ts = util::TimestampName();
+    std::wstring name = util::SafeFileName(what.empty() ? L"OzMaker" : what, 60);
+    if (name.empty()) name = L"OzMaker";
+    auto fill = [&](std::wstring_view key, const std::wstring& v) {
+        for (size_t p; (p = s.find(key)) != std::wstring::npos;) s.replace(p, key.size(), v);
+    };
+    fill(L"{날짜}", ts);
+    fill(L"{date}", ts);
+    fill(L"{창 이름}", name);
+    fill(L"{window}", name);
+    s = util::SafeFileName(s, 120);
+    return s.empty() ? L"OzMaker_" + ts : s;
+}
+
 std::wstring App::ExportName(Format f) const {
     std::wstring ext = FormatExt(f), src = clip_ ? clip_->SourcePath() : std::wstring();
-    std::wstring stem = L"OzMaker_" + util::TimestampName();
+    std::wstring stem = FileStem(clipName_);
     if (!src.empty()) {
         stem = util::FileNameOf(src);
         if (size_t dot = stem.rfind(L'.'); dot != std::wstring::npos) stem.resize(dot);
@@ -1311,26 +1455,11 @@ void App::StartExport(bool saveAs) {
         Toast(L"편집 중인 원본 파일에는 덮어쓸 수 없습니다. 다른 이름을 고르세요.", true);
         return;
     }
-    ExportJob job;
-    job.clip = clip_;
-    job.first = inF_;
-    job.last = outF_;
-    job.crop = crop_;
-    OutputSize(job.outW, job.outH);
-    job.fpsLimit = EffectiveOutFps();
-    job.speed = kSpeedOptions[settings_.speedIdx];
-    job.format = f;
-    job.loop = settings_.loop;
-    if (f == Format::Mp4) {
-        job.video = VideoSettings((int)std::lround(job.fpsLimit));
-        job.audio.enabled = ExportAudio();
-        job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
-    } else {
-        job.quality = settings_.quality[fmt_];
-    }
+    ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, f == Format::Mp4 ? 0 : settings_.quality[fmt_]);
     job.path = path;
     settings_.Save();
     hasResult_ = resultOriginal_ = false;
+    exportEstimate_ = estValid_ && estKey_ == EstimateKey() ? estBytes_ : 0;
     exporter_.Start(std::move(job), hwnd_, WM_APP_EXPORT_DONE);
     Invalidate();
 }
@@ -1345,7 +1474,202 @@ void App::OnExportDone() {
         lastResult_ = r;
         hasResult_ = true;
         resultOriginal_ = false;
+        DropHeld(clip_.get());  // exported: nothing to protect any more
+        AddRecent(r.path);
         if (settings_.sounds) sound::Play(sound::Cue::Saved);
+        uint64_t target = (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
+        if (target && r.bytes > target) {
+            // The guess was low for this clip: learn by how much and fit again, smaller.
+            if (exportEstimate_) fitCorrection_ = std::clamp(fitCorrection_ * r.bytes / (double)exportEstimate_, 1.0, 4.0);
+            fitContent_.clear();
+            Toast(util::Format(L"목표 %dMB보다 커졌습니다(%s). 더 작게 다시 맞췄으니 한 번 더 저장하세요.",
+                               kTargetMB[settings_.targetIdx], util::FormatBytes(r.bytes).c_str()),
+                  true);
+        }
+    }
+    Invalidate();
+}
+
+ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
+    ExportJob job;
+    job.clip = clip_;
+    job.first = inF_;
+    job.last = outF_;
+    job.crop = crop_;
+    OutputSize(job.outW, job.outH, scaleIdx);
+    job.fpsLimit = EffectiveOutFps(outFpsIdx);
+    job.speed = kSpeedOptions[settings_.speedIdx];
+    job.format = (Format)fmt_;
+    job.plays = kLoopOptions[settings_.loopIdx];
+    job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
+    if (job.format == Format::Mp4) {
+        job.video = VideoSettings((int)std::lround(job.fpsLimit));
+        if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
+        job.audio.enabled = ExportAudio();
+        job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
+    } else {
+        job.quality = quality;
+    }
+    return job;
+}
+
+std::wstring App::ContentKey() const {
+    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top, crop_.right,
+                        crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx);
+}
+
+std::wstring App::EstimateKey() const {
+    return ContentKey() + util::Format(L" %d %d %d %d %d %d %d %u %d %d", settings_.scaleIdx, settings_.outFpsIdx,
+                                       fmt_ < 3 ? settings_.quality[fmt_] : 0, settings_.holdLast, ExportAudio(),
+                                       settings_.vCodec, settings_.vBitrateIdx, fitBitrate_, settings_.aBitrateIdx,
+                                       settings_.vFpsIdx);
+}
+
+// Called while the export panel is up: refits when what the fit depends on changed, else re-estimates (a moment
+// after the last change, so dragging a slider doesn't start one per frame).
+void App::UpdateEstimate() {
+    if (!clip_ || !FormatAvailable((Format)fmt_)) return;
+    double now = util::NowSeconds();
+    if (settings_.targetIdx && ContentKey() != fitContent_) {
+        StartFit();
+        return;
+    }
+    if (fitting_) return;
+    std::wstring key = EstimateKey();
+    if (key != estKey_) {
+        estKey_ = key;
+        estValid_ = false;
+        estDue_ = now + 0.35;
+    }
+    if (estDue_ > 0 && now >= estDue_) {
+        estDue_ = 0;
+        estimator_.Start({MakeJob(settings_.scaleIdx, settings_.outFpsIdx, fmt_ < 3 ? settings_.quality[fmt_] : 0)}, 0,
+                         ++estSerial_, hwnd_, WM_APP_ESTIMATE);
+    } else if (estDue_ > 0) {
+        RequestWake(estDue_);
+    }
+}
+
+// Picks size, frame rate and quality (움짤) or the bitrate (MP4) so the export lands under the target. Starts from
+// the best and steps the three down in turns, so none of them drops all the way first.
+void App::StartFit() {
+    fitContent_ = ContentKey();
+    fitMissed_ = false;
+    const uint64_t target = fitTargetForTest_ ? fitTargetForTest_ : (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
+    const Format f = (Format)fmt_;
+    // Sizes and frame rates that make a difference here, largest first.
+    std::vector<int> sizes, rates;
+    for (int i = 0; i < (int)_countof(kExportSizes); ++i) {
+        int w, h;
+        OutputSize(w, h, i);
+        bool dup = false;
+        for (int j : sizes) {
+            int w2, h2;
+            OutputSize(w2, h2, j);
+            dup |= w2 == w;
+        }
+        if (!dup) sizes.push_back(i);
+    }
+    std::stable_sort(sizes.begin(), sizes.end(), [&](int a, int b) {
+        int wa, ha, wb, hb;
+        OutputSize(wa, ha, a);
+        OutputSize(wb, hb, b);
+        return wa > wb;
+    });
+    // What each frame-rate choice really gives (a cap above the clip's own rate changes nothing).
+    const double speed = kSpeedOptions[settings_.speedIdx];
+    auto outRate = [&](int i) {
+        if (f == Format::Mp4) return EffectiveOutFps(i);
+        auto plan = PlanFrames(*clip_, inF_, outF_, EffectiveOutFps(i), speed);
+        double ms = 0;
+        for (auto& p : plan) ms += p.durationMs;
+        return ms > 0 ? plan.size() * 1000.0 / ms : 0.0;
+    };
+    std::vector<double> rateOf;
+    for (int i = 0; i < (int)_countof(kOutFpsOptions); ++i) rateOf.push_back(outRate(i));
+    for (int i = 0; i < (int)_countof(kOutFpsOptions); ++i) {
+        bool dup = false;
+        for (int j : rates) dup |= std::fabs(rateOf[j] - rateOf[i]) < 0.5;
+        if (!dup) rates.push_back(i);
+    }
+    std::stable_sort(rates.begin(), rates.end(), [&](int a, int b) { return rateOf[a] > rateOf[b]; });
+
+    if (f == Format::Mp4) {
+        // The bitrate decides the size; shrink the picture only when that bitrate would starve it.
+        fitting_ = false;
+        const double sec = std::max(0.1, PlanVideoFrames(*clip_, inF_, outF_, EffectiveOutFps(), speed).size() /
+                                             EffectiveOutFps());
+        double audio = ExportAudio() ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000.0 : 0;
+        double video = std::max(2e5, target * 8 * 0.9 / fitCorrection_ / sec - audio);
+        int pick = sizes.front();
+        for (int s : sizes) {
+            int w, h;
+            OutputSize(w, h, s);
+            pick = s;
+            if (video / ((double)w * h * EffectiveOutFps()) >= 0.03) break;  // bits per pixel still watchable
+        }
+        settings_.scaleIdx = pick;
+        fitBitrate_ = (UINT32)std::min(video, 80e6);
+        estBytes_ = EstimateBytes(MakeJob(pick, settings_.outFpsIdx, 0), std::atomic<bool>{false});
+        estValid_ = true;
+        estKey_ = EstimateKey();
+        fitMissed_ = video <= 2e5 + 1;
+        settingsDirty_ = true;
+        hasResult_ = false;
+        return;
+    }
+
+    std::vector<int> qualities = {settings_.quality[fmt_]};
+    if (f != Format::Gif)
+        for (int q : {70, 55, 40})
+            if (q < qualities.back()) qualities.push_back(q);
+    fitKnobs_.clear();
+    std::vector<ExportJob> jobs;
+    size_t si = 0, ri = 0, qi = 0;
+    auto add = [&] {
+        fitKnobs_.push_back({sizes[si], rates[ri], qualities[qi]});
+        jobs.push_back(MakeJob(sizes[si], rates[ri], qualities[qi]));
+    };
+    add();
+    // Frame rate, size, quality, frame rate, ... skipping whichever is already at its lowest.
+    for (int step = 0, idle = 0; idle < 3; step = (step + 1) % 3) {
+        bool moved = (step == 0 && ri + 1 < rates.size() && ++ri) || (step == 1 && si + 1 < sizes.size() && ++si) ||
+                     (step == 2 && qi + 1 < qualities.size() && ++qi);
+        if (moved) {
+            add();
+            idle = 0;
+        } else {
+            ++idle;
+        }
+    }
+    fitting_ = true;
+    estValid_ = false;
+    estDue_ = 0;
+    // Aim a little under: the estimate is a guess.
+    estimator_.Start(std::move(jobs), (uint64_t)(target * 0.9 / fitCorrection_), fitSerial_ = ++estSerial_, hwnd_,
+                     WM_APP_ESTIMATE);
+}
+
+void App::OnEstimate() {
+    Estimator::Result r;
+    if (!estimator_.Take(r)) return;
+    if (r.serial == fitSerial_ && fitting_) {
+        fitting_ = false;
+        if (r.chosen >= 0 && r.chosen < (int)fitKnobs_.size()) {
+            const FitKnobs& k = fitKnobs_[r.chosen];
+            settings_.scaleIdx = k.scaleIdx;
+            settings_.outFpsIdx = k.outFpsIdx;
+            if (fmt_ < 3) settings_.quality[fmt_] = k.quality;
+            fitMissed_ = !r.fits;
+            settingsDirty_ = true;
+            hasResult_ = false;
+        }
+        estBytes_ = (uint64_t)(r.bytes * fitCorrection_);
+        estValid_ = r.chosen >= 0;
+        estKey_ = EstimateKey();
+    } else if (r.serial == estSerial_) {
+        estBytes_ = (uint64_t)(r.bytes * fitCorrection_);
+        estValid_ = r.chosen >= 0;
     }
     Invalidate();
 }
@@ -1487,6 +1811,7 @@ void App::TrayMenu() {
                 StopRecording();
             break;
         case 3:
+            if (!ConfirmQuit()) break;
             quitting_ = true;
             DestroyWindow(hwnd_);
             break;

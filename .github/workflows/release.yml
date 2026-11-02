@@ -1,10 +1,20 @@
 # Full build with WebP and AVIF (vcpkg on the runner), self-test, and the distribution zip.
-# A v* tag publishes the zip as a GitHub release; a manual run only uploads it as an artifact.
+# A v* tag publishes the zip as a GitHub release; a manual run or a pull request that touches the encoder build
+# only uploads it as an artifact.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - vcpkg.json
+      - triplets/**
+      - src/encoders/**
+      - OzMaker.vcxproj
+      - tools/package.ps1
+      - tools/ci-selftest.ps1
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:

@@ -31,7 +31,10 @@ private:
         WM_APP_SHOW,  // = WM_APP + 5, sent by a second instance (main.cpp)
         WM_APP_QUIT,  // = WM_APP + 6, sent by --exit (main.cpp)
         WM_APP_FRAME,
+        WM_APP_OPEN,  // a file handed over by a second instance (main.cpp), opened after its SendMessage returns
+        WM_APP_ESTIMATE,
     };
+    static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
     enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh };
     enum class RecState { Idle, Countdown, Recording };
@@ -70,6 +73,8 @@ private:
     void DrawExportPanel(Rect r);
     void DrawSettings(Rect r);
     void DrawToast(Rect client);
+    void DrawFilesButton(Rect& right);
+    void DrawFilesPopover(Rect client);
     void SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
                     const std::function<void(Rect)>& control);
     void SettingSection(Rect& area, std::wstring_view title);
@@ -101,6 +106,15 @@ private:
     std::wstring VideoSummary() const;
     std::wstring AudioSummary(int source) const;
 
+    // ---- files: opening videos, recent files, recordings not exported yet
+    void OpenMediaFile(const std::wstring& path);
+    void BrowseForVideo();
+    void AddRecent(const std::wstring& path);
+    void RefreshRecent();
+    void HoldRecording(std::shared_ptr<Clip> clip);
+    void DropHeld(const Clip* clip);
+    bool ConfirmQuit();
+
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
     bool OpenVideo(const std::wstring& path);
@@ -115,11 +129,18 @@ private:
     void Seek(size_t index);
     size_t PlayheadFromClock();
     int64_t RangeEndTs() const;
-    void OutputSize(int& w, int& h) const;
-    double EffectiveOutFps() const;
+    void OutputSize(int& w, int& h, int scaleIdx = -1) const;  // -1 = the current setting
+    double EffectiveOutFps(int outFpsIdx = -1) const;
+    ExportJob MakeJob(int scaleIdx, int outFpsIdx, int quality) const;  // without a path
+    std::wstring EstimateKey() const;  // everything the size of the export depends on
+    std::wstring ContentKey() const;   // what a size fit depends on (not the settings it picks)
+    void UpdateEstimate();
+    void StartFit();
+    void OnEstimate();
     bool ExportAudio() const;
     VideoConfig VideoSettings(int fps) const;
     std::wstring ExportName(Format f) const;
+    std::wstring FileStem(const std::wstring& what) const;  // settings_.nameTemplate filled in
     void StartExport(bool saveAs);
     void OnExportDone();
     void StartThumbnails();
@@ -144,6 +165,7 @@ private:
     int RunAnalyzeTest(const std::wstring& args);
     int RunVideoTest(const std::wstring& dir, int w, int h);
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
+    int RunRegionTest(const std::wstring& dir);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
 
     // ---- state
@@ -179,6 +201,8 @@ private:
     RecTarget recTarget_;
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     std::wstring recNotice_;
+    std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")
+    std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
     bool showVideo_ = false;
     bool encProbed_ = false;
@@ -219,6 +243,42 @@ private:
     int thumbW_ = 0, thumbH_ = 0;
     std::vector<ComPtr<ID2D1Bitmap1>> thumbs_;
 
+    // Recordings stay here until exported, so a new one doesn't silently replace them.
+    struct HeldClip {
+        std::shared_ptr<Clip> clip;
+        double when = 0;
+        std::wstring name;
+    };
+    static constexpr size_t kMaxHeld = 5;
+    std::vector<HeldClip> held_;  // newest first
+    struct RecentFile {
+        std::wstring path;
+        uint64_t bytes = 0;
+        double age = 0;  // seconds since written
+        bool video = false;
+    };
+    std::vector<RecentFile> recentFiles_;  // existing files of settings_.recent, refreshed when the list opens
+    bool filesOpen_ = false;
+    Rect filesBtn_;
+    float filesScroll_ = 0;
+    std::wstring pendingOpen_;
+
+    // Export size estimate and "용량 맞추기" (EstimateBytes on the estimator's thread).
+    struct FitKnobs {
+        int scaleIdx, outFpsIdx, quality;
+    };
+    Estimator estimator_;
+    uint32_t estSerial_ = 0, fitSerial_ = 0;
+    std::wstring estKey_, fitContent_;
+    double estDue_ = 0;
+    uint64_t estBytes_ = 0;
+    bool estValid_ = false, fitting_ = false, fitMissed_ = false;
+    std::vector<FitKnobs> fitKnobs_;
+    UINT32 fitBitrate_ = 0;     // MP4 under a target: the video bitrate that fits
+    double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
+    uint64_t exportEstimate_ = 0;
+    uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
+
     Exporter exporter_;
     ExportResult lastResult_;
     bool hasResult_ = false;
@@ -229,7 +289,10 @@ private:
     double toastUntil_ = 0;
 
     bool capturingHotkey_ = false, hotkeyOk_ = true;
+    bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
+    float exportScroll_ = 0, exportContentH_ = 0;
+    bool autostart_ = false;
     NOTIFYICONDATAW nid_{};
     HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr;
     UINT taskbarCreated_ = 0;

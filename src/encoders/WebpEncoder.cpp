@@ -19,7 +19,7 @@ public:
         path_ = p.path;
         WebPAnimEncoderOptions ao;
         if (!WebPAnimEncoderOptionsInit(&ao)) return Fail(err, L"libwebp 버전이 맞지 않습니다.");
-        ao.anim_params.loop_count = p.loop ? 0 : 1;
+        ao.anim_params.loop_count = p.plays;  // total plays, 0 = forever
         ao.allow_mixed = 0;
         ao.minimize_size = 0;
         enc_ = WebPAnimEncoderNew(w_, h_, &ao);

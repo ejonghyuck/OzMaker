@@ -22,7 +22,7 @@ public:
         enc_->maxThreads = (int)std::max(1u, std::thread::hardware_concurrency());
         enc_->speed = 8;
         enc_->timescale = 1000;
-        enc_->repetitionCount = p.loop ? AVIF_REPETITION_COUNT_INFINITE : 0;
+        enc_->repetitionCount = p.plays > 0 ? p.plays - 1 : AVIF_REPETITION_COUNT_INFINITE;  // repeats after the first
         enc_->quality = std::clamp(p.quality, 1, 100);
         enc_->qualityAlpha = AVIF_QUALITY_LOSSLESS;
 

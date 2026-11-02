@@ -1,9 +1,10 @@
 #pragma once
 #include "Clip.h"
 
-// An MP4 file as a clip. Opening it reads every frame's time from the container without decoding; readers decode
-// on demand (on the GPU when the decoder supports it), continuing forward when they can and otherwise seeking to
-// the keyframe before the wanted frame.
+// A video file (MP4 and whatever else Media Foundation reads) as a clip. Opening it reads every frame's time from
+// the container without decoding; readers decode on demand (on the GPU when the decoder supports it), continuing
+// forward when they can and otherwise seeking to the keyframe before the wanted frame. Frames come out turned the
+// way the file says to show them (portrait phone videos).
 class VideoClip : public Clip {
 public:
     // scanSamples: skip the sample tables and read every sample (fallback path, tests).
@@ -27,6 +28,10 @@ public:
     // Container time of frame 0; clip time = container time - Offset().
     int64_t Offset() const { return offset_; }
     int AudioRate() const { return audioRate_; }
+    // Clockwise turn from the decoded picture to the frames handed out: 0, 90, 180 or 270.
+    int Rotation() const { return rotation_; }
+    int CodedWidth() const { return rotation_ % 180 ? height_ : width_; }
+    int CodedHeight() const { return rotation_ % 180 ? width_ : height_; }
     // The MP4 writer's AAC encoder takes only these rates; other sound can't be carried into an export.
     bool AudioExportable() const { return audioRate_ == 44100 || audioRate_ == 48000; }
     // Device for hardware decoding shared by the readers; null when there is none.
@@ -58,6 +63,7 @@ private:
     std::vector<size_t> keys_;  // ascending frame indices
     int64_t offset_ = 0, endTs_ = 0;
     int audioRate_ = 0;
+    int rotation_ = 0;
 
     mutable std::mutex devMtx_;
     mutable bool devTried_ = false;

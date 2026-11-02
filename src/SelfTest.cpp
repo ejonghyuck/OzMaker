@@ -27,6 +27,21 @@ bool HasVideoProcessor() {
 }
 
 // Sum of a GIF's frame delays in 1/100 s, read from its graphic control extensions; -1 if unreadable.
+// NETSCAPE loop count of a GIF: -1 = no loop block (plays once), 0 = forever, n = repeats after the first play.
+int GifLoopCount(const std::wstring& path) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        d.assign(buf, buf + n);
+        fclose(f);
+    }
+    const char tag[] = "NETSCAPE2.0";
+    auto it = std::search(d.begin(), d.end(), tag, tag + 11);
+    if (it == d.end() || d.end() - it < 15) return -1;
+    return it[13] | (it[14] << 8);
+}
+
 int GifDurationCs(const std::wstring& path) {
     std::vector<uint8_t> d;
     if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
@@ -142,6 +157,7 @@ std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, dou
 }
 
 int App::RunSelfTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\selftest.log");
     int failures = 0;
@@ -215,6 +231,19 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"%s: %s %s, %d frames, %.2fs, %.0f ms %s", FormatName(fmt), r.ok ? L"ok" : L"FAIL",
                          util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds, (util::NowSeconds() - s) * 1000,
                          r.error.c_str()));
+        // The size guess against the real thing. MP4 is VBR (this test picture needs far less than the bitrate),
+        // so only 움짤 must be close.
+        {
+            std::atomic<bool> cancel{false};
+            s = util::NowSeconds();
+            uint64_t est = EstimateBytes(job, cancel);
+            double ratio = r.bytes ? est / (double)r.bytes : 0;
+            bool good = fmt == Format::Mp4 ? est > 0 : ratio > 0.6 && ratio < 1.6;
+            log(util::Format(L"%s estimate: %s %s vs %s (x%.2f), %.0f ms", FormatName(fmt), good ? L"ok" : L"FAIL",
+                             util::FormatBytes(est).c_str(), util::FormatBytes(r.bytes).c_str(), ratio,
+                             (util::NowSeconds() - s) * 1000));
+            if (!good) ++failures;
+        }
         if (!r.ok) ++failures;
     }
     // Cropped, scaled, rate-limited, sped-up GIF.
@@ -258,11 +287,65 @@ int App::RunSelfTest(const std::wstring& dir) {
                          r.error.c_str()));
         if (!r.ok || std::fabs(cs / 100.0 - N / fps / 2) > 0.03) ++failures;
     }
+    // Loop count and the hold on the last frame, read back from the files.
+    for (int plays : {0, 1, 3}) {
+        ExportJob job;
+        job.clip = clip;
+        job.first = 0;
+        job.last = 29;
+        job.crop = {0, 0, W, H};
+        job.outW = W / 4;
+        job.outH = H / 4;
+        job.fpsLimit = FormatMaxFps(Format::Gif);
+        job.format = Format::Gif;
+        job.plays = plays;
+        job.holdLastMs = plays == 3 ? kHoldLastMs : 0;
+        job.path = dir + util::Format(L"\\selftest_plays%d.gif", plays);
+        ExportResult r = ExportSync(ex, job);
+        int loops = GifLoopCount(job.path), cs = GifDurationCs(job.path);
+        int wantLoops = plays == 0 ? 0 : plays == 1 ? -1 : plays - 1;
+        double wantSec = 30 / fps + job.holdLastMs / 1000;
+        bool good = r.ok && loops == wantLoops && std::fabs(cs / 100.0 - wantSec) < 0.03;
+        log(util::Format(L"GIF plays %d: %s loop block %d, file plays %.2fs (want %.2fs)", plays, good ? L"ok" : L"FAIL",
+                         loops, cs / 100.0, wantSec));
+        if (!good) ++failures;
+    }
+    // 용량 맞추기: a target well under the full-size GIF makes the fit step size/frame rate down; the export with
+    // what it picked must land under the target without shrinking far more than needed.
+    {
+        OpenEditor(MakeSyntheticClip(W, H, N, fps));
+        playing_ = false;
+        fmt_ = (int)Format::Gif;
+        settings_.scaleIdx = settings_.outFpsIdx = 0;
+        settings_.targetIdx = 1;
+        fitTargetForTest_ = 120'000;
+        double s = util::NowSeconds();
+        UpdateEstimate();  // starts the fit
+        while (fitting_ && util::NowSeconds() - s < 120) {
+            Sleep(10);
+            OnEstimate();  // no window to notify here: poll for the result
+        }
+        double fitMs = (util::NowSeconds() - s) * 1000;
+        ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[0]);
+        job.path = dir + L"\\selftest_fit.gif";
+        ExportResult r = ExportSync(ex, job);
+        bool good = !fitting_ && r.ok && r.bytes <= fitTargetForTest_ && r.bytes > fitTargetForTest_ / 4;
+        log(util::Format(L"fit 120 KB: %s %s (estimate %s), %dx%d %.0ffps, %zu candidates, %.0f ms", good ? L"ok" : L"FAIL",
+                         util::FormatBytes(r.bytes).c_str(), util::FormatBytes(estBytes_).c_str(), job.outW, job.outH,
+                         job.fpsLimit, fitKnobs_.size(), fitMs));
+        if (!good) ++failures;
+        fitTargetForTest_ = 0;
+        settings_.targetIdx = 0;
+        CloseEditor();
+        StopThumbnails();
+        clip_.reset();
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
 
 int App::RunScreenshots(const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     const float W = 1120, H = 780;
     double clock = util::NowSeconds();
@@ -282,11 +365,7 @@ int App::RunScreenshots(const std::wstring& dir) {
         }
     };
 
-    // Only list the dedicated test window (if running): other windows' titles are the user's business.
-    windows_.clear();
-    for (auto& w : EnumerateCaptureWindows())
-        if (w.title.find(L"OzMaker Test Window") != std::wstring::npos) windows_.push_back(w);
-    monitors_ = EnumerateMonitors();
+    RefreshWindows();
     target_ = nullptr;
     screen_ = Screen::Home;
     settings_.source = kSourceWindow;
@@ -339,6 +418,15 @@ int App::RunScreenshots(const std::wstring& dir) {
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
             regionPicker_.PaintTest(p, mr, a, c);
         });
+        gfx_.RenderToPng((dir + L"\\region_adjust.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
+            p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
+            POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
+            regionPicker_.PaintTest(p, mr, a, c, true);
+        });
     }
 
     screen_ = Screen::Settings;
@@ -356,7 +444,18 @@ int App::RunScreenshots(const std::wstring& dir) {
     inF_ = 12;
     outF_ = 100;
     playhead_ = 40;
+    {
+        // The estimate shows once it is ready; the screenshot doesn't wait for the worker.
+        std::atomic<bool> cancel{false};
+        estBytes_ = EstimateBytes(MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[fmt_]), cancel);
+        estKey_ = EstimateKey();
+        estValid_ = true;
+    }
     shot(L"editor.png", 96);
+    settings_.targetIdx = 3;  // 15MB: the fit is under way in this shot
+    shot(L"editor_target.png", 96);
+    settings_.targetIdx = 0;
+    fitting_ = false;
     cropMode_ = true;
     crop_ = {120, 60, 840, 465};
     hasResult_ = true;
@@ -366,7 +465,25 @@ int App::RunScreenshots(const std::wstring& dir) {
     toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
     toastUntil_ = clock + 60;
     shot(L"editor_toast.png", 96);
+    toast_ = L"동영상 인코더를 시작하지 못했습니다(0x8007000E). 설정 › 동영상에서 하드웨어 인코딩을 끄거나 해상도를 "
+             L"낮춰 보세요. 그래픽 드라이버를 최신으로 업데이트하면 해결되는 경우도 많습니다.";
+    toastError_ = true;
+    shot(L"editor_toast_long.png", 96);
+    toastError_ = false;
+    toastUntil_ = 0;
     CloseEditor();
+
+    // Files list: two recordings not exported yet and a few recent files (names only, nothing on disk).
+    held_ = {{MakeSyntheticClip(320, 180, 30, 30), clock - 40, L"OzMaker Test Window"},
+             {clip_, clock - 1500, L"화면 1"}};
+    recentFiles_ = {{settings_.outDir + L"\\OzMaker_20261102_142311.gif", 2'345'678, 300, false},
+                    {settings_.outDir + L"\\OzMaker_20261102_140205.mp4", 48'213'004, 4000, true},
+                    {settings_.outDir + L"\\OzMaker_20261101_221940.webp", 812'004, 90000, false}};
+    filesOpen_ = true;
+    shot(L"files_popover.png", 96);
+    filesOpen_ = false;
+    held_.clear();
+    recentFiles_.clear();
     return 0;
 }
 
@@ -799,6 +916,86 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
     return w.Finish(err);
 }
 
+// A copy of an MP4 whose video track says to show it turned clockwise by cw degrees, the way phones mark portrait
+// video: the display matrix and size in the track header (tkhd) change, the pictures stay as they are.
+bool WriteRotatedCopy(const std::wstring& src, const std::wstring& dst, int cw) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(src.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    auto be32 = [&](size_t p) { return (uint32_t)d[p] << 24 | (uint32_t)d[p + 1] << 16 | (uint32_t)d[p + 2] << 8 | d[p + 3]; };
+    auto put32 = [&](size_t p, uint32_t v) {
+        for (int i = 0; i < 4; ++i) d[p + i] = (uint8_t)(v >> (24 - 8 * i));
+    };
+    // Boxes directly inside [from, to): returns the payload offset of the first of that type, 0 if none.
+    auto find = [&](size_t from, size_t to, const char* type) -> size_t {
+        for (size_t p = from; p + 8 <= to;) {
+            uint32_t size = be32(p);
+            if (size < 8 || p + size > to) return 0;
+            if (!memcmp(&d[p + 4], type, 4)) return p + 8;
+            p += size;
+        }
+        return 0;
+    };
+    auto end = [&](size_t payload) { return payload - 8 + be32(payload - 8); };
+    size_t moov = find(0, d.size(), "moov");
+    if (!moov) return false;
+    for (size_t p = moov; p + 8 <= end(moov);) {
+        size_t trak = find(p, end(moov), "trak");
+        if (!trak) return false;
+        p = end(trak);
+        size_t mdia = find(trak, end(trak), "mdia");
+        size_t hdlr = mdia ? find(mdia, end(mdia), "hdlr") : 0;
+        if (!hdlr || memcmp(&d[hdlr + 8], "vide", 4)) continue;
+        size_t tkhd = find(trak, end(trak), "tkhd");
+        if (!tkhd) return false;
+        size_t m = tkhd + (d[tkhd] == 1 ? 52 : 40);  // matrix after the version-dependent times
+        uint32_t w = be32(m + 36), h = be32(m + 40);  // 16.16
+        const uint32_t one = 0x10000, neg = 0xFFFF0000;
+        uint32_t a = 0, b = 0, c = 0, e = 0, x = 0, y = 0;
+        if (cw == 90) b = one, c = neg, x = h;
+        else if (cw == 180) a = neg, e = neg, x = w, y = h;
+        else if (cw == 270) b = neg, c = one, y = w;
+        else a = e = one;
+        uint32_t mat[9] = {a, b, 0, c, e, 0, x, y, 0x40000000};
+        for (int i = 0; i < 9; ++i) put32(m + i * 4, mat[i]);
+        if (cw % 180) {
+            put32(m + 36, h);
+            put32(m + 40, w);
+        }
+        FILE* f = _wfsopen(dst.c_str(), L"wb", _SH_DENYNO);
+        if (!f) return false;
+        bool ok = fwrite(d.data(), 1, d.size(), f) == d.size();
+        fclose(f);
+        return ok;
+    }
+    return false;
+}
+
+// A copy of an MP4 whose video sample entry claims a codec nobody has ('avc1' -> 'oz00').
+bool WriteUnknownCodecCopy(const std::wstring& src, const std::wstring& dst) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(src.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    auto at = [&](const char* s, size_t from) {
+        auto it = std::search(d.begin() + std::min(from, d.size()), d.end(), s, s + 4);
+        return it == d.end() ? SIZE_MAX : (size_t)(it - d.begin());
+    };
+    size_t stsd = at("stsd", 0), entry = stsd == SIZE_MAX ? SIZE_MAX : at("avc1", stsd);
+    if (entry == SIZE_MAX) return false;
+    memcpy(&d[entry], "oz00", 4);
+    FILE* f = _wfsopen(dst.c_str(), L"wb", _SH_DENYNO);
+    if (!f) return false;
+    bool ok = fwrite(d.data(), 1, d.size(), f) == d.size();
+    fclose(f);
+    return ok;
+}
+
 std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double seconds, int& rate) {
     VideoClip::AudioReader ar;
     std::vector<int16_t> out;
@@ -813,6 +1010,7 @@ std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double secon
 }  // namespace
 
 int App::RunVideoTest(const std::wstring& dir, int W, int H) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\video.log");
     int failures = 0;
@@ -873,6 +1071,51 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
             times += util::Format(L" %d:%.0fms", i, (util::NowSeconds() - t0) * 1000);
         }
         check(bad == 0, util::Format(L"random access: %d wrong,", bad) + times);
+    }
+
+    // No decoder for the video: opening says so instead of showing a blank editor.
+    {
+        std::wstring bad = dir + L"\\vt_unknown_codec.mp4", why;
+        bool made = WriteUnknownCodecCopy(src, bad);
+        auto c = made ? VideoClip::Open(bad, why) : nullptr;
+        check(made && !c && why.find(L"oz00") != std::wstring::npos, L"unknown codec: " + why);
+    }
+
+    // Portrait phone video: the frames come out turned the way the file says.
+    for (int cw : {90, 180, 270}) {
+        std::wstring rotPath = dir + util::Format(L"\\vt_rot%d.mp4", cw);
+        auto rot = WriteRotatedCopy(src, rotPath, cw) ? VideoClip::Open(rotPath, err) : nullptr;
+        if (!rot) {
+            check(false, util::Format(L"rotated %d: can't open (%s)", cw, err.c_str()));
+            continue;
+        }
+        auto ra = clip->NewReader(), rb = rot->NewReader();
+        const uint8_t* pa = ra->Get(45);
+        const uint8_t* pb = rb->Get(45);
+        int bad = 0, points = 0;
+        const int RW = cw == 180 ? W : H, RH = cw == 180 ? H : W;
+        if (pa && pb && rot->Width() == RW && rot->Height() == RH) {
+            for (int y = 0; y < H; y += 7)
+                for (int x = 0; x < W; x += 7) {
+                    // Where source pixel (x, y) ends up after the clockwise turn.
+                    int ox = cw == 90 ? H - 1 - y : cw == 180 ? W - 1 - x : y;
+                    int oy = cw == 90 ? x : cw == 180 ? H - 1 - y : W - 1 - x;
+                    const uint8_t* s = pa + ((size_t)y * W + x) * 4;
+                    const uint8_t* t = pb + ((size_t)oy * RW + ox) * 4;
+                    // The video processor that turns the picture resamples colour a little at sharp edges.
+                    ++points;
+                    for (int k = 0; k < 3; ++k)
+                        if (std::abs(s[k] - t[k]) > 40) {
+                            ++bad;
+                            break;
+                        }
+                }
+            if (cw == 90) SavePng(gfx_.Wic(), dir + L"\\vt_rot90_frame45.png", pb, RW, RH);
+        }
+        check(pa && pb && rot->Rotation() == cw && rot->Width() == RW && rot->Height() == RH && points > 0 &&
+                  bad * 20 < points,
+              util::Format(L"rotated %d: %dx%d, turn %d, %d of %d pixels out of place", cw, rot->Width(),
+                           rot->Height(), rot->Rotation(), bad, points));
     }
 
     // Source audio: where does the tone step at 1.000 s land after the AAC round trip?
@@ -1029,9 +1272,113 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     return failures ? 2 : 0;
 }
 
+// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys.
+int App::RunRegionTest(const std::wstring& dir) {
+    util::EnsureDir(dir);
+    Log log(dir + L"\\region.log");
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const int ox = mi.rcMonitor.left, oy = mi.rcMonitor.top;
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    bool done = false, ok = false;
+    RECT got{};
+    auto pump = [&](double s) {
+        double until = util::NowSeconds() + s;
+        MSG msg;
+        while (util::NowSeconds() < until) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(5);
+        }
+    };
+    auto start = [&] {
+        done = ok = false;
+        regionPicker_.Start({}, [&](bool o, RECT r) {
+            done = true;
+            ok = o;
+            got = r;
+        });
+        pump(0.15);
+    };
+    // Monitor-relative points to the picker's client coordinates (it covers the virtual screen).
+    auto post = [&](UINT msg, int x, int y, WPARAM w = 0) {
+        PostMessageW(regionPicker_.Hwnd(), msg, w, MAKELPARAM(ox + x - vx, oy + y - vy));
+    };
+    auto drag = [&](int x0, int y0, int x1, int y1) {
+        post(WM_MOUSEMOVE, x0, y0);
+        post(WM_LBUTTONDOWN, x0, y0, MK_LBUTTON);
+        for (int t = 1; t <= 4; ++t) post(WM_MOUSEMOVE, x0 + (x1 - x0) * t / 4, y0 + (y1 - y0) * t / 4, MK_LBUTTON);
+        post(WM_LBUTTONUP, x1, y1);
+        pump(0.12);
+    };
+    auto key = [&](UINT vk) {
+        PostMessageW(regionPicker_.Hwnd(), WM_KEYDOWN, vk, 0);
+        pump(0.08);
+    };
+    auto rel = [&](RECT r) {
+        return util::Format(L"%d,%d-%d,%d", r.left - ox, r.top - oy, r.right - ox, r.bottom - oy);
+    };
+    auto is = [&](RECT r, int l, int t, int rr, int b) {
+        return r.left - ox == l && r.top - oy == t && r.right - ox == rr && r.bottom - oy == b;
+    };
+
+    start();
+    drag(200, 150, 1000, 600);
+    RECT s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && is(s, 200, 150, 1001, 601), L"drag, then adjusting: " + rel(s));
+    drag(600, 375, 700, 425);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 200, 1101, 651), L"move by 100,50: " + rel(s));
+    drag(1101, 651, 1151, 681);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 200, 1151, 681), L"bottom-right handle +50,+30: " + rel(s));
+    RECT b = regionPicker_.ToolbarButton(3);  // 16:9
+    post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
+    post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 201, 1151, 680), L"16:9 keeps width and centre: " + rel(s));
+    drag(s.right - ox, s.bottom - oy, s.right - ox + 100, s.bottom - oy + 20);
+    s = regionPicker_.AdjustedArea();
+    double k = (s.right - s.left) / (double)(s.bottom - s.top);
+    check(s.left - ox == 300 && s.top - oy == 201 && std::fabs(k - 16.0 / 9) < 0.01 && s.right - ox == 1251,
+          util::Format(L"corner drag keeps 16:9 (%.4f): ", k) + rel(s));
+    drag(s.right - ox, (s.top + s.bottom) / 2 - oy, s.right - ox - 300, (s.top + s.bottom) / 2 - oy);
+    s = regionPicker_.AdjustedArea();
+    k = (s.right - s.left) / (double)(s.bottom - s.top);
+    check(s.left - ox == 300 && s.right - ox == 951 && std::fabs(k - 16.0 / 9) < 0.01,
+          util::Format(L"right edge drag keeps 16:9 (%.4f): ", k) + rel(s));
+    RECT before = s;
+    key(VK_RIGHT);
+    s = regionPicker_.AdjustedArea();
+    check(s.left == before.left + 1 && s.right == before.right + 1 && s.top == before.top, L"arrow key moves 1px: " + rel(s));
+    key(VK_RETURN);
+    check(done && ok && EqualRect(&got, &s) && !regionPicker_.Active(), L"Enter confirms: " + rel(got));
+
+    start();
+    post(WM_MOUSEMOVE, 400, 300);
+    post(WM_LBUTTONDOWN, 400, 300, MK_LBUTTON);
+    post(WM_LBUTTONUP, 400, 300);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click (no window) takes the screen: " + rel(s));
+    key(VK_ESCAPE);
+    check(done && !ok && !regionPicker_.Active(), L"Esc cancels");
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
 // The post-recording flow in the real window and message loop: a saved MP4 opens in the editor, plays through
 // the frame fetcher, gets trimmed with the keyboard and exported, then the editor is closed and reopened.
 int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
+    testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\editor.log");
     int failures = 0;

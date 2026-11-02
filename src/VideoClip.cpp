@@ -14,13 +14,16 @@ private:
     bool CreateReader(bool gpu);
     void ReadOutputType();
     bool CopyOut(IMFSample* s);
+    const uint8_t* Out() const;  // the frame in have_, turned for display
 
     const VideoClip* c_;
     ComPtr<IMFSourceReader> rd_;
     bool inited_ = false, failed_ = false, eos_ = true;
     size_t pos_ = SIZE_MAX;   // last frame the decoder delivered
     size_t have_ = SIZE_MAX;  // frame in buf_
-    std::vector<uint8_t> buf_;
+    std::vector<uint8_t> buf_;  // decoded picture (coded size)
+    std::vector<uint8_t> rot_;  // turned for display, when the decoder hands out the picture as coded
+    bool turn_ = false;
     UINT32 outW_ = 0, outH_ = 0;
     LONG stride_ = 0;
     int apX_ = 0, apY_ = 0;
@@ -66,10 +69,19 @@ void VideoReader::ReadOutputType() {
     // The decoded frame can be padded (1080 -> 1088); the picture sits at the display aperture.
     MFVideoArea ap{};
     apX_ = apY_ = 0;
+    UINT32 pw = outW_, ph = outH_;
     if (SUCCEEDED(t->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&ap, sizeof(ap), nullptr))) {
         apX_ = std::max(0, (int)ap.OffsetX.value);
         apY_ = std::max(0, (int)ap.OffsetY.value);
+        if (ap.Area.cx > 0 && ap.Area.cy > 0) pw = ap.Area.cx, ph = ap.Area.cy;
     }
+    // The video processor normally turns the picture already (and clears the attribute); turn it here otherwise.
+    const int rot = c_->Rotation();
+    if (rot % 180 && c_->Width() != c_->Height())
+        turn_ = (int)pw == c_->CodedWidth() && (int)ph == c_->CodedHeight();
+    else
+        turn_ = rot && MFGetAttributeUINT32(t.Get(), MF_MT_VIDEO_ROTATION, 0) != 0;
+    if (turn_ && rot_.empty()) rot_.assign((size_t)c_->Width() * c_->Height() * 4, 0);
 }
 
 bool VideoReader::CopyOut(IMFSample* s) {
@@ -85,7 +97,7 @@ bool VideoReader::CopyOut(IMFSample* s) {
         pitch = stride_;
         if (pitch < 0) p += (size_t)(-pitch) * (outH_ - 1);  // bottom-up: start at the top row
     }
-    const int W = c_->Width(), H = c_->Height();
+    const int W = turn_ ? c_->CodedWidth() : c_->Width(), H = turn_ ? c_->CodedHeight() : c_->Height();
     int cw = std::min(W, (int)outW_ - apX_), ch = std::min(H, (int)outH_ - apY_);
     for (int y = 0; y < H; ++y) {
         auto* dst = reinterpret_cast<uint32_t*>(buf_.data() + (size_t)y * W * 4);
@@ -102,12 +114,33 @@ bool VideoReader::CopyOut(IMFSample* s) {
         b2->Unlock2D();
     else
         mb->Unlock();
+    if (turn_) {
+        const int rot = c_->Rotation();
+        // Destination row by row from the source pixel that lands there.
+        auto* src = reinterpret_cast<const uint32_t*>(buf_.data());
+        auto* dst = reinterpret_cast<uint32_t*>(rot_.data());
+        const int OW = c_->Width(), OH = c_->Height();
+        for (int y = 0; y < OH; ++y) {
+            uint32_t* row = dst + (size_t)y * OW;
+            if (rot == 90)
+                for (int x = 0; x < OW; ++x) row[x] = src[(size_t)(H - 1 - x) * W + y];
+            else if (rot == 180)
+                for (int x = 0; x < OW; ++x) row[x] = src[(size_t)(H - 1 - y) * W + (W - 1 - x)];
+            else
+                for (int x = 0; x < OW; ++x) row[x] = src[(size_t)x * W + (W - 1 - y)];
+        }
+    }
     return true;
+}
+
+const uint8_t* VideoReader::Out() const {
+    if (have_ == SIZE_MAX) return nullptr;
+    return turn_ ? rot_.data() : buf_.data();
 }
 
 const uint8_t* VideoReader::Get(size_t index) {
     if (failed_ || index >= c_->Count()) return nullptr;
-    if (index == have_) return buf_.data();
+    if (index == have_) return Out();
     if (!inited_) {
         inited_ = true;
         if (!Init()) {
@@ -124,7 +157,7 @@ const uint8_t* VideoReader::Get(size_t index) {
         // Just past the keyframe, so rounding can't land the seek on the one before it.
         v.hVal.QuadPart = c_->Ts(key) + c_->Offset() + 1000;
         HRESULT hr = rd_->SetCurrentPosition(GUID_NULL, v);
-        if (FAILED(hr)) return have_ != SIZE_MAX ? buf_.data() : nullptr;
+        if (FAILED(hr)) return Out();
         eos_ = false;
         pos_ = SIZE_MAX;
     }
@@ -150,7 +183,7 @@ const uint8_t* VideoReader::Get(size_t index) {
             break;
         }
     }
-    return have_ != SIZE_MAX ? buf_.data() : nullptr;
+    return Out();
 }
 
 // ---- MP4 sample tables: frame times and keyframes of a long video in milliseconds instead of reading every sample
@@ -302,6 +335,23 @@ bool ReadSampleTables(const std::wstring& path, std::vector<SampleEntry>& out) {
     return false;
 }
 
+// Why a video can't be decoded, by its compression format.
+std::wstring NoDecoderMessage(const GUID& subtype) {
+    if (subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES)
+        return L"HEVC(H.265) 영상입니다. Microsoft Store의 'HEVC 비디오 확장'을 설치하면 열 수 있습니다.";
+    if (subtype == MFVideoFormat_VP90)
+        return L"VP9 영상입니다. Microsoft Store의 'VP9 비디오 확장'을 설치하면 열 수 있습니다.";
+    if (subtype == MFVideoFormat_AV1)
+        return L"AV1 영상입니다. Microsoft Store의 'AV1 비디오 확장'을 설치하면 열 수 있습니다.";
+    // The MPEG-4 source puts a sample entry type it doesn't know into Data1, first letter in the high byte.
+    wchar_t cc[5] = {};
+    for (int i = 0; i < 4; ++i) {
+        wchar_t ch = (wchar_t)((subtype.Data1 >> (24 - 8 * i)) & 0xFF);
+        cc[i] = ch >= 0x20 && ch < 0x7F ? ch : L'?';
+    }
+    return std::wstring(L"이 영상 형식(") + cc + L")을 재생할 코덱이 이 PC에 없습니다.";
+}
+
 }  // namespace
 
 std::shared_ptr<VideoClip> VideoClip::Open(const std::wstring& path, std::wstring& err, bool scanSamples) {
@@ -326,8 +376,16 @@ std::shared_ptr<VideoClip> VideoClip::Open(const std::wstring& path, std::wstrin
         w = std::min<UINT32>(w ? w : ap.Area.cx, ap.Area.cx);
         h = std::min<UINT32>(h ? h : ap.Area.cy, ap.Area.cy);
     }
-    c->width_ = (int)w;
-    c->height_ = (int)h;
+    // Phones store portrait video as landscape pictures plus a turn to apply when showing them.
+    switch (MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, MFVideoRotationFormat_0)) {
+        case MFVideoRotationFormat_90: c->rotation_ = 90; break;
+        case MFVideoRotationFormat_180: c->rotation_ = 180; break;
+        case MFVideoRotationFormat_270: c->rotation_ = 270; break;
+    }
+    c->width_ = (int)(c->rotation_ % 180 ? h : w);
+    c->height_ = (int)(c->rotation_ % 180 ? w : h);
+    GUID subtype{};
+    native->GetGUID(MF_MT_SUBTYPE, &subtype);
     ComPtr<IMFMediaType> at;
     if (SUCCEEDED(rd->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &at)))
         c->audioRate_ = (int)MFGetAttributeUINT32(at.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
@@ -360,6 +418,22 @@ std::shared_ptr<VideoClip> VideoClip::Open(const std::wstring& path, std::wstrin
     if (es.empty() || w == 0 || h == 0) {
         err = L"영상 프레임을 읽을 수 없습니다.";
         return nullptr;
+    }
+    // Asking for decoded frames loads the decoder: without one the editor would only show a blank picture.
+    {
+        ComPtr<IMFMediaType> t;
+        MFCreateMediaType(&t);
+        t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        ComPtr<IMFAttributes> a;
+        MFCreateAttributes(&a, 1);
+        a->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+        ComPtr<IMFSourceReader> probe;
+        if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), a.Get(), &probe)) ||
+            FAILED(probe->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, t.Get()))) {
+            err = NoDecoderMessage(subtype);
+            return nullptr;
+        }
     }
     std::stable_sort(es.begin(), es.end(), [](const SampleEntry& a, const SampleEntry& b) { return a.ts < b.ts; });
     c->offset_ = es.front().ts;
