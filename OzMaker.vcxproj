@@ -108,6 +108,7 @@
     <ClCompile Include="src\Exporter.cpp" />
     <ClCompile Include="src\FrameStore.cpp" />
     <ClCompile Include="src\Mp4Writer.cpp" />
+    <ClCompile Include="src\Mp4Unfragment.cpp" />
     <ClCompile Include="src\Gfx.cpp" />
     <ClCompile Include="src\Overlays.cpp" />
     <ClCompile Include="src\Resize.cpp" />
@@ -135,6 +136,7 @@
     <ClInclude Include="src\Exporter.h" />
     <ClInclude Include="src\FrameStore.h" />
     <ClInclude Include="src\Mp4Writer.h" />
+    <ClInclude Include="src\Mp4Unfragment.h" />
     <ClInclude Include="src\Gfx.h" />
     <ClInclude Include="src\Overlays.h" />
     <ClInclude Include="src\Resize.h" />

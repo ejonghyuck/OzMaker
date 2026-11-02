@@ -290,6 +290,14 @@ bool SetAutostart(bool on) {
                            (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
 
+bool ProcessGone(DWORD pid) {
+    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!p) return GetLastError() == ERROR_INVALID_PARAMETER;
+    bool gone = WaitForSingleObject(p, 0) == WAIT_OBJECT_0;
+    CloseHandle(p);
+    return gone;
+}
+
 std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& holes) {
     std::vector<RECT> parts{whole}, next;
     if (IsRectEmpty(&whole)) parts.clear();

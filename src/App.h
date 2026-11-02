@@ -117,6 +117,7 @@ private:
     void BeginCapture();
     void StopRecording();
     void OnVideoSaved(const CaptureResult& r);
+    void ShowVideo(const CaptureResult& r);
     void OnHotkey();
     void TogglePause();
     // Every recording tick: the length limit and the free space (#17). Stops with a reason when one is reached.
@@ -214,6 +215,7 @@ private:
     // ---- test helpers (SelfTest)
     int RunScreenshots(const std::wstring& dir);
     int RunSelfTest(const std::wstring& dir);
+    int RunCrashTest(const std::vector<std::wstring>& args);
     int RunRecordTest(const std::wstring& args);
     int RunAnalyzeTest(const std::wstring& args);
     int RunVideoTest(const std::wstring& dir, int w, int h);

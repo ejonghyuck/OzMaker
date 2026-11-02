@@ -12,6 +12,7 @@ struct VideoConfig {
     bool cbr = false;
     int gopFrames = 120;
     int qualityVsSpeed = 50;     // 0 = fastest, 100 = best
+    bool fragmented = false;     // fragmented MP4 while writing, so a crash leaves a file (#24); Finish makes it plain
 };
 
 struct AudioConfig {
@@ -48,6 +49,11 @@ public:
 
     bool Finish(std::wstring& err);
     void Abort();
+    // After a Finish that worked: something the user should know, e.g. that the file stayed fragmented.
+    const std::wstring& Notice() const { return notice_; }
+
+    // At startup: the videos a run that crashed was writing, made plain MP4 (#24). Newest first.
+    static std::vector<std::wstring> Recover();
 
     const std::wstring& EncoderName() const { return encoderName_; }
     bool HardwareEncoder() const { return hardwareUsed_; }
@@ -59,10 +65,14 @@ private:
     bool TryOpen(const std::wstring& path, bool hardware, bool codecParams, std::wstring& err);
     bool WriteAudioQueue();
     void Close();
+    void Mark();
+    void Unmark();
 
     VideoConfig v_;
     AudioConfig a_;
     std::wstring path_;
+    std::wstring marker_;  // fragmented: names path_ while it is written, for Recover
+    std::wstring notice_;
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<ID3D11Multithread> mt_;

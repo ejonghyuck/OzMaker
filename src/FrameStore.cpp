@@ -18,15 +18,6 @@ struct JournalHeader {
 static_assert(sizeof(JournalHeader) == 32);
 
 std::wstring JournalPath(const std::wstring& data) { return data.substr(0, data.find_last_of(L'.')) + L".idx"; }
-
-// Access denied means it runs, under another account or elevated: leave its files alone.
-bool ProcessGone(DWORD pid) {
-    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
-    if (!p) return GetLastError() == ERROR_INVALID_PARAMETER;
-    bool gone = WaitForSingleObject(p, 0) == WAIT_OBJECT_0;
-    CloseHandle(p);
-    return gone;
-}
 }  // namespace
 
 FrameStore::~FrameStore() {
@@ -240,7 +231,7 @@ std::vector<FrameStore::Recovered> FrameStore::Recover() {
     auto ticks = [](const FILETIME& f) { return (int64_t)((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime); };
     for (const std::wstring& name : journals) {
         DWORD pid = wcstoul(name.c_str() + 8, nullptr, 10);  // OzMaker_<pid>_<qpc>.idx
-        if (pid == GetCurrentProcessId() || !ProcessGone(pid)) continue;
+        if (pid == GetCurrentProcessId() || !util::ProcessGone(pid)) continue;
         std::wstring journal = dir + L"\\" + name;
         std::wstring data = journal.substr(0, journal.size() - 4) + L".frames";
         auto s = std::make_shared<FrameStore>();

@@ -86,19 +86,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     regionPicker_.Init(inst, gfx_.D2D());
 
     auto args = SplitArgs(cmdLine);
-    // A crash on purpose, for the self-test of the crash report (#24).
-    if (args.size() >= 2 && args[0] == L"--crash-test") {
-        if (args[1] == L"abort") std::abort();
-        std::shared_ptr<FrameStore> rec;
-        if (args[1] == L"record") {  // 45 frames on disk, never finished
-            rec = MakeSyntheticClip(160, 90, 45, 30, false);
-            if (rec) rec->SetNominalFps(30);  // as Capture does
-            Sleep(1000);
-        }
-        volatile int* nowhere = nullptr;
-        *nowhere = 1;
-        return 1;
-    }
+    if (args.size() >= 2 && args[0] == L"--crash-test") return RunCrashTest(args);
     if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
@@ -136,19 +124,37 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
         crashed = true;
     }
     crash::Prune(5);
-    if (size_t back = RecoverRecordings(); crashed || back) {
-        std::wstring title = crashed ? L"지난번에 OzMaker가 비정상 종료되었습니다" : L"저장하지 않은 녹화를 되살렸습니다";
-        std::wstring body = back ? util::Format(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다", back)
-                                 : std::wstring(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
-        if (tray) {
-            TrayBalloon(title, body);
-        } else {
-            if (back) {
-                clipName_ = held_[0].name;
-                OpenEditor(held_[0].clip);
+    size_t clips = RecoverRecordings();
+    std::vector<std::wstring> videos = Mp4Writer::Recover();  // newest first
+    if (crashed || clips || !videos.empty()) {
+        std::wstring title = crashed ? L"지난번에 OzMaker가 비정상 종료되었습니다" : L"지난번 녹화를 되살렸습니다";
+        std::wstring body =
+            clips && !videos.empty() ? util::Format(L"녹화 %zu개와 동영상 %zu개를 되살렸습니다", clips, videos.size())
+            : clips    ? util::Format(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다", clips)
+            : !videos.empty() ? (videos.size() == 1 ? L"녹화하던 동영상을 되살렸습니다 · " + util::FileNameOf(videos[0])
+                                                    : util::Format(L"녹화하던 동영상 %zu개를 되살렸습니다", videos.size()))
+                              : std::wstring(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
+        // A video is already a file in the save folder: it opens like one that was just saved.
+        for (size_t i = videos.size(); i-- > 1;) AddRecent(videos[i]);
+        if (!videos.empty()) {
+            CaptureResult r;
+            r.video = r.ok = true;
+            r.path = videos[0];
+            r.bytes = util::FileSize(r.path);
+            std::wstring err;
+            if (auto v = VideoClip::Open(r.path, err)) {
+                r.seconds = v->Seconds();
+                r.audio = v->HasAudio();
             }
-            Toast(title + L". " + body + L".", crashed);
+            ShowVideo(r);
+        } else if (clips && !tray) {
+            clipName_ = held_[0].name;
+            OpenEditor(held_[0].clip);
         }
+        if (tray)
+            TrayBalloon(title, body);
+        else
+            Toast(title + L". " + body + L".", crashed);
     }
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
@@ -1264,18 +1270,12 @@ void App::StopRecording() {
     }
 }
 
-void App::OnVideoSaved(const CaptureResult& r) {
-    if (!r.ok) {
-        if (settings_.sounds) sound::Play(sound::Cue::Stop);
-        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
-        return;
-    }
-    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+// The file is already saved: the result card shows it, and the editor opens on it for trimming, with that file as the
+// current result.
+void App::ShowVideo(const CaptureResult& r) {
     AddRecent(r.path);
     lastVideo_ = r;
-    if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     showVideo_ = true;
-    // The file is already saved; the editor opens on it for trimming, with that file as the current result.
     std::wstring err;
     if (auto video = VideoClip::Open(r.path, err)) {
         OpenEditor(video);
@@ -1290,6 +1290,17 @@ void App::OnVideoSaved(const CaptureResult& r) {
         if (screen_ == Screen::Settings) screen_ = Screen::Home;
         if (screen_ == Screen::Editor) CloseEditor();
     }
+}
+
+void App::OnVideoSaved(const CaptureResult& r) {
+    if (!r.ok) {
+        if (settings_.sounds) sound::Play(sound::Cue::Stop);
+        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
+        return;
+    }
+    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    ShowVideo(r);
+    if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
     std::wstring reason = std::exchange(stopReason_, {});
     if (NotifyQuietly())
