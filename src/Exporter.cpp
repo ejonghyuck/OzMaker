@@ -104,7 +104,7 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     p.width = job.outW;
     p.height = job.outH;
     p.quality = job.quality;
-    p.loop = job.loop;
+    p.plays = job.plays;
     p.path = tmp;
     if (!enc->Begin(p, res.error)) return false;
     auto reader = job.clip->NewReader();
@@ -126,8 +126,9 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
             break;
         }
         resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
-        ok = enc->Add(frame.data(), plan[k].durationMs, res.error);
-        res.seconds += plan[k].durationMs / 1000.0;
+        double ms = plan[k].durationMs + (k + 1 == plan.size() ? job.holdLastMs : 0);
+        ok = enc->Add(frame.data(), ms, res.error);
+        res.seconds += ms / 1000.0;
         progress_ = 0.97f * (float)(k + 1) / plan.size();
     }
     if (ok) ok = enc->End(res.error);

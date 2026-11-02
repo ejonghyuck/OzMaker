@@ -78,10 +78,13 @@ void Settings::Load() {
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
-    scaleIdx = ReadInt(ini, L"Scale", scaleIdx, 0, _countof(kScaleOptions) - 1);
+    // Older versions kept the scale (100/75/50/33/25 %) under "Scale" and a loop switch under "Loop".
+    int oldScale = ReadInt(ini, L"Scale", 0, 0, 4);
+    scaleIdx = ReadInt(ini, L"ExportSize", oldScale == 4 ? 5 : oldScale, 0, _countof(kExportSizes) - 1);
     outFpsIdx = ReadInt(ini, L"OutFps", outFpsIdx, 0, _countof(kOutFpsOptions) - 1);
     speedIdx = ReadInt(ini, L"Speed", speedIdx, 0, _countof(kSpeedOptions) - 1);
-    loop = ReadInt(ini, L"Loop", loop, 0, 1) != 0;
+    loopIdx = ReadInt(ini, L"LoopCount", ReadInt(ini, L"Loop", 1, 0, 1) ? 0 : 1, 0, _countof(kLoopOptions) - 1);
+    holdLast = ReadInt(ini, L"HoldLast", holdLast, 0, 1) != 0;
 
     wchar_t buf[MAX_PATH * 2] = {};
     GetPrivateProfileStringW(L"OzMaker", L"Monitor", L"", buf, _countof(buf), ini.c_str());
@@ -94,6 +97,8 @@ void Settings::Load() {
         if (*buf) recent.push_back(buf);
     }
     if (outDir.empty()) outDir = util::KnownFolder(FOLDERID_Pictures) + L"\\OzMaker";
+    GetPrivateProfileStringW(L"OzMaker", L"FileName", kNameTemplates[0], buf, _countof(buf), ini.c_str());
+    nameTemplate = *buf ? buf : kNameTemplates[0];
 }
 
 void Settings::Save() const {
@@ -142,11 +147,13 @@ void Settings::Save() const {
     num(L"HotkeyKey", (long)hkVk);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
-    num(L"Scale", scaleIdx);
+    num(L"ExportSize", scaleIdx);
     num(L"OutFps", outFpsIdx);
     num(L"Speed", speedIdx);
-    num(L"Loop", loop);
+    num(L"LoopCount", loopIdx);
+    num(L"HoldLast", holdLast);
     put(L"OutDir", outDir);
+    put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);
 }

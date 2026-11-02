@@ -232,6 +232,7 @@ void App::DrawFilesPopover(Rect client) {
             if (open) {
                 filesOpen_ = false;
                 auto clip = h.clip;
+                clipName_ = h.name;
                 if (clip != clip_) OpenEditor(clip);
                 else ResumeEditor();
                 break;
@@ -1142,6 +1143,50 @@ void App::DrawExportPanel(Rect r) {
     ui_.Text(in.CutTop(28), L"내보내기", 16.f, TextColor, Bold());
     in.CutTop(8);
 
+    uint32_t disabled = 0;
+    for (int i = 0; i < (int)Format::Count; ++i)
+        if (!FormatAvailable((Format)i)) disabled |= 1u << i;
+    Format fmt = (Format)fmt_;
+    const bool mp4 = fmt == Format::Mp4;
+    const double speed = kSpeedOptions[settings_.speedIdx];
+    int ow = 0, oh = 0;
+    OutputSize(ow, oh);
+    double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
+    size_t outFrames = 0;
+    if (mp4) {
+        outFrames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
+        outFps = fpsLimit;
+        outSec = outFrames / fpsLimit;
+    } else {
+        auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
+        for (auto& p : plan) outSec += p.durationMs / 1000.0;
+        outFrames = plan.size();
+        outFps = outSec > 0 ? outFrames / outSec : 0;
+        if (settings_.holdLast) outSec += kHoldLastMs / 1000.0;
+    }
+
+    // Bottom: what will be written and the actions, always in view.
+    Rect saveAs = in.CutBottom(36);
+    in.CutBottom(8);
+    Rect save = in.CutBottom(46);
+    in.CutBottom(10);
+    bool showResult = hasResult_ && !busy;
+    Rect card, summary;
+    if (showResult)
+        card = in.CutBottom(76);
+    else
+        summary = in.CutBottom(20);
+    in.CutBottom(8);
+
+    // Options above, scrolling when the window is too short for all of them.
+    Rect view = in;
+    float maxScroll = std::max(0.f, exportContentH_ - view.H());
+    if (ui_.Hover(view) && ui_.In().wheel != 0) exportScroll_ -= ui_.In().wheel * 60.f;
+    exportScroll_ = std::clamp(exportScroll_, 0.f, maxScroll);
+    ui_.PushClip(view);
+    in = Rect(view.l, view.t - exportScroll_, view.r - (maxScroll > 0 ? 8 : 0), view.t - exportScroll_ + 10000);
+    const float top = in.t;
+
     auto label = [&](std::wstring_view name, std::wstring_view value) {
         Rect l = in.CutTop(20);
         ui_.Text(l, name, 12.5f, TextDim);
@@ -1150,9 +1195,6 @@ void App::DrawExportPanel(Rect r) {
     };
     bool changed = false;
 
-    uint32_t disabled = 0;
-    for (int i = 0; i < (int)Format::Count; ++i)
-        if (!FormatAvailable((Format)i)) disabled |= 1u << i;
     label(L"형식", {});
     if (ui_.Segmented(HashId("ex.fmt"), in.CutTop(34), {L"GIF", L"WebP", L"AVIF", L"MP4"}, fmt_,
                       disabled)) {
@@ -1160,8 +1202,6 @@ void App::DrawExportPanel(Rect r) {
         hasResult_ = false;
         if (fmt_ != (int)Format::Mp4) settings_.format = fmt_;  // the 움짤 format the next clip starts with
     }
-    Format fmt = (Format)fmt_;
-    const bool mp4 = fmt == Format::Mp4;
     if (mp4) ProbeEncoders();
     std::wstring blurb = (disabled & (1u << fmt_)) ? L"이 빌드에는 포함되어 있지 않습니다"
                          : !mp4                    ? std::wstring(FormatBlurb(fmt))
@@ -1195,26 +1235,11 @@ void App::DrawExportPanel(Rect r) {
     }
     in.CutTop(10);
 
-    int ow = 0, oh = 0;
-    OutputSize(ow, oh);
     label(L"크기", util::Format(L"%d × %d", ow, oh));
-    changed |= ui_.Segmented(HashId("ex.scale"), in.CutTop(32), {L"100%", L"75%", L"50%", L"33%", L"25%"},
+    changed |= ui_.Segmented(HashId("ex.scale"), in.CutTop(32), {L"100%", L"75%", L"50%", L"33%", L"640px", L"480px"},
                              settings_.scaleIdx);
     in.CutTop(10);
 
-    const double speed = kSpeedOptions[settings_.speedIdx];
-    double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
-    size_t outFrames = 0;
-    if (mp4) {
-        outFrames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
-        outFps = fpsLimit;
-        outSec = outFrames / fpsLimit;
-    } else {
-        auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
-        for (auto& p : plan) outSec += p.durationMs / 1000.0;
-        outFrames = plan.size();
-        outFps = outSec > 0 ? outFrames / outSec : 0;
-    }
     label(L"프레임 레이트", util::Format(L"%.0f fps", outFps));
     changed |= ui_.Segmented(HashId("ex.fps"), in.CutTop(32), {L"원본", L"30", L"25", L"20", L"15", L"10"},
                              settings_.outFpsIdx);
@@ -1231,38 +1256,45 @@ void App::DrawExportPanel(Rect r) {
         playhead_ = ph;
         SetPlaying(playing_);
     }
-    in.CutTop(8);
+    in.CutTop(10);
     if (!mp4) {
-        changed |= ui_.ToggleRow(HashId("ex.loop"), in.CutTop(38).Inset(-10, 0), L"반복 재생", settings_.loop);
+        Rect row = in.CutTop(32);
+        ui_.Text(row, L"반복", 12.5f, TextDim);
+        changed |= ui_.Segmented(HashId("ex.loop"), row.CutRight(std::min(186.f, row.W() - 60)),
+                                 {L"계속", L"1번", L"3번"}, settings_.loopIdx);
+        in.CutTop(6);
+        changed |= ui_.ToggleRow(HashId("ex.hold"), in.CutTop(46).Inset(-10, 0), L"끝에서 잠깐 멈춤",
+                                 settings_.holdLast, L"마지막 장면을 1초 더 보여 줍니다");
     } else if (clip_->HasAudio()) {
         auto* video = dynamic_cast<const VideoClip*>(clip_.get());
         if (video && !video->AudioExportable()) {
             bool off = false;
-            ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", off,
+            ui_.ToggleRow(HashId("ex.audio"), in.CutTop(46).Inset(-10, 0), L"소리 포함", off,
                           util::Format(L"%.1fkHz 소리는 넣을 수 없습니다", video->AudioRate() / 1000.0), false);
         } else {
             bool slow = speed != 1.0;
-            changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", exportAudio_,
+            changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(46).Inset(-10, 0), L"소리 포함", exportAudio_,
                                      slow ? L"속도를 바꾸면 소리는 빠집니다" : L"", !slow);
         }
+    }
+    exportContentH_ = in.t - top;
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(24.f, view.H() * view.H() / exportContentH_);
+        float ty = view.t + (view.H() - th) * (exportScroll_ / maxScroll);
+        ui_.Fill(Rect(view.r - 3, ty, view.r, ty + th), BorderStrong, 1.5f);
     }
     if (changed) {
         hasResult_ = false;
         settingsDirty_ = true;
     }
 
-    // Bottom area: action buttons / progress / result.
-    Rect saveAs = in.CutBottom(36);
-    in.CutBottom(8);
-    Rect save = in.CutBottom(46);
-    in.CutBottom(10);
-    bool showResult = hasResult_ && !busy;
     if (!showResult) {
         std::wstring sum = mp4 ? util::Format(L"%d×%d · %.0ffps · %.1f초 · %s", ow, oh, outFps, outSec,
                                               ExportAudio() ? L"소리 포함" : L"소리 없음")
                                : util::Format(L"%d×%d · %.0ffps · %.1f초 · %zu프레임", ow, oh, outFps, outSec,
                                               outFrames);
-        ui_.Text(in.CutBottom(20), sum, 12.f, TextFaint, Align(AlignCenter));
+        ui_.Text(summary, sum, 12.f, TextFaint, Align(AlignCenter));
     }
 
     if (busy) {
@@ -1285,7 +1317,6 @@ void App::DrawExportPanel(Rect r) {
     }
 
     if (showResult) {
-        Rect card = in.CutBottom(76);
         ui_.Fill(card, WithAlpha(Success, 0.08f), 12);
         ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.35f), 12);
         Rect top = Rect(card.l + 12, card.t + 4, card.r - 12, card.t + 32);
@@ -1379,6 +1410,18 @@ void App::DrawSettings(Rect r) {
         }
     });
 
+    int nameIdx = -1;
+    for (int i = 0; i < (int)_countof(kNameTemplates); ++i)
+        if (settings_.nameTemplate == kNameTemplates[i]) nameIdx = i;
+    std::wstring nameDesc = (nameIdx < 0 ? L"settings.ini의 형식: " + settings_.nameTemplate + L" · 예: " : L"예: ") +
+                            FileStem(L"리그 오브 레전드") + L".gif";
+    SettingRow(area, L"파일 이름", nameDesc, 330, [&](Rect c) {
+        if (ui_.Segmented(HashId("set.name"), c, {L"OzMaker_날짜", L"창 이름_날짜", L"날짜"}, nameIdx)) {
+            settings_.nameTemplate = kNameTemplates[nameIdx];
+            changed = true;
+        }
+    });
+
     std::wstring hkDesc = hotkeyOk_ ? L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"
                                     : L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요";
     SettingRow(area, L"녹화 단축키", hkDesc, 230, [&](Rect c) {
@@ -1407,6 +1450,17 @@ void App::DrawSettings(Rect r) {
     SettingRow(area, L"효과음", L"녹화 시작 · 중지 · 저장 시 짧은 알림음", 60, [&](Rect c) {
         changed |= ui_.Toggle(HashId("set.sound"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.sounds);
     });
+
+    SettingRow(area, L"Windows 시작 시 실행", L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다", 60,
+               [&](Rect c) {
+                   bool on = autostart_;
+                   if (ui_.Toggle(HashId("set.autostart"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) {
+                       if (util::SetAutostart(on))
+                           autostart_ = on;
+                       else
+                           Toast(L"시작 프로그램에 등록하지 못했습니다.", true);
+                   }
+               });
 
     int closeIdx = settings_.closeToTray ? 0 : 1;
     SettingRow(area, L"닫기 버튼", L"트레이로 숨기면 창을 닫아도 단축키로 녹화할 수 있습니다", 260, [&](Rect c) {

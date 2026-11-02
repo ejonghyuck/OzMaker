@@ -133,6 +133,7 @@ private:
     bool ExportAudio() const;
     VideoConfig VideoSettings(int fps) const;
     std::wstring ExportName(Format f) const;
+    std::wstring FileStem(const std::wstring& what) const;  // settings_.nameTemplate filled in
     void StartExport(bool saveAs);
     void OnExportDone();
     void StartThumbnails();
@@ -194,6 +195,7 @@ private:
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     std::wstring recNotice_;
     std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")
+    std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
     bool showVideo_ = false;
     bool encProbed_ = false;
@@ -266,6 +268,8 @@ private:
     bool capturingHotkey_ = false, hotkeyOk_ = true;
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
+    float exportScroll_ = 0, exportContentH_ = 0;
+    bool autostart_ = false;
     NOTIFYICONDATAW nid_{};
     HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr;
     UINT taskbarCreated_ = 0;

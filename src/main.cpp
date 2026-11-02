@@ -22,7 +22,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         if (HWND h = FindWindowW(L"OzMakerMain", nullptr)) PostMessageW(h, WM_APP + 6, 0, 0);
         return 0;
     }
-    bool testMode = first.rfind(L"--", 0) == 0;
+    const bool tray = first == L"--tray";  // started with Windows: stay in the tray
+    bool testMode = first.rfind(L"--", 0) == 0 && !tray;
     HANDLE mutex = nullptr;
     if (!testMode) {
         mutex = CreateMutexW(nullptr, TRUE, L"Local\\OzMaker.SingleInstance");
@@ -32,7 +33,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
                 DWORD pid = 0;
                 GetWindowThreadProcessId(h, &pid);
                 AllowSetForegroundWindow(pid);
-                if (!first.empty()) {
+                if (!first.empty() && !tray) {
                     // A file to open ("Open with", dropped on the exe): the running instance opens it.
                     wchar_t full[MAX_PATH * 4];
                     DWORD n = GetFullPathNameW(first.c_str(), _countof(full), full, nullptr);
@@ -40,7 +41,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
                     COPYDATASTRUCT cd{0x4F5A4F50, (DWORD)((path.size() + 1) * sizeof(wchar_t)), (void*)path.c_str()};
                     DWORD_PTR res = 0;
                     SendMessageTimeoutW(h, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &res);
-                } else {
+                } else if (!tray) {
                     PostMessageW(h, WM_APP + 5, 0, 0);
                 }
             }

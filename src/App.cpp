@@ -94,7 +94,10 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
                             args.size() >= 4 ? _wtoi(args[3].c_str()) : 360);
 
-    if (!CreateMainWindow(show)) return 1;
+    const bool tray = !args.empty() && args[0] == L"--tray";  // started with Windows (HKCU Run)
+    autostart_ = util::AutostartEnabled();
+    if (autostart_) util::SetAutostart(true);  // keeps pointing at this exe if it was moved
+    if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
@@ -875,7 +878,7 @@ void App::BeginCapture() {
     if (recVideo_) {
         VideoOptions v;
         util::EnsureDir(settings_.outDir);
-        std::wstring base = settings_.outDir + L"\\OzMaker_" + util::TimestampName();
+        std::wstring base = settings_.outDir + L"\\" + FileStem(recName_);
         v.path = base + L".mp4";
         for (int i = 2; GetFileAttributesW(v.path.c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
             v.path = base + util::Format(L"_%d.mp4", i);
@@ -948,6 +951,7 @@ void App::StopRecording() {
     if (settings_.sounds) sound::Play(sound::Cue::Stop);
     auto clip = res.clip;
     if (clip) HoldRecording(clip);
+    clipName_ = recName_;
     if (!clip) {
         ReportError(L"녹화 실패", recTarget_.source == kSourceWindow
                                       ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
@@ -1311,7 +1315,7 @@ size_t App::PlayheadFromClock() {
     int64_t t = playTs_ + (int64_t)((now - playWall_) * 1e7 * speed);
     if (t < start) t = start;
     if (t >= end) {
-        if (settings_.loop) {
+        if (kLoopOptions[settings_.loopIdx] != 1) {
             t = start + (t - start) % len;
             // Restart the clock at the loop point (the sound restarts with it).
             playTs_ = t;
@@ -1351,8 +1355,8 @@ void App::ApplyCropAspect() {
 
 void App::OutputSize(int& w, int& h) const {
     int cw = crop_.right - crop_.left, ch = crop_.bottom - crop_.top;
-    int pct = kScaleOptions[settings_.scaleIdx];
-    double s = pct == 33 ? 1.0 / 3.0 : pct / 100.0;
+    const ExportSize& o = kExportSizes[settings_.scaleIdx];
+    double s = o.width ? std::min(1.0, o.width / (double)std::max(1, cw)) : o.percent == 33 ? 1.0 / 3.0 : o.percent / 100.0;
     w = std::max(2, (int)std::lround(cw * s) & ~1);
     h = std::max(2, (int)std::lround(ch * s) & ~1);
 }
@@ -1392,9 +1396,24 @@ VideoConfig App::VideoSettings(int fps) const {
 }
 
 // Exports of a video are named after it ("<name>_trim.mp4", "<name>.gif"); a fresh clip gets a timestamp.
+std::wstring App::FileStem(const std::wstring& what) const {
+    std::wstring s = settings_.nameTemplate, ts = util::TimestampName();
+    std::wstring name = util::SafeFileName(what.empty() ? L"OzMaker" : what, 60);
+    if (name.empty()) name = L"OzMaker";
+    auto fill = [&](std::wstring_view key, const std::wstring& v) {
+        for (size_t p; (p = s.find(key)) != std::wstring::npos;) s.replace(p, key.size(), v);
+    };
+    fill(L"{날짜}", ts);
+    fill(L"{date}", ts);
+    fill(L"{창 이름}", name);
+    fill(L"{window}", name);
+    s = util::SafeFileName(s, 120);
+    return s.empty() ? L"OzMaker_" + ts : s;
+}
+
 std::wstring App::ExportName(Format f) const {
     std::wstring ext = FormatExt(f), src = clip_ ? clip_->SourcePath() : std::wstring();
-    std::wstring stem = L"OzMaker_" + util::TimestampName();
+    std::wstring stem = FileStem(clipName_);
     if (!src.empty()) {
         stem = util::FileNameOf(src);
         if (size_t dot = stem.rfind(L'.'); dot != std::wstring::npos) stem.resize(dot);
@@ -1437,7 +1456,8 @@ void App::StartExport(bool saveAs) {
     job.fpsLimit = EffectiveOutFps();
     job.speed = kSpeedOptions[settings_.speedIdx];
     job.format = f;
-    job.loop = settings_.loop;
+    job.plays = kLoopOptions[settings_.loopIdx];
+    job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
     if (f == Format::Mp4) {
         job.video = VideoSettings((int)std::lround(job.fpsLimit));
         job.audio.enabled = ExportAudio();

@@ -12,7 +12,8 @@ struct ExportJob {
     double speed = 1.0;
     Format format = Format::Gif;
     int quality = 80;
-    bool loop = true;
+    int plays = 0;               // 움짤: times it plays, 0 = forever
+    double holdLastMs = 0;       // 움짤: extra time on the last frame
     VideoConfig video;           // MP4: codec and bitrate; size and rate come from the fields above
     AudioConfig audio;           // MP4: enabled = keep the clip's sound (only at speed 1)
     std::wstring path;

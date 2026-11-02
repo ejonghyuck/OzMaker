@@ -33,4 +33,10 @@ std::wstring FormatAgo(double seconds);  // "방금", "3분 전", "어제" ...
 
 std::wstring HotkeyToString(UINT mods, UINT vk);
 
+// Characters Windows doesn't allow in file names become '_'; trimmed to maxLen.
+std::wstring SafeFileName(std::wstring_view s, size_t maxLen = 80);
+// Start with Windows (HKCU Run, "OzMaker" -> "<this exe>" --tray).
+bool AutostartEnabled();
+bool SetAutostart(bool on);
+
 }  // namespace util

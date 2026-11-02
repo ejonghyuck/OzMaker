@@ -331,9 +331,11 @@ public:
         uint8_t hdr[13] = {'G', 'I', 'F', '8', '9', 'a', (uint8_t)(w_ & 255), (uint8_t)(w_ >> 8),
                            (uint8_t)(h_ & 255), (uint8_t)(h_ >> 8), 0x70, 0, 0};
         fwrite(hdr, 1, sizeof(hdr), f_);
-        if (p.loop) {
-            static const uint8_t app[] = {0x21, 0xFF, 0x0B, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E',
-                                          '2',  '.',  '0',  3,   1,   0,   0,   0};
+        // Without the NETSCAPE block a GIF plays once; with it, once plus the loop count (0 = forever).
+        if (p.plays != 1) {
+            int repeats = p.plays > 1 ? std::min(p.plays - 1, 0xFFFF) : 0;
+            const uint8_t app[] = {0x21, 0xFF, 0x0B, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0', 3, 1,
+                                   (uint8_t)(repeats & 255), (uint8_t)(repeats >> 8), 0};
             fwrite(app, 1, sizeof(app), f_);
         }
         return true;

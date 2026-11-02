@@ -27,6 +27,21 @@ bool HasVideoProcessor() {
 }
 
 // Sum of a GIF's frame delays in 1/100 s, read from its graphic control extensions; -1 if unreadable.
+// NETSCAPE loop count of a GIF: -1 = no loop block (plays once), 0 = forever, n = repeats after the first play.
+int GifLoopCount(const std::wstring& path) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        d.assign(buf, buf + n);
+        fclose(f);
+    }
+    const char tag[] = "NETSCAPE2.0";
+    auto it = std::search(d.begin(), d.end(), tag, tag + 11);
+    if (it == d.end() || d.end() - it < 15) return -1;
+    return it[13] | (it[14] << 8);
+}
+
 int GifDurationCs(const std::wstring& path) {
     std::vector<uint8_t> d;
     if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
@@ -257,6 +272,29 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"GIF 2x: %s %d frames, file plays %.2fs %s", r.ok ? L"ok" : L"FAIL", r.frames, cs / 100.0,
                          r.error.c_str()));
         if (!r.ok || std::fabs(cs / 100.0 - N / fps / 2) > 0.03) ++failures;
+    }
+    // Loop count and the hold on the last frame, read back from the files.
+    for (int plays : {0, 1, 3}) {
+        ExportJob job;
+        job.clip = clip;
+        job.first = 0;
+        job.last = 29;
+        job.crop = {0, 0, W, H};
+        job.outW = W / 4;
+        job.outH = H / 4;
+        job.fpsLimit = FormatMaxFps(Format::Gif);
+        job.format = Format::Gif;
+        job.plays = plays;
+        job.holdLastMs = plays == 3 ? kHoldLastMs : 0;
+        job.path = dir + util::Format(L"\\selftest_plays%d.gif", plays);
+        ExportResult r = ExportSync(ex, job);
+        int loops = GifLoopCount(job.path), cs = GifDurationCs(job.path);
+        int wantLoops = plays == 0 ? 0 : plays == 1 ? -1 : plays - 1;
+        double wantSec = 30 / fps + job.holdLastMs / 1000;
+        bool good = r.ok && loops == wantLoops && std::fabs(cs / 100.0 - wantSec) < 0.03;
+        log(util::Format(L"GIF plays %d: %s loop block %d, file plays %.2fs (want %.2fs)", plays, good ? L"ok" : L"FAIL",
+                         loops, cs / 100.0, wantSec));
+        if (!good) ++failures;
     }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;

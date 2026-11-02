@@ -6,7 +6,7 @@ enum class Format { Gif = 0, WebP, Avif, Mp4, Count };
 struct EncoderParams {
     int width = 0, height = 0;
     int quality = 80;  // 1..100
-    bool loop = true;
+    int plays = 0;     // times the animation plays, 0 = forever
     std::wstring path;
 };
 
