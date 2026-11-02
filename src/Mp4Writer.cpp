@@ -366,8 +366,9 @@ bool Mp4Writer::Finish(std::wstring& err) {
         Close();
         return false;
     }
-    bool ok = !failed_ && WriteAudioQueue() && videoFrames_ > 0;
-    HRESULT hr = ok ? writer_->Finalize() : E_FAIL;
+    // After a write error the samples written before it are still good: finalize the file with those.
+    if (!failed_) WriteAudioQueue();
+    HRESULT hr = videoFrames_ > 0 ? writer_->Finalize() : E_FAIL;
     if (FAILED(hr)) {
         err = videoFrames_ == 0 ? L"녹화된 화면이 없습니다."
                                 : L"동영상 파일을 마무리하지 못했습니다. (" + Hr(hr) + L")";

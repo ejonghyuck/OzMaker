@@ -109,12 +109,11 @@ void AudioCapture::Stop(int64_t endQpc) {
     sink_ = nullptr;
 }
 
-void AudioCapture::Run() {
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    DWORD taskIdx = 0;
-    HANDLE task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-
+HRESULT AudioCapture::Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureClient>& cap, HANDLE event) {
+    client.Reset();
+    cap.Reset();
+    convert_ = false;
+    resamplePos_ = 0;
     WAVEFORMATEX want{};
     want.wFormatTag = WAVE_FORMAT_PCM;
     want.nChannels = 2;
@@ -123,8 +122,6 @@ void AudioCapture::Run() {
     want.nBlockAlign = 4;
     want.nAvgBytesPerSec = rate_ * 4;
 
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioCaptureClient> cap;
     HRESULT hr = S_OK;
     if (src_ == Source::Process) {
         AUDIOCLIENT_ACTIVATION_PARAMS ap{};
@@ -189,21 +186,46 @@ void AudioCapture::Run() {
     if (SUCCEEDED(hr)) hr = client->SetEventHandle(event);
     if (SUCCEEDED(hr)) hr = client->GetService(IID_PPV_ARGS(&cap));
     if (SUCCEEDED(hr)) hr = client->Start();
+    if (FAILED(hr)) {
+        cap.Reset();
+        client.Reset();
+    }
+    return hr;
+}
+
+void AudioCapture::Run() {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    DWORD taskIdx = 0;
+    HANDLE task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    ComPtr<IAudioClient> client;
+    ComPtr<IAudioCaptureClient> cap;
+    HRESULT hr = Open(client, cap, event);
     startHr_ = hr;
     SetEvent(ready_);
 
     if (SUCCEEDED(hr)) {
-        const int frameRate = convert_ ? srcRate_ : rate_;
         const int64_t idlePad = 1'000'000;  // pad silence this far behind real time when nothing is playing
-        int64_t lastPacket = util::Qpc100ns();
+        int64_t lastPacket = util::Qpc100ns(), lastRetry = 0;
         bool alive = true;
         HANDLE waits[2] = {stop_, event};
         while (WaitForMultipleObjects(2, waits, FALSE, 20) != WAIT_OBJECT_0) {
             bool got = false;
+            if (!alive && util::Qpc100ns() - lastRetry > 5'000'000) {
+                // The device went away (headset unplugged, output switched): follow the new default device.
+                // The gap is filled with silence below.
+                lastRetry = util::Qpc100ns();
+                if (client) client->Stop();
+                alive = SUCCEEDED(Open(client, cap, event));
+                lastL_ = lastR_ = 0;
+            }
+            const int frameRate = convert_ ? srcRate_ : rate_;
             while (alive) {
                 UINT32 next = 0;
                 if (FAILED(cap->GetNextPacketSize(&next))) {
-                    alive = false;  // device lost (e.g. output switched): the rest is silence
+                    alive = false;
+                    lastRetry = util::Qpc100ns();
                     break;
                 }
                 if (next == 0) break;
@@ -213,6 +235,7 @@ void AudioCapture::Run() {
                 UINT64 devPos = 0, qpcPos = 0;
                 if (FAILED(cap->GetBuffer(&data, &frames, &flags, &devPos, &qpcPos))) {
                     alive = false;
+                    lastRetry = util::Qpc100ns();
                     break;
                 }
                 int64_t qpc = (int64_t)qpcPos;
@@ -229,7 +252,7 @@ void AudioCapture::Run() {
                 PadTo((now - idlePad - origin_) * rate_ / 10'000'000);
             }
         }
-        client->Stop();
+        if (client) client->Stop();
     }
     cap.Reset();
     client.Reset();

@@ -9,8 +9,10 @@ std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, d
     size_t count = s.Count();
     if (count == 0 || first > last || first >= count) return out;
     last = std::min(last, count - 1);
+    speed = speed > 0 ? speed : 1.0;
     int64_t rangeEnd = last + 1 < count ? s.Ts(last + 1) : s.EndTs();
-    int64_t interval = fpsLimit > 0 ? (int64_t)(1e7 / fpsLimit) : 0;
+    // The limit is in output time: at 2× a source frame every 1/30 s plays every 1/60 s.
+    int64_t interval = fpsLimit > 0 ? (int64_t)(1e7 * speed / fpsLimit) : 0;
     int64_t nextDue = 0;
     std::vector<size_t> sel;
     for (size_t i = first; i <= last; ++i) {
@@ -20,7 +22,6 @@ std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, d
             nextDue = (sel.size() > 1 && nextDue + interval > t) ? nextDue + interval : t + interval;
         }
     }
-    speed = speed > 0 ? speed : 1.0;
     out.reserve(sel.size());
     for (size_t k = 0; k < sel.size(); ++k) {
         int64_t end = k + 1 < sel.size() ? s.Ts(sel[k + 1]) : rangeEnd;

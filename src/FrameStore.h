@@ -26,9 +26,13 @@ public:
     size_t Count() const override;
     int64_t Ts(size_t i) const override { return entries_[i].ts; }
     int64_t EndTs() const override { return endTs_; }
+    double NominalFps() const override { return nominalFps_; }
+    void SetNominalFps(double fps) { nominalFps_ = fps; }
     std::unique_ptr<FrameReader> NewReader() const override { return std::make_unique<Reader>(this); }
     uint64_t DiskBytes() const { return writeOffset_.load(); }
     uint32_t Dropped() const { return dropped_.load(); }
+    // A write failed (disk full): no more frames are taken, and Finish keeps only those before the failure.
+    bool WriteFailed() const { return firstBad_.load() != SIZE_MAX; }
 
     // Sequential/random-access decoder. One per consumer thread.
     class Reader : public FrameReader {
@@ -63,7 +67,9 @@ private:
     size_t frameBytes_ = 0;
     std::atomic<uint64_t> writeOffset_{0};
     std::atomic<uint32_t> dropped_{0};
+    std::atomic<size_t> firstBad_{SIZE_MAX};  // lowest frame whose write failed
     int64_t endTs_ = 0;
+    double nominalFps_ = 0;
 
     mutable std::mutex mtx_;
     std::condition_variable cv_;

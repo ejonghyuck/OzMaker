@@ -31,6 +31,9 @@ public:
     // A frame within tolerance of t that is quick to decode (thumbnails of long videos).
     virtual size_t QuickIndexNear(int64_t t, int64_t tolerance) const { return IndexAt(t); }
     double AverageFps() const;
+    // Rate the frames were captured at; 0 when unknown. Recordings skip unchanged frames, so their average rate
+    // can be far below it.
+    virtual double NominalFps() const { return 0; }
 };
 
 // Decodes the frame the editor wants on a worker thread, newest request first, so seeking in a long-GOP video

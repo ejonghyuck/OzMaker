@@ -65,7 +65,7 @@ void App::DrawHeader(Rect r) {
         if (ui_.IconButton(HashId("hdr.settings"), Rect::Centered(b.CX(), b.CY(), 36, 36), icon::Settings, L"설정")) {
             settingsReturn_ = screen_;
             screen_ = Screen::Settings;
-            capturingHotkey_ = false;
+            SetCapturingHotkey(false);
         }
         right.CutRight(8);
     } else {
@@ -73,7 +73,7 @@ void App::DrawHeader(Rect r) {
         if (ui_.Button(HashId("hdr.back"), Rect::Centered(b.CX(), b.CY(), 110, 36), L"돌아가기", BtnStyle::Ghost,
                        icon::Back)) {
             screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
-            capturingHotkey_ = false;
+            SetCapturingHotkey(false);
             if (screen_ == Screen::Home) RefreshWindows();
         }
     }
@@ -378,7 +378,7 @@ void App::DrawCapturePreview(Rect preview) {
     const bool card = showVideo_ && rec_ == RecState::Idle;
     Rect view = preview;
     if (card) view.b = VideoCardRect(preview).t;
-    std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+    std::wstring hk = HotkeyLabel();
     auto placeholder = [&](std::wstring_view title, std::wstring_view body) {
         float cy = view.CY();
         ui_.Ring(view.CX(), cy - 44, 30, WithAlpha(Accent, 0.35f), 2.f);
@@ -610,7 +610,7 @@ void App::DrawCapturePanel(Rect r) {
     D2D1_COLOR_F bg = enabled ? Mix(Rec, RecHi, h) : Surface2;
     if (rec_ != RecState::Idle) bg = Mix(Hex(0x2A2F3A), Hex(0x343B48), h);
     ui_.Fill(btn, bg, 14);
-    std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+    std::wstring hk = HotkeyLabel();
     if (rec_ == RecState::Idle) {
         const wchar_t* label = video ? L"동영상 녹화" : L"녹화 시작";
         float lw = ui_.Measure(label, 16.f, kSemibold);
@@ -995,7 +995,7 @@ void App::DrawExportPanel(Rect r) {
     if (mp4) ProbeEncoders();
     std::wstring blurb = (disabled & (1u << fmt_)) ? L"이 빌드에는 포함되어 있지 않습니다"
                          : !mp4                    ? std::wstring(FormatBlurb(fmt))
-                         : clip_->HasAudio()       ? L"어디서나 재생되는 동영상 · 소리 포함"
+                         : ExportAudio()           ? L"어디서나 재생되는 동영상 · 소리 포함"
                                                    : L"어디서나 재생되는 동영상";
     ui_.Text(in.CutTop(20), blurb, 11.5f, TextFaint);
     in.CutTop(8);
@@ -1065,9 +1065,16 @@ void App::DrawExportPanel(Rect r) {
     if (!mp4) {
         changed |= ui_.ToggleRow(HashId("ex.loop"), in.CutTop(38).Inset(-10, 0), L"반복 재생", settings_.loop);
     } else if (clip_->HasAudio()) {
-        bool slow = speed != 1.0;
-        changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", exportAudio_,
-                                 slow ? L"속도를 바꾸면 소리는 빠집니다" : L"", !slow);
+        auto* video = dynamic_cast<const VideoClip*>(clip_.get());
+        if (video && !video->AudioExportable()) {
+            bool off = false;
+            ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", off,
+                          util::Format(L"%.1fkHz 소리는 넣을 수 없습니다", video->AudioRate() / 1000.0), false);
+        } else {
+            bool slow = speed != 1.0;
+            changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", exportAudio_,
+                                     slow ? L"속도를 바꾸면 소리는 빠집니다" : L"", !slow);
+        }
     }
     if (changed) {
         hasResult_ = false;
@@ -1208,7 +1215,7 @@ void App::DrawSettings(Rect r) {
         std::wstring label = capturingHotkey_ ? L"키 조합을 누르세요…" : util::HotkeyToString(settings_.hkMods, settings_.hkVk);
         if (ui_.Button(HashId("set.hotkey"), c, label, capturingHotkey_ ? BtnStyle::Primary : BtnStyle::Secondary,
                        icon::Keyboard, true, 13.f))
-            capturingHotkey_ = !capturingHotkey_;
+            SetCapturingHotkey(!capturingHotkey_);
     });
 
     SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,

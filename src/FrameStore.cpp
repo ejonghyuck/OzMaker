@@ -49,7 +49,7 @@ std::shared_ptr<FrameStore::Buffer> FrameStore::Acquire() {
 bool FrameStore::Submit(std::shared_ptr<Buffer> frame, int64_t ts) {
     {
         std::lock_guard lk(mtx_);
-        if (stopping_) return false;
+        if (stopping_ || WriteFailed()) return false;
         if (inflight_ >= maxInflight_) {
             ++dropped_;
             return false;
@@ -84,6 +84,11 @@ void FrameStore::Finish(int64_t endTs) {
         pool_.clear();
     }
     std::lock_guard lk(mtx_);
+    if (size_t bad = firstBad_.load(); bad < entries_.size()) {
+        // Later frames are deltas on the lost one, or come after a gap: keep what precedes it.
+        entries_.resize(bad);
+        endTs = 0;
+    }
     int64_t lastTs = entries_.empty() ? 0 : entries_.back().ts;
     endTs_ = std::max(endTs, lastTs + 10'000'000 / 60);
     finished_ = true;
@@ -103,6 +108,8 @@ bool FrameStore::WriteAt(uint64_t off, const void* data, size_t n) {
 }
 
 void FrameStore::Worker() {
+    // Compression can wait; the game being recorded can't.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     COMPRESSOR_HANDLE comp = nullptr;
     CreateCompressor(COMPRESS_ALGORITHM_XPRESS | COMPRESS_RAW, nullptr, &comp);
     std::vector<uint8_t> delta(frameBytes_);
@@ -135,7 +142,11 @@ void FrameStore::Worker() {
         const uint8_t* data = raw ? src : out.data();
         size_t size = raw ? frameBytes_ : outSize;
         uint64_t off = writeOffset_.fetch_add(size);
-        WriteAt(off, data, size);
+        if (!WriteAt(off, data, size)) {
+            size_t bad = firstBad_.load();
+            while (job.seq < bad && !firstBad_.compare_exchange_weak(bad, job.seq)) {
+            }
+        }
         job.cur.reset();
 
         std::lock_guard lk(mtx_);

@@ -53,6 +53,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                    levels, _countof(levels), D3D11_SDK_VERSION, &dev_, nullptr, &ctx_);
         winrt::check_hresult(hr);
+        ctx_.As(&ctx1_);
         if (video && SUCCEEDED(ctx_.As(&mt_))) mt_->SetMultithreadProtected(TRUE);
         ComPtr<IDXGIDevice> dxgi;
         winrt::check_hresult(dev_.As(&dxgi));
@@ -154,6 +155,11 @@ double Capture::Elapsed() const { return running_ ? (util::Qpc100ns() - startQpc
 
 size_t Capture::Frames() const { return frames_.load(); }
 
+bool Capture::StoreFailed() const {
+    std::lock_guard lk(mtx_);
+    return store_ && store_->WriteFailed();
+}
+
 bool Capture::SourceRect(int cw, int ch, RECT& r) const {
     RECT full{0, 0, cw, ch};
     r = full;
@@ -194,6 +200,39 @@ bool Capture::SourceRect(int cw, int ch, RECT& r) const {
     return r.right - r.left >= 2 && r.bottom - r.top >= 2;
 }
 
+// Monitor capture records whatever is on screen over the window. While the window isn't in front (Alt+Tab out of
+// a game), the parts other windows cover are blacked out so a browser or messenger never ends up in the recording.
+void Capture::CoveredRects(const RECT& sr, std::vector<RECT>& out) const {
+    out.clear();
+    HWND target = opt_.target;
+    DWORD targetPid = 0;
+    GetWindowThreadProcessId(target, &targetPid);
+    if (HWND fg = GetForegroundWindow()) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid == targetPid) return;  // the window itself, or one of its own popups, is in front
+    }
+    RECT area = sr;  // the recorded part of the monitor, in screen pixels
+    OffsetRect(&area, monitorRect_.left, monitorRect_.top);
+    for (HWND w = GetTopWindow(nullptr); w && w != target; w = GetWindow(w, GW_HWNDNEXT)) {
+        RECT r;
+        if (!IsWindowVisible(w) || IsIconic(w) || !GetWindowRect(w, &r) || !IntersectRect(&r, &r, &area)) continue;
+        if (GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TRANSPARENT) continue;  // click-through overlays
+        DWORD pid = 0, affinity = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == targetPid) continue;
+        if (GetWindowDisplayAffinity(w, &affinity) && affinity != WDA_NONE) continue;  // not captured anyway
+        BOOL cloaked = FALSE;
+        if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) continue;
+        RECT frame;  // without the invisible resize borders
+        if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+            !IntersectRect(&r, &frame, &area))
+            continue;
+        OffsetRect(&r, -area.left, -area.top);
+        out.push_back(r);
+    }
+}
+
 bool Capture::Setup(int sw, int sh) {
     double f = 1.0;
     int longE = std::max(sw, sh), shortE = std::min(sw, sh);
@@ -227,6 +266,7 @@ bool Capture::Setup(int sw, int sh) {
         auto store = std::make_shared<FrameStore>();
         std::wstring err;
         if (!store->Open(w, h, err)) return false;
+        store->SetNominalFps(opt_.fps);
         store_ = std::move(store);
     }
     outW_ = w;
@@ -240,7 +280,7 @@ void Capture::Fail(std::wstring msg) {
     if (notify_) PostMessageW(notify_, closedMsg_, 1, 0);
 }
 
-void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts) {
+void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered) {
     int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
     if (!setupDone_) {
         if (setupFailed_) return;
@@ -252,19 +292,27 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts) {
         setupDone_ = true;
     }
     const bool video = opt_.video.has_value();
+    const bool same = sw - outW_ >= 0 && sw - outW_ <= 1 && sh - outH_ >= 0 && sh - outH_ <= 1;
+    const bool mask = !covered.empty() && ctx1_;
     DeviceLock lock(mt_.Get());
 
-    // Clip mode copies into the next staging texture; video mode keeps the latest frame in out_.
-    ID3D11Texture2D* dst = video ? out_.Get() : staging_[ring_].Get();
-    if (sw - outW_ >= 0 && sw - outW_ <= 1 && sh - outH_ >= 0 && sh - outH_ <= 1) {
+    // Clip mode copies into the next staging texture (through out_ when it is scaled or masked); video mode keeps
+    // the latest frame in out_.
+    ID3D11Texture2D* staging = video ? nullptr : staging_[ring_].Get();
+    float fx = 1.f, fy = 1.f;  // source -> output pixels
+    int dx = 0, dy = 0;
+    if (same) {
         // Same size (an odd edge is trimmed by one pixel): plain copy, no resampling.
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)(sr.left + outW_), (UINT)(sr.top + outH_), 1};
-        ctx_->CopySubresourceRegion(dst, 0, 0, 0, 0, tex, 0, &box);
+        ctx_->CopySubresourceRegion(video || mask ? out_.Get() : staging, 0, 0, 0, 0, tex, 0, &box);
     } else {
         float f = std::min((float)outW_ / sw, (float)outH_ / sh);
         int dw = std::clamp((int)std::lround(sw * f), 1, outW_);
         int dh = std::clamp((int)std::lround(sh * f), 1, outH_);
-        int dx = (outW_ - dw) / 2, dy = (outH_ - dh) / 2;
+        dx = (outW_ - dw) / 2;
+        dy = (outH_ - dh) / 2;
+        fx = (float)dw / sw;
+        fy = (float)dh / sh;
         float scale = std::max((float)sw / dw, (float)sh / dh);
         int lod = scale > 1.f ? std::max(0, (int)std::lround(std::log2(scale)) - 2) : 0;
 
@@ -314,8 +362,23 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts) {
         ID3D11ShaderResourceView* nullSrv = nullptr;
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
-        if (!video) ctx_->CopyResource(dst, out_.Get());
     }
+    if (mask) {
+        std::vector<D3D11_RECT> rects;
+        rects.reserve(covered.size());
+        for (const RECT& c : covered) {
+            D3D11_RECT r{dx + (LONG)std::floor(c.left * fx), dy + (LONG)std::floor(c.top * fy),
+                         dx + (LONG)std::ceil(c.right * fx), dy + (LONG)std::ceil(c.bottom * fy)};
+            r.left = std::clamp<LONG>(r.left, 0, outW_);
+            r.right = std::clamp<LONG>(r.right, 0, outW_);
+            r.top = std::clamp<LONG>(r.top, 0, outH_);
+            r.bottom = std::clamp<LONG>(r.bottom, 0, outH_);
+            if (r.right > r.left && r.bottom > r.top) rects.push_back(r);
+        }
+        const float black[4] = {0, 0, 0, 1};
+        if (!rects.empty()) ctx1_->ClearView(outRtv_.Get(), black, rects.data(), (UINT)rects.size());
+    }
+    if (!video && (!same || mask)) ctx_->CopyResource(staging, out_.Get());
     if (video) {
         SetEvent(firstFrame_);
         return;
@@ -427,11 +490,15 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
     if (accept) {
         RECT sr;
         if (SourceRect(cs.Width, cs.Height, sr)) {
+            if (opt_.monitorMode)
+                CoveredRects(sr, covered_);
+            else
+                covered_.clear();
             try {
                 auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
                 ComPtr<ID3D11Texture2D> tex;
                 if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) {
-                    Process(tex.Get(), sr, ts - firstTs_);
+                    Process(tex.Get(), sr, ts - firstTs_, covered_);
                     lastTs_ = ts - firstTs_;
                     lastArrivalQpc_ = util::Qpc100ns();
                 }
@@ -469,13 +536,15 @@ CaptureResult Capture::Stop() {
         res.path = opt_.video->path;
         res.notice = notice_;
         res.seconds = (stopQpc - startQpc_) / 1e7;
-        std::wstring err = videoError_;
-        if (err.empty()) {
-            res.ok = writer_->Finish(err);
-        } else {
-            writer_->Abort();
+        // An error mid-recording keeps what was encoded before it.
+        std::wstring finishErr;
+        res.ok = writer_->Finish(finishErr);
+        if (res.ok && !videoError_.empty()) {
+            res.seconds = (double)writer_->VideoFrames() / std::max(1, opt_.fps);
+            std::wstring kept = videoError_ + L" 오류 전까지(" + util::FormatClock(res.seconds, false) + L") 저장했습니다.";
+            res.notice = res.notice.empty() ? kept : kept + L" " + res.notice;
         }
-        res.error = err;
+        res.error = res.ok ? std::wstring() : !videoError_.empty() ? videoError_ : finishErr;
         res.encoder = writer_->EncoderName();
         res.hardware = writer_->HardwareEncoder();
         res.audio = res.ok && writer_->HasAudio();
@@ -517,6 +586,7 @@ void Capture::ReleaseGpu() {
     vs_.Reset();
     if (ctx_) ctx_->ClearState();
     mt_.Reset();
+    ctx1_.Reset();
     ctx_.Reset();
     dev_.Reset();
 }

@@ -27,6 +27,8 @@ public:
     // Container time of frame 0; clip time = container time - Offset().
     int64_t Offset() const { return offset_; }
     int AudioRate() const { return audioRate_; }
+    // The MP4 writer's AAC encoder takes only these rates; other sound can't be carried into an export.
+    bool AudioExportable() const { return audioRate_ == 44100 || audioRate_ == 48000; }
     // Device for hardware decoding shared by the readers; null when there is none.
     IMFDXGIDeviceManager* DeviceManager() const;
 

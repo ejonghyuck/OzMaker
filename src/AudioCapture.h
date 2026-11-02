@@ -1,5 +1,8 @@
 #pragma once
 
+struct IAudioClient;
+struct IAudioCaptureClient;
+
 // WASAPI loopback recorder producing interleaved 16-bit stereo PCM at a fixed rate on the QPC timeline, so it
 // lines up with Windows.Graphics.Capture frames. Sample n of the output plays at origin + n / rate; stretches
 // where nothing is playing (loopback delivers no packets then) are filled with silence.
@@ -26,6 +29,8 @@ public:
 
 private:
     void Run();
+    // Activates, initializes and starts the loopback client (the default output device's, for System).
+    HRESULT Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureClient>& cap, HANDLE event);
     void Deliver(const BYTE* data, UINT32 frames, bool silent, int64_t qpc);
     void Append(const int16_t* pcm, size_t frames);  // pcm == nullptr: silence
     void PadTo(int64_t frame);

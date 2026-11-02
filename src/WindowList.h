@@ -31,6 +31,7 @@ bool QueryWindowInfo(HWND hwnd, WinInfo& out);
 
 bool GetVisibleFrame(HWND hwnd, RECT& r);
 bool IsFullscreenWindow(HWND hwnd);
+bool IsShellWindow(HWND hwnd);  // desktop, taskbar, start menu and friends
 std::wstring GetProcessPath(DWORD pid);
 
 // Best icon for a window as a WIC bitmap (caller converts to D2D). May return null.

@@ -17,7 +17,8 @@ struct VideoOptions {
 struct CaptureOptions {
     CaptureSource source = CaptureSource::Window;
     HWND target = nullptr;       // Window
-    bool monitorMode = false;    // Window: capture the monitor and crop to the window (robust for fullscreen games)
+    bool monitorMode = false;    // Window: capture the monitor and crop to the window (robust for fullscreen games);
+                                 // other windows over it are blacked out while it isn't in front
     HMONITOR monitor = nullptr;  // Monitor / Region
     RECT region{};               // Region, screen pixels
     bool clientOnly = true;      // Window: drop title bar and borders
@@ -53,6 +54,7 @@ public:
     CaptureResult Stop();
 
     bool Running() const { return running_; }
+    bool StoreFailed() const;  // clip mode: the temp file couldn't be written (disk full)
     double Elapsed() const;
     size_t Frames() const;
     int OutWidth() const { return outW_; }
@@ -61,8 +63,10 @@ public:
 private:
     void OnFrame(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& pool);
     bool SourceRect(int contentW, int contentH, RECT& r) const;
+    void CoveredRects(const RECT& sr, std::vector<RECT>& out) const;
     bool Setup(int srcW, int srcH);
-    void Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts);
+    // covered: parts of sr (relative to it) to black out.
+    void Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered);
     void DrainOne();
     void TickLoop();
     void Fail(std::wstring msg);
@@ -75,6 +79,7 @@ private:
 
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
+    ComPtr<ID3D11DeviceContext1> ctx1_;  // ClearView for the covered parts
     ComPtr<ID3D11Multithread> mt_;  // video mode: the encoder shares the device
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice rtDevice_{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem item_{nullptr};
@@ -97,6 +102,7 @@ private:
     int ring_ = 0;
     struct Pending { int idx; int64_t ts; };
     std::deque<Pending> pending_;
+    std::vector<RECT> covered_;
 
     std::shared_ptr<FrameStore> store_;
     int outW_ = 0, outH_ = 0;
