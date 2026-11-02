@@ -1,0 +1,218 @@
+#include "pch.h"
+#include "Util.h"
+
+#include <cstdarg>
+
+namespace util {
+
+std::wstring Utf8ToWide(std::string_view s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring out(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
+    return out;
+}
+
+std::string WideToUtf8(std::wstring_view s) {
+    if (s.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+int64_t Qpc100ns() {
+    static const int64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart / freq) * 10'000'000 + (c.QuadPart % freq) * 10'000'000 / freq;
+}
+
+double NowSeconds() { return Qpc100ns() / 1e7; }
+
+std::wstring Format(const wchar_t* fmt, ...) {
+    wchar_t buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+std::wstring FormatClock(double seconds, bool tenths) {
+    if (seconds < 0) seconds = 0;
+    int64_t t = (int64_t)(seconds * 10.0 + 1e-6);
+    int64_t tenth = t % 10;
+    int64_t s = t / 10;
+    int64_t h = s / 3600, m = (s / 60) % 60, sec = s % 60;
+    if (h > 0) return Format(L"%lld:%02lld:%02lld", h, m, sec);
+    if (tenths) return Format(L"%lld:%02lld.%lld", m, sec, tenth);
+    return Format(L"%lld:%02lld", m, sec);
+}
+
+std::wstring FormatBytes(uint64_t b) {
+    if (b < 1024) return Format(L"%llu B", b);
+    if (b < 1024 * 1024) return Format(L"%.0f KB", b / 1024.0);
+    if (b < 1024ull * 1024 * 1024) return Format(L"%.1f MB", b / (1024.0 * 1024.0));
+    return Format(L"%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
+}
+
+std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR p = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_CREATE, nullptr, &p))) out = p;
+    CoTaskMemFree(p);
+    return out;
+}
+
+bool EnsureDir(const std::wstring& dir) {
+    if (dir.empty()) return false;
+    DWORD a = GetFileAttributesW(dir.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES) return (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    return SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr) == ERROR_SUCCESS;
+}
+
+std::wstring AppDataDir() {
+    std::wstring d = KnownFolder(FOLDERID_RoamingAppData) + L"\\OzMaker";
+    EnsureDir(d);
+    return d;
+}
+
+std::wstring TimestampName() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    return Format(L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+}
+
+std::wstring FileNameOf(const std::wstring& path) {
+    size_t p = path.find_last_of(L"\\/");
+    return p == std::wstring::npos ? path : path.substr(p + 1);
+}
+
+uint64_t FileSize(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return 0;
+    return ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+}
+
+void OpenFolderAndSelect(const std::wstring& path) {
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(path.c_str());
+    if (pidl) {
+        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+        ILFree(pidl);
+    }
+}
+
+void ShellOpen(const std::wstring& path) {
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+bool CopyFileToClipboard(HWND owner, const std::wstring& path) {
+    // CF_HDROP: pasting into Explorer, Discord, messengers etc. pastes the file itself.
+    size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GHND, bytes);
+    if (!mem) return false;
+    auto* df = (DROPFILES*)GlobalLock(mem);
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    memcpy((uint8_t*)df + sizeof(DROPFILES), path.c_str(), path.size() * sizeof(wchar_t));
+    GlobalUnlock(mem);
+
+    if (!OpenClipboard(owner)) {
+        GlobalFree(mem);
+        return false;
+    }
+    EmptyClipboard();
+    bool ok = SetClipboardData(CF_HDROP, mem) != nullptr;
+    // Preferred drop effect = copy, so Explorer pastes a copy instead of moving.
+    UINT fmt = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+    if (HGLOBAL eff = GlobalAlloc(GHND, sizeof(DWORD))) {
+        *(DWORD*)GlobalLock(eff) = DROPEFFECT_COPY;
+        GlobalUnlock(eff);
+        if (!SetClipboardData(fmt, eff)) GlobalFree(eff);
+    }
+    CloseClipboard();
+    if (!ok) GlobalFree(mem);
+    return ok;
+}
+
+bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    ComPtr<IShellItem> init;
+    if (!initial.empty() && SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr, IID_PPV_ARGS(&init))))
+        dlg->SetFolder(init.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return false;
+    PWSTR p = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return false;
+    out = p;
+    CoTaskMemFree(p);
+    return true;
+}
+
+bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name, const wchar_t* ext,
+                  const wchar_t* filterName, std::wstring& out) {
+    ComPtr<IFileSaveDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    std::wstring spec = std::wstring(L"*.") + ext;
+    COMDLG_FILTERSPEC filters[] = {{filterName, spec.c_str()}};
+    dlg->SetFileTypes(1, filters);
+    dlg->SetDefaultExtension(ext);
+    dlg->SetFileName(name.c_str());
+    ComPtr<IShellItem> folder;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        dlg->SetFolder(folder.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return false;
+    PWSTR p = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return false;
+    out = p;
+    CoTaskMemFree(p);
+    return true;
+}
+
+static std::wstring VkName(UINT vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::wstring(1, (wchar_t)vk);
+    if (vk >= '0' && vk <= '9') return std::wstring(1, (wchar_t)vk);
+    if (vk >= VK_F1 && vk <= VK_F24) return Format(L"F%u", vk - VK_F1 + 1);
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return Format(L"Num %u", vk - VK_NUMPAD0);
+    switch (vk) {
+        case VK_SPACE: return L"Space";
+        case VK_PAUSE: return L"Pause";
+        case VK_SNAPSHOT: return L"PrtSc";
+        case VK_SCROLL: return L"ScrLk";
+        case VK_INSERT: return L"Insert";
+        case VK_DELETE: return L"Delete";
+        case VK_HOME: return L"Home";
+        case VK_END: return L"End";
+        case VK_PRIOR: return L"PgUp";
+        case VK_NEXT: return L"PgDn";
+        case VK_OEM_3: return L"`";
+    }
+    UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    wchar_t buf[64] = {};
+    if (sc && GetKeyNameTextW((LONG)(sc << 16), buf, 64) > 0) return buf;
+    return Format(L"0x%02X", vk);
+}
+
+std::wstring HotkeyToString(UINT mods, UINT vk) {
+    std::wstring s;
+    if (mods & MOD_CONTROL) s += L"Ctrl + ";
+    if (mods & MOD_ALT) s += L"Alt + ";
+    if (mods & MOD_SHIFT) s += L"Shift + ";
+    if (mods & MOD_WIN) s += L"Win + ";
+    s += VkName(vk);
+    return s;
+}
+
+}  // namespace util

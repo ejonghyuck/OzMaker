@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{6F1C2B9E-4D3A-4E7B-9A51-0C2D7E8F1A23}</ProjectGuid>
+    <RootNamespace>OzMaker</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <!-- Dependencies are built release-only with the static CRT, so both configs link the release CRT. -->
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <!-- vcpkg (optional): provides libwebp / libavif. Without it WebP and AVIF export are left out. -->
+  <PropertyGroup Label="Vcpkg">
+    <OzVcpkgRoot Condition="'$(VCPKG_ROOT)' != ''">$(VCPKG_ROOT)</OzVcpkgRoot>
+    <OzVcpkgRoot Condition="'$(OzVcpkgRoot)' == ''">$(MSBuildThisFileDirectory)..\vcpkg</OzVcpkgRoot>
+    <OzUseVcpkg Condition="Exists('$(OzVcpkgRoot)\vcpkg.exe') And '$(OzNoVcpkg)' != 'true'">true</OzUseVcpkg>
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgTriplet>x64-windows-static-rel</VcpkgTriplet>
+    <VcpkgConfiguration>Release</VcpkgConfiguration>
+    <VcpkgAdditionalInstallOptions>--overlay-triplets="$(MSBuildThisFileDirectory)triplets"</VcpkgAdditionalInstallOptions>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(OzVcpkgRoot)\scripts\buildsystems\msbuild\vcpkg.props" Condition="'$(OzUseVcpkg)' == 'true'" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)bin\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)obj\$(Configuration)\</IntDir>
+    <TargetName>OzMaker</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <FxCompile>
+      <ShaderModel>5.0</ShaderModel>
+      <EntryPointName>main</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput />
+    </FxCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>OZ_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\App.cpp" />
+    <ClCompile Include="src\AudioCapture.cpp" />
+    <ClCompile Include="src\AudioPreview.cpp" />
+    <ClCompile Include="src\Clip.cpp" />
+    <ClCompile Include="src\VideoClip.cpp" />
+    <ClCompile Include="src\AppViews.cpp" />
+    <ClCompile Include="src\Capture.cpp" />
+    <ClCompile Include="src\Exporter.cpp" />
+    <ClCompile Include="src\FrameStore.cpp" />
+    <ClCompile Include="src\Mp4Writer.cpp" />
+    <ClCompile Include="src\Gfx.cpp" />
+    <ClCompile Include="src\Overlays.cpp" />
+    <ClCompile Include="src\Resize.cpp" />
+    <ClCompile Include="src\SelfTest.cpp" />
+    <ClCompile Include="src\Settings.cpp" />
+    <ClCompile Include="src\Sound.cpp" />
+    <ClCompile Include="src\Ui.cpp" />
+    <ClCompile Include="src\Util.cpp" />
+    <ClCompile Include="src\WindowList.cpp" />
+    <ClCompile Include="src\encoders\Encoder.cpp" />
+    <ClCompile Include="src\encoders\GifEncoder.cpp" />
+    <ClCompile Include="src\encoders\WebpEncoder.cpp" />
+    <ClCompile Include="src\encoders\AvifEncoder.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\App.h" />
+    <ClInclude Include="src\AudioCapture.h" />
+    <ClInclude Include="src\AudioPreview.h" />
+    <ClInclude Include="src\Clip.h" />
+    <ClInclude Include="src\VideoClip.h" />
+    <ClInclude Include="src\Capture.h" />
+    <ClInclude Include="src\Exporter.h" />
+    <ClInclude Include="src\FrameStore.h" />
+    <ClInclude Include="src\Mp4Writer.h" />
+    <ClInclude Include="src\Gfx.h" />
+    <ClInclude Include="src\Overlays.h" />
+    <ClInclude Include="src\Resize.h" />
+    <ClInclude Include="src\Settings.h" />
+    <ClInclude Include="src\Sound.h" />
+    <ClInclude Include="src\Theme.h" />
+    <ClInclude Include="src\Ui.h" />
+    <ClInclude Include="src\Util.h" />
+    <ClInclude Include="src\WindowList.h" />
+    <ClInclude Include="src\encoders\Encoder.h" />
+    <ClInclude Include="res\resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="src\shaders\ScaleVS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+    </FxCompile>
+    <FxCompile Include="src\shaders\ScalePS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+    </FxCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="res\OzMaker.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="res\app.manifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="vcpkg.json" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(OzVcpkgRoot)\scripts\buildsystems\msbuild\vcpkg.targets" Condition="'$(OzUseVcpkg)' == 'true'" />
+</Project>

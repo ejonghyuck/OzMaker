@@ -1,0 +1,11 @@
+{
+  "name": "ozmaker",
+  "version-string": "0.3.0",
+  "dependencies": [
+    "libwebp",
+    {
+      "name": "libavif",
+      "features": [ "aom" ]
+    }
+  ]
+}

@@ -1,0 +1,1328 @@
+#include "pch.h"
+#include "App.h"
+#include "Util.h"
+
+using namespace theme;
+
+namespace {
+
+TextStyle Bold(uint8_t h = AlignStart) {
+    TextStyle s;
+    s.weight = kSemibold;
+    s.h = h;
+    return s;
+}
+
+TextStyle Align(uint8_t h, uint8_t v = AlignCenter) {
+    TextStyle s;
+    s.h = h;
+    s.v = v;
+    return s;
+}
+
+// The saved-video card along the bottom of the capture preview.
+Rect VideoCardRect(Rect preview) { return Rect(preview.l + 12, preview.b - 12 - 64, preview.r - 12, preview.b - 12); }
+
+const wchar_t* FormatBlurb(Format f) {
+    switch (f) {
+        case Format::Gif: return L"어디서나 재생 · 256색";
+        case Format::WebP: return L"GIF보다 훨씬 작은 용량 · 대부분의 브라우저/메신저";
+        case Format::Avif: return L"최고 압축률 · 최신 브라우저";
+        default: return L"";
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------- frame
+
+void App::DrawFrame(Rect client) {
+    ui_.Fill(client, Bg);
+    Rect r = client;
+    DrawHeader(r.CutTop(60));
+    r = r.Inset(20, 0);
+    r.b -= 20;
+    switch (screen_) {
+        case Screen::Home: DrawHome(r); break;
+        case Screen::Editor: DrawEditor(r); break;
+        case Screen::Settings: DrawSettings(r); break;
+    }
+    DrawToast(client);
+}
+
+void App::DrawHeader(Rect r) {
+    Rect h = r.Inset(20, 0);
+    ui_.Logo(Rect::XYWH(h.l, h.CY() - 14, 28, 28));
+    float tw = ui_.Measure(L"OzMaker", 17.f, kBold);
+    TextStyle title;
+    title.weight = kBold;
+    ui_.Text(Rect(h.l + 40, h.t, h.l + 40 + tw + 4, h.b), L"OzMaker", 17.f, TextColor, title);
+    ui_.Text(Rect(h.l + 48 + tw, h.t + 2, h.l + 200 + tw, h.b), L"움짤 메이커", 12.5f, TextFaint);
+
+    Rect right = h;
+    if (screen_ != Screen::Settings) {
+        Rect b = right.CutRight(36);
+        if (ui_.IconButton(HashId("hdr.settings"), Rect::Centered(b.CX(), b.CY(), 36, 36), icon::Settings, L"설정")) {
+            settingsReturn_ = screen_;
+            screen_ = Screen::Settings;
+            capturingHotkey_ = false;
+        }
+        right.CutRight(8);
+    } else {
+        Rect b = right.CutRight(110);
+        if (ui_.Button(HashId("hdr.back"), Rect::Centered(b.CX(), b.CY(), 110, 36), L"돌아가기", BtnStyle::Ghost,
+                       icon::Back)) {
+            screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
+            capturingHotkey_ = false;
+            if (screen_ == Screen::Home) RefreshWindows();
+        }
+    }
+    if (screen_ == Screen::Editor) {
+        Rect b = right.CutRight(120);
+        bool en = !exporter_.Busy();
+        if (ui_.Button(HashId("hdr.new"), Rect::Centered(b.CX(), b.CY(), 120, 36), L"새 녹화", BtnStyle::Ghost,
+                       icon::Back, en))
+            CloseEditor();
+    } else if (screen_ == Screen::Home && clip_) {
+        Rect b = right.CutRight(150);
+        if (ui_.Button(HashId("hdr.resume"), Rect::Centered(b.CX(), b.CY(), 150, 36), L"이전 녹화 편집",
+                       BtnStyle::Secondary, icon::Next))
+            ResumeEditor();
+    }
+    if (rec_ == RecState::Recording) {
+        std::wstring t = L"REC  " + util::FormatClock(capture_.Elapsed(), true);
+        Rect pill = Rect::Centered(r.CX(), r.CY(), 120, 30);
+        ui_.Fill(pill, WithAlpha(Rec, 0.16f), 15);
+        ui_.Circle(pill.l + 16, pill.CY(), 4.5f, Rec);
+        TextStyle st = Bold();
+        st.tabular = true;
+        ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, RecHi, st);
+    }
+    ui_.Line(r.l, r.b - 0.5f, r.r, r.b - 0.5f, Border, 1.f);
+}
+
+void App::DrawToast(Rect client) {
+    double now = ui_.Now();
+    bool visible = !toast_.empty() && now < toastUntil_;
+    float a = ui_.Anim(HashId("toast"), visible ? 1.f : 0.f, 12.f);
+    if (visible) RequestWake(toastUntil_);
+    if (a <= 0.01f) return;
+    float tw = std::min(client.W() - 80, ui_.Measure(toast_, 13.f) + 60);
+    Rect r = Rect::Centered(client.CX(), client.b - 44 + (1 - a) * 16, tw, 40);
+    ui_.Fill(r.Offset(0, 3), WithAlpha(Black, 0.35f * a), 20);
+    ui_.Fill(r, WithAlpha(toastError_ ? Hex(0x3A1A20) : Hex(0x222733), a), 20);
+    ui_.Stroke(r.Inset(0.5f), WithAlpha(toastError_ ? Rec : BorderStrong, 0.7f * a), 20);
+    ui_.Icon(Rect::XYWH(r.l + 12, r.t, 24, r.H()), toastError_ ? icon::Warning : icon::Check, 14.f,
+             WithAlpha(toastError_ ? RecHi : Success, a));
+    ui_.Text(Rect(r.l + 42, r.t, r.r - 16, r.b), toast_, 13.f, WithAlpha(TextColor, a));
+}
+
+// ---------------------------------------------------------------- home
+
+void App::DrawHome(Rect r) {
+    r.CutTop(20);
+    Rect left = r.CutLeft(360);
+    r.CutLeft(20);
+    DrawSourcePanel(left);
+    DrawCapturePanel(r);
+}
+
+void App::DrawSourcePanel(Rect r) {
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), Border, 14);
+    Rect in = r.Inset(16);
+    int src = settings_.source;
+    bool idle = rec_ == RecState::Idle;
+    if (ui_.Segmented(HashId("home.source"), in.CutTop(38), {L"창", L"전체 화면", L"영역"}, src, idle ? 0 : 0b111) &&
+        idle)
+        SetSource(src);
+    in.CutTop(14);
+    switch (settings_.source) {
+        case kSourceDisplay: DrawMonitorList(in); break;
+        case kSourceRegion: DrawRegionPanel(in); break;
+        default: DrawWindowList(in); break;
+    }
+}
+
+void App::DrawWindowList(Rect in) {
+    Rect head = in.CutTop(36);
+    ui_.Text(head, L"녹화할 창", 15.f, TextColor, Bold());
+    Rect pickR = head.CutRight(124);
+    {
+        UiId id = HashId("home.pick");
+        bool clicked = ui_.Click(id, pickR);
+        float h = ui_.Anim(id, ui_.Hover(pickR) ? 1.f : 0.f);
+        ui_.Fill(pickR, Mix(Surface2, Surface3, h), 9);
+        ui_.Stroke(pickR.Inset(0.5f), Border, 9);
+        ui_.Crosshair(pickR.l + 20, pickR.CY(), 14, Mix(TextDim, Accent, 0.6f + 0.4f * h));
+        ui_.Text(Rect(pickR.l + 34, pickR.t, pickR.r, pickR.b), L"화면에서 선택", 13.f, TextColor, Bold());
+        ui_.Tooltip(id, pickR, L"화면 위의 창을 직접 클릭해서 고릅니다");
+        if (clicked) {
+            HideMain();
+            picker_.Start(EnumerateCaptureWindows(), [this](HWND h) {
+                ShowMain(true);
+                if (h) {
+                    RefreshWindows();
+                    SelectTarget(h);
+                }
+            });
+        }
+    }
+    head.CutRight(6);
+    Rect refR = head.CutRight(34);
+    if (ui_.IconButton(HashId("home.refresh"), Rect::Centered(refR.CX(), refR.CY(), 34, 34), icon::Refresh,
+                       L"목록 새로고침", true, 14.f))
+        RefreshWindows();
+
+    in.CutTop(10);
+    Rect hint = in.CutBottom(22);
+    ui_.Text(hint, L"더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
+    in.CutBottom(6);
+
+    Rect list = in;
+    const float itemH = 58, step = 62;
+    float content = windows_.size() * step - 4;
+    float maxScroll = std::max(0.f, content - list.H());
+    bool inList = ui_.Hover(list);
+    if (inList && ui_.In().wheel != 0) listScroll_ -= ui_.In().wheel * step * 1.5f;
+    listScroll_ = std::clamp(listScroll_, 0.f, maxScroll);
+    float scroll = ui_.Anim(HashId("home.scroll"), listScroll_, 22.f);
+
+    if (windows_.empty()) {
+        ui_.Text(list, L"녹화할 수 있는 창이 없습니다", 13.f, TextFaint, Align(AlignCenter));
+        return;
+    }
+    ui_.PushClip(list);
+    auto* dc = gfx_.DC();
+    for (size_t i = 0; i < windows_.size(); ++i) {
+        const WinInfo& w = windows_[i];
+        Rect item = Rect::XYWH(list.l, list.t + i * step - scroll, list.W() - (maxScroll > 0 ? 8 : 0), itemH);
+        if (item.b < list.t || item.t > list.b) continue;
+        UiId id = HashId("win", (uint32_t)(uintptr_t)w.hwnd);
+        bool hov = ui_.Hover(item);
+        if (ui_.Click(id, item)) SelectTarget(w.hwnd);
+        if (hov && ui_.In().dblclick) StartRecording(WindowTarget(w.hwnd), false);
+        bool sel = w.hwnd == target_;
+        float h = ui_.Anim(id, hov ? 1.f : 0.f);
+        ui_.Fill(item, sel ? Mix(Surface2, Accent, 0.16f) : WithAlpha(Surface2, h), 10);
+        if (sel) ui_.Stroke(item.Inset(0.75f), WithAlpha(Accent, 0.85f), 10, 1.5f);
+
+        Rect ic = Rect::XYWH(item.l + 12, item.CY() - 16, 32, 32);
+        if (ID2D1Bitmap* bmp = IconFor(w))
+            dc->DrawBitmap(bmp, ic, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+        else
+            ui_.Icon(ic, icon::AppWindow, 20.f, TextDim);
+
+        ui_.Text(Rect(item.l + 56, item.t + 8, item.r - 12, item.t + 30), w.title, 13.5f, TextColor, Bold());
+        std::wstring sub = w.exeName.empty() ? L"" : w.exeName;
+        if (!w.minimized) {
+            sub += util::Format(L"%s%d×%d", sub.empty() ? L"" : L" · ", w.frame.right - w.frame.left,
+                                w.frame.bottom - w.frame.top);
+        }
+        if (w.fullscreen) sub += L" · 전체화면";
+        if (w.minimized) sub += L" · 최소화됨";
+        ui_.Text(Rect(item.l + 56, item.t + 30, item.r - 12, item.b - 8), sub, 12.f, TextFaint);
+    }
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(30.f, list.H() * list.H() / content);
+        float ty = list.t + (list.H() - th) * (scroll / maxScroll);
+        ui_.Fill(Rect::XYWH(list.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
+    }
+}
+
+void App::DrawMonitorList(Rect in) {
+    Rect head = in.CutTop(36);
+    ui_.Text(head, L"녹화할 화면", 15.f, TextColor, Bold());
+    Rect refR = head.CutRight(34);
+    if (ui_.IconButton(HashId("mon.refresh"), Rect::Centered(refR.CX(), refR.CY(), 34, 34), icon::Refresh,
+                       L"모니터 다시 찾기", true, 14.f))
+        monitors_ = EnumerateMonitors();
+    in.CutTop(10);
+    Rect hint = in.CutBottom(22);
+    ui_.Text(hint, L"더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
+    in.CutBottom(6);
+
+    const MonitorDesc* sel = FindMonitor(monitors_, settings_.monitor);
+    const float itemH = 64, step = 70;
+    for (size_t i = 0; i < monitors_.size(); ++i) {
+        const MonitorDesc& m = monitors_[i];
+        Rect item = Rect::XYWH(in.l, in.t + i * step, in.W(), itemH);
+        if (item.b > in.b) break;
+        UiId id = HashId("mon", (uint32_t)i);
+        bool hov = ui_.Hover(item);
+        if (ui_.Click(id, item)) {
+            settings_.monitor = m.device;
+            settingsDirty_ = true;
+        }
+        if (hov && ui_.In().dblclick) StartRecording(MonitorTarget(m.handle), false);
+        bool isSel = &m == sel;
+        float h = ui_.Anim(id, hov ? 1.f : 0.f);
+        ui_.Fill(item, isSel ? Mix(Surface2, Accent, 0.16f) : WithAlpha(Surface2, h), 10);
+        if (isSel) ui_.Stroke(item.Inset(0.75f), WithAlpha(Accent, 0.85f), 10, 1.5f);
+
+        Rect ic = Rect::XYWH(item.l + 12, item.CY() - 17, 34, 34);
+        ui_.Fill(ic, isSel ? WithAlpha(Accent, 0.22f) : Surface3, 8);
+        ui_.Text(ic, std::to_wstring(m.number), 15.f, isSel ? AccentHi : TextDim, Bold(AlignCenter));
+
+        std::wstring title = util::Format(L"모니터 %d", m.number);
+        if (!m.name.empty()) title += L" · " + m.name;
+        ui_.Text(Rect(item.l + 58, item.t + 10, item.r - 12, item.t + 32), title, 13.5f, TextColor, Bold());
+        std::wstring sub = util::Format(L"%d×%d", m.rect.right - m.rect.left, m.rect.bottom - m.rect.top);
+        if (m.hz > 1) sub += util::Format(L" · %dHz", m.hz);
+        sub += util::Format(L" · 배율 %d%%", (int)std::lround(m.dpi * 100.0 / 96));
+        if (m.primary) sub += L" · 주 모니터";
+        ui_.Text(Rect(item.l + 58, item.t + 32, item.r - 12, item.b - 10), sub, 12.f, TextFaint);
+    }
+    if (monitors_.empty()) ui_.Text(in, L"모니터를 찾을 수 없습니다", 13.f, TextFaint, Align(AlignCenter));
+}
+
+void App::DrawRegionPanel(Rect in) {
+    ui_.Text(in.CutTop(36), L"녹화할 영역", 15.f, TextColor, Bold());
+    in.CutTop(10);
+
+    // Big "select area" card.
+    Rect card = in.CutTop(132);
+    UiId id = HashId("region.pick");
+    bool clicked = ui_.Click(id, card, rec_ == RecState::Idle);
+    float h = ui_.Anim(id, ui_.Hover(card) ? 1.f : 0.f);
+    ui_.Fill(card, Mix(Surface2, Mix(Surface2, Accent, 0.14f), h), 12);
+    ui_.Stroke(card.Inset(0.75f), WithAlpha(Accent, 0.35f + 0.5f * h), 12, 1.5f);
+    // Dashed-looking selection glyph.
+    Rect g = Rect::Centered(card.CX(), card.t + 40, 46, 30);
+    for (float x = g.l; x < g.r; x += 8) {
+        ui_.Line(x, g.t, std::min(x + 4, g.r), g.t, Accent, 2.f);
+        ui_.Line(x, g.b, std::min(x + 4, g.r), g.b, Accent, 2.f);
+    }
+    for (float y = g.t; y < g.b; y += 8) {
+        ui_.Line(g.l, y, g.l, std::min(y + 4, g.b), Accent, 2.f);
+        ui_.Line(g.r, y, g.r, std::min(y + 4, g.b), Accent, 2.f);
+    }
+    ui_.Text(Rect(card.l, card.t + 64, card.r, card.t + 90),
+             settings_.HasRegion() ? L"영역 다시 지정" : L"영역 지정", 15.f, TextColor, Bold(AlignCenter));
+    TextStyle st = Align(AlignCenter, AlignStart);
+    ui_.Text(Rect(card.l + 12, card.t + 92, card.r - 12, card.b - 8),
+             L"화면에서 드래그해서 고릅니다 · 클릭하면 창 전체", 12.f, TextDim, st);
+    if (clicked) StartRegionPick();
+
+    in.CutTop(14);
+    if (settings_.HasRegion()) {
+        const RECT& rg = settings_.region;
+        Rect info = in.CutTop(92);
+        ui_.Fill(info, Surface2, 12);
+        Rect ii = info.Inset(14, 12);
+        ui_.Text(ii.CutTop(18), L"현재 영역", 12.f, TextFaint);
+        TextStyle big = Bold();
+        big.tabular = true;
+        ui_.Text(ii.CutTop(30), util::Format(L"%d × %d", rg.right - rg.left, rg.bottom - rg.top), 20.f, TextColor,
+                 big);
+        std::wstring where;
+        HMONITOR mon = MonitorFromRect(&rg, MONITOR_DEFAULTTONULL);
+        for (auto& m : monitors_)
+            if (m.handle == mon)
+                where = util::Format(L"모니터 %d · 위치 %d, %d", m.number, rg.left - m.rect.left, rg.top - m.rect.top);
+        if (where.empty()) where = L"⚠ 지금 연결된 화면 밖에 있습니다";
+        ui_.Text(ii, where, 12.f, TextDim);
+    }
+    Rect hint = in.CutBottom(40);
+    TextStyle hs = Align(AlignCenter, AlignEnd);
+    hs.wrap = true;
+    ui_.Text(hint, L"녹화 중에는 영역 둘레에 얇은 테두리가 보입니다\n(녹화 결과에는 찍히지 않습니다)", 12.f, TextFaint, hs);
+}
+
+void App::DrawMonitorLayout(Rect r, const RECT* region, bool pickable) {
+    if (monitors_.empty()) return;
+    RECT bb = monitors_[0].rect;
+    for (auto& m : monitors_) UnionRect(&bb, &bb, &m.rect);
+    float bw = (float)(bb.right - bb.left), bh = (float)(bb.bottom - bb.top);
+    float f = std::min(r.W() * 0.86f / bw, r.H() * 0.78f / bh);
+    float ox = r.CX() - bw * f / 2, oy = r.CY() - bh * f / 2;
+    auto map = [&](const RECT& x) {
+        return Rect(ox + (x.left - bb.left) * f, oy + (x.top - bb.top) * f, ox + (x.right - bb.left) * f,
+                    oy + (x.bottom - bb.top) * f);
+    };
+    const MonitorDesc* sel = region ? nullptr : FindMonitor(monitors_, settings_.monitor);
+    for (size_t i = 0; i < monitors_.size(); ++i) {
+        const MonitorDesc& m = monitors_[i];
+        Rect mr = map(m.rect).Inset(3);
+        UiId id = HashId("layout", (uint32_t)i);
+        bool hov = pickable && ui_.Hover(mr);
+        if (pickable && ui_.Click(id, mr)) {
+            settings_.monitor = m.device;
+            settingsDirty_ = true;
+        }
+        if (pickable && hov && ui_.In().dblclick) StartRecording(MonitorTarget(m.handle), false);
+        bool isSel = &m == sel;
+        float h = ui_.Anim(id, hov ? 1.f : 0.f);
+        ui_.Fill(mr, isSel ? Mix(Surface2, Accent, 0.18f) : Mix(Surface2, Surface3, h), 8);
+        ui_.Stroke(mr.Inset(0.75f), isSel ? Accent : BorderStrong, 8, isSel ? 2.f : 1.f);
+        float fs = std::clamp(mr.H() * 0.28f, 12.f, 40.f);
+        ui_.Text(Rect(mr.l, mr.t, mr.r, mr.CY() + fs * 0.4f), std::to_wstring(m.number), fs,
+                 isSel ? AccentHi : TextDim, Bold(AlignCenter));
+        if (mr.H() > 70)
+            ui_.Text(Rect(mr.l, mr.CY() + fs * 0.4f, mr.r, mr.CY() + fs * 0.4f + 22),
+                     util::Format(L"%d×%d", m.rect.right - m.rect.left, m.rect.bottom - m.rect.top), 12.f, TextFaint,
+                     Align(AlignCenter));
+    }
+    if (region) {
+        Rect rr = map(*region);
+        ui_.Fill(rr, WithAlpha(Accent, 0.28f), 2);
+        ui_.Stroke(rr, Accent, 2, 1.5f);
+    }
+}
+
+void App::DrawCapturePreview(Rect preview) {
+    ui_.Fill(preview, Hex(0x0A0B0E), 10);
+    // The window preview is a DWM thumbnail, which DWM composites above everything we draw: everything here stays
+    // above the result card instead of under it.
+    const bool card = showVideo_ && rec_ == RecState::Idle;
+    Rect view = preview;
+    if (card) view.b = VideoCardRect(preview).t;
+    std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+    auto placeholder = [&](std::wstring_view title, std::wstring_view body) {
+        float cy = view.CY();
+        ui_.Ring(view.CX(), cy - 44, 30, WithAlpha(Accent, 0.35f), 2.f);
+        ui_.Crosshair(view.CX(), cy - 44, 30, Accent);
+        ui_.Text(Rect(view.l, cy - 4, view.r, cy + 22), title, 16.f, TextColor, Bold(AlignCenter));
+        TextStyle st = Align(AlignCenter, AlignStart);
+        st.wrap = true;
+        ui_.Text(Rect(view.l + 30, cy + 30, view.r - 30, cy + 80), body, 12.5f, TextDim, st);
+    };
+    switch (settings_.source) {
+        case kSourceDisplay:
+            DrawMonitorLayout(view, nullptr, rec_ == RecState::Idle);
+            break;
+        case kSourceRegion:
+            if (!settings_.HasRegion()) {
+                placeholder(L"녹화할 영역을 지정하세요",
+                            L"왼쪽의 ‘영역 지정’을 누르고 화면에서 드래그하세요.\n단축키 " + hk +
+                                L" 은 지정한 영역을 바로 녹화합니다.");
+            } else if (snapBmp_ && EqualRect(&snapRect_, &settings_.region)) {
+                auto sz = snapBmp_->GetSize();
+                Rect area = view.Inset(10);
+                float s = Scale();
+                float rw = (float)(snapRect_.right - snapRect_.left) / s, rh = (float)(snapRect_.bottom - snapRect_.top) / s;
+                float f = std::min({area.W() / rw, area.H() / rh, 1.f});
+                (void)sz;
+                Rect dst = Rect::Centered(area.CX(), area.CY(), rw * f, rh * f);
+                gfx_.DC()->DrawBitmap(snapBmp_.Get(), dst, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+                ui_.Stroke(dst.Inset(-1.f), WithAlpha(Accent, 0.8f), 0, 1.5f);
+            } else {
+                DrawMonitorLayout(view, &settings_.region, false);
+            }
+            break;
+        default:
+            if (target_ && IsWindow(target_)) {
+                thumbWanted_ = true;
+                thumbArea_ = view.Inset(10);
+                const WinInfo* info = FindWindowInfo(target_);
+                if (info && info->minimized)
+                    ui_.Text(view, L"최소화된 창입니다 · 녹화를 시작하면 복원됩니다", 13.f, TextFaint,
+                             Align(AlignCenter));
+            } else {
+                placeholder(L"녹화할 창을 선택하세요", L"왼쪽 목록에서 고르거나 ‘화면에서 선택’을 누르세요.\n게임 중에는 " +
+                                                         hk + L" 을 누르면 지금 보고 있는 창을 바로 녹화합니다.");
+            }
+            break;
+    }
+    if (card) DrawVideoResult(preview);
+}
+
+void App::DrawVideoResult(Rect preview) {
+    Rect card = VideoCardRect(preview);
+    float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
+    card = card.Offset(0, (1 - a) * 12);
+    ui_.Fill(card.Offset(0, 3), WithAlpha(Black, 0.4f * a), 12);
+    ui_.Fill(card, WithAlpha(Hex(0x14231D), 0.97f * a), 12);
+    ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
+    Rect in = card.Inset(14, 10);
+    Rect close = in.CutRight(28);
+    if (ui_.IconButton(HashId("vres.close"), Rect::Centered(close.CX(), close.CY(), 28, 28), icon::Close, L"닫기",
+                       true, 11.f))
+        showVideo_ = false;
+    in.CutRight(6);
+    const float bw = 76;
+    Rect btns = in.CutRight(bw * 4 + 18);
+    Rect b = Rect::Centered(0, btns.CY(), bw, 34);
+    auto at = [&](int i) { return Rect::XYWH(btns.l + i * (bw + 6), b.t, bw, b.H()); };
+    if (ui_.Button(HashId("vres.edit"), at(0), L"편집", BtnStyle::Primary, icon::Cut, true, 12.f)) {
+        if (clip_ && _wcsicmp(clip_->SourcePath().c_str(), lastVideo_.path.c_str()) == 0)
+            ResumeEditor();
+        else
+            OpenVideo(lastVideo_.path);
+    }
+    if (ui_.Button(HashId("vres.folder"), at(1), L"폴더", BtnStyle::Secondary, icon::Folder, true, 12.f))
+        util::OpenFolderAndSelect(lastVideo_.path);
+    if (ui_.Button(HashId("vres.copy"), at(2), L"복사", BtnStyle::Secondary, icon::Copy, true, 12.f)) {
+        if (util::CopyFileToClipboard(hwnd_, lastVideo_.path))
+            Toast(L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요");
+        else
+            Toast(L"클립보드에 복사할 수 없습니다.", true);
+    }
+    if (ui_.Button(HashId("vres.open"), at(3), L"재생", BtnStyle::Secondary, icon::Play, true, 12.f))
+        util::ShellOpen(lastVideo_.path);
+    in.CutRight(12);
+    Rect icon = in.CutLeft(28);
+    ui_.Circle(icon.CX(), icon.CY(), 12, WithAlpha(Success, 0.2f));
+    ui_.Icon(icon, icon::Check, 12.f, Success);
+    in.CutLeft(8);
+    ui_.Text(Rect(in.l, in.t, in.r, in.CY() + 1), util::FileNameOf(lastVideo_.path), 13.f, TextColor, Bold());
+    std::wstring sub = util::FormatClock(lastVideo_.seconds, false) + L" · " + util::FormatBytes(lastVideo_.bytes) +
+                       (lastVideo_.audio ? L" · 소리 포함" : L" · 소리 없음");
+    if (!lastVideo_.encoder.empty()) {  // only when it fits: the buttons leave little room in a narrow window
+        std::wstring enc =
+            lastVideo_.hardware ? L" · " + Mp4Writer::Vendor(lastVideo_.encoder) + L" 가속" : L" · CPU 인코딩";
+        if (ui_.Measure(sub + enc, 11.5f) <= in.W()) sub += enc;
+    }
+    ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), sub, 11.5f, TextDim);
+}
+
+void App::DrawCapturePanel(Rect r) {
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), Border, 14);
+    Rect in = r.Inset(20);
+    const bool video = settings_.output == kOutputVideo;
+    if (video) ProbeEncoders();
+
+    Rect controls = in.CutBottom(326);
+    in.CutBottom(16);
+    DrawCapturePreview(in);
+
+    RecTarget t;
+    bool ready = CurrentTarget(t, nullptr);
+    const int src = settings_.source;
+
+    // Info row: what + resulting size.
+    Rect row = controls.CutTop(24);
+    if (ready) {
+        int sw = 0, sh = 0, ow = 0, oh = 0;
+        SourceSize(t, sw, sh);
+        PlannedSize(sw, sh, ow, oh);
+        std::wstring title;
+        std::wstring badge = L"창 캡처";
+        D2D1_COLOR_F badgeColor = AccentHi;
+        if (src == kSourceWindow) {
+            const WinInfo* info = FindWindowInfo(t.hwnd);
+            title = info ? info->title : L"";
+            if (UseMonitorCapture(t.hwnd)) {
+                badge = L"화면 캡처";
+                badgeColor = Warning;
+            }
+        } else {
+            const MonitorDesc* md = nullptr;
+            for (auto& m : monitors_)
+                if (m.handle == t.monitor) md = &m;
+            title = md ? util::Format(L"모니터 %d", md->number) : L"모니터";
+            if (md && !md->name.empty() && src == kSourceDisplay) title += L" · " + md->name;
+            if (src == kSourceRegion) title = L"영역 · " + title;
+            badge = src == kSourceRegion ? L"영역" : L"전체 화면";
+        }
+        std::wstring dims = sw > 0 ? util::Format(L"%d×%d  →  %d×%d", sw, sh, ow, oh) : L"";
+        float dw = ui_.Measure(dims, 12.5f) + 4;
+        float bw = ui_.Measure(badge, 11.5f) + 16;
+        Rect b = Rect::XYWH(row.r - bw, row.CY() - 11, bw, 22);
+        ui_.Fill(b, WithAlpha(badgeColor, 0.15f), 11);
+        ui_.Text(b, badge, 11.5f, badgeColor, Bold(AlignCenter));
+        ui_.Text(Rect(b.l - dw - 10, row.t, b.l - 10, row.b), dims, 12.5f, TextDim, Align(AlignEnd));
+        ui_.Text(Rect(row.l, row.t, b.l - dw - 20, row.b), title, 14.f, TextColor, Bold());
+    } else {
+        const wchar_t* none = src == kSourceDisplay ? L"선택된 화면 없음"
+                              : src == kSourceRegion ? L"지정된 영역 없음"
+                                                     : L"선택된 창 없음";
+        ui_.Text(row, none, 14.f, TextFaint, Bold());
+    }
+    controls.CutTop(14);
+
+    auto labeled = [&](std::wstring_view label, float h) {
+        Rect line = controls.CutTop(h);
+        Rect l = line.CutLeft(84);
+        ui_.Text(l, label, 13.f, TextDim);
+        controls.CutTop(10);
+        return line;
+    };
+    bool changed = false;
+    bool idle = rec_ == RecState::Idle;
+    int output = settings_.output;
+    if (ui_.Segmented(HashId("home.output"), labeled(L"결과물", 38), {L"움짤 (GIF · WebP …)", L"동영상 (MP4)"}, output,
+                      idle ? 0 : 0b11) &&
+        idle) {
+        settings_.output = output;
+        changed = true;
+    }
+    if (video) {
+        changed |= ui_.Segmented(HashId("home.vfps"), labeled(L"프레임", 38), {L"24", L"30", L"60"}, settings_.vFpsIdx);
+        changed |= ui_.Segmented(HashId("home.vres"), labeled(L"해상도", 38),
+                                 {L"원본", L"2160p", L"1440p", L"1080p", L"720p"}, settings_.vResIdx);
+    } else {
+        changed |= ui_.Segmented(HashId("home.fps"), labeled(L"프레임", 38),
+                                 {L"10", L"15", L"20", L"30", L"50", L"60"}, settings_.fpsIdx);
+        changed |= ui_.Segmented(HashId("home.size"), labeled(L"최대 크기", 38),
+                                 {L"원본", L"1280", L"960", L"720", L"480"}, settings_.sizeIdx);
+    }
+
+    // Toggles: cursor, (window) title bar, (video) sound.
+    Rect toggles = controls.CutTop(44);
+    int n = 1 + (src == kSourceWindow) + video;
+    float tw = (toggles.W() - 10 * (n - 1)) / n;
+    changed |= ui_.ToggleRow(HashId("home.cursor"), toggles.CutLeft(tw), L"마우스 커서", settings_.cursor);
+    if (src == kSourceWindow) {
+        toggles.CutLeft(10);
+        changed |= ui_.ToggleRow(HashId("home.client"), toggles.CutLeft(tw), L"제목 표시줄 제외", settings_.clientOnly);
+    }
+    if (video) {
+        toggles.CutLeft(10);
+        changed |= ui_.ToggleRow(HashId("home.audio"), toggles.CutLeft(tw), L"소리 녹음", settings_.audio);
+    }
+    controls.CutTop(10);
+
+    // One-line summary of what will happen, with a shortcut to the detailed settings.
+    Rect cap = controls.CutTop(20);
+    if (video) {
+        Rect link = cap.CutRight(80);
+        UiId lid = HashId("home.vsettings");
+        bool lh = ui_.Hover(link);
+        if (ui_.Click(lid, link)) {
+            settingsReturn_ = screen_;
+            screen_ = Screen::Settings;
+            settingsScroll_ = 10000;  // jump to the video section
+        }
+        ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
+        std::wstring audio = AudioSummary(src);
+        bool warn = settings_.audio && src == kSourceWindow && !AudioCapture::ProcessLoopbackSupported();
+        float aw = ui_.Measure(audio, 12.f) + 4;
+        Rect ar = cap.CutRight(aw + 16);
+        ui_.Icon(Rect::XYWH(ar.l, ar.t, 14, ar.H()), warn ? icon::Warning : icon::Info, 11.f,
+                 warn ? Warning : TextFaint);
+        ui_.Text(Rect(ar.l + 16, ar.t, ar.r, ar.b), audio, 12.f, warn ? Warning : TextDim);
+        ui_.Text(cap, VideoSummary(), 12.f, TextFaint);
+    } else {
+        ui_.Text(cap, L"녹화가 끝나면 편집 화면에서 구간 · 크기 · 형식을 정해 저장합니다", 12.f, TextFaint);
+    }
+    controls.CutTop(14);
+    if (changed) settingsDirty_ = true;
+
+    // Record button
+    Rect btn = controls.CutTop(56);
+    UiId id = HashId("home.rec");
+    bool enabled = rec_ != RecState::Idle || ready;
+    bool clicked = ui_.Click(id, btn, enabled);
+    float h = ui_.Anim(id, enabled && ui_.Hover(btn) ? 1.f : 0.f);
+    D2D1_COLOR_F bg = enabled ? Mix(Rec, RecHi, h) : Surface2;
+    if (rec_ != RecState::Idle) bg = Mix(Hex(0x2A2F3A), Hex(0x343B48), h);
+    ui_.Fill(btn, bg, 14);
+    std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+    if (rec_ == RecState::Idle) {
+        const wchar_t* label = video ? L"동영상 녹화" : L"녹화 시작";
+        float lw = ui_.Measure(label, 16.f, kSemibold);
+        float cx = btn.CX() - (lw + 28) / 2 + 9;
+        ui_.Circle(cx, btn.CY(), 9, enabled ? White : TextFaint);
+        if (enabled) ui_.Circle(cx, btn.CY(), 4, Mix(Rec, RecHi, h));
+        ui_.Text(Rect(cx + 18, btn.t, btn.r, btn.b), label, 16.f, enabled ? White : TextFaint, Bold());
+    } else {
+        ui_.Fill(Rect::Centered(btn.CX() - 70, btn.CY(), 14, 14), Rec, 3);
+        std::wstring t2 = rec_ == RecState::Countdown ? L"카운트다운 취소"
+                                                 : L"녹화 중지  " + util::FormatClock(capture_.Elapsed(), true);
+        TextStyle st = Bold();
+        st.tabular = true;
+        ui_.Text(Rect(btn.CX() - 52, btn.t, btn.r, btn.b), t2, 16.f, White, st);
+    }
+    float kw = ui_.Measure(hk, 11.5f) + 18;
+    Rect kb = Rect::XYWH(btn.r - kw - 14, btn.CY() - 12, kw, 24);
+    ui_.Fill(kb, WithAlpha(Black, 0.22f), 8);
+    ui_.Text(kb, hk, 11.5f, WithAlpha(White, enabled ? 0.85f : 0.4f), Align(AlignCenter));
+    if (clicked) {
+        if (rec_ == RecState::Idle)
+            StartRecording(t, false);
+        else
+            StopRecording();
+    }
+}
+
+// ---------------------------------------------------------------- editor
+
+void App::DrawEditor(Rect r) {
+    if (!clip_) {
+        screen_ = Screen::Home;
+        return;
+    }
+    r.CutTop(20);
+    Rect right = r.CutRight(316);
+    r.CutRight(20);
+    Rect left = r;
+    Rect tl = left.CutBottom(84);
+    left.CutBottom(8);
+    Rect tr = left.CutBottom(44);
+    left.CutBottom(10);
+
+    // Keyboard shortcuts
+    const UiInput& in = ui_.In();
+    size_t count = clip_->Count();
+    if (in.Key(VK_SPACE)) SetPlaying(!playing_);
+    if (in.Key(VK_LEFT) && playhead_ > 0) {
+        SetPlaying(false);
+        Seek(playhead_ - 1);
+    }
+    if (in.Key(VK_RIGHT) && playhead_ + 1 < count) {
+        SetPlaying(false);
+        Seek(playhead_ + 1);
+    }
+    if (in.Key(VK_HOME)) Seek(inF_);
+    if (in.Key(VK_END)) Seek(outF_);
+    if (in.Key('I')) {
+        inF_ = std::min(playhead_, outF_);
+        hasResult_ = false;
+        Seek(inF_);
+    }
+    if (in.Key('O')) {
+        outF_ = std::max(playhead_, inF_);
+        hasResult_ = false;
+    }
+    if (in.Key(VK_ESCAPE)) cropMode_ = false;
+
+    if (playing_) playhead_ = PlayheadFromClock();
+    playhead_ = std::clamp(playhead_, (size_t)0, count - 1);
+
+    DrawPreview(left);
+    DrawTransport(tr);
+    DrawTimeline(tl);
+    DrawExportPanel(right);
+}
+
+void App::DrawPreview(Rect r) {
+    ui_.Fill(r, Hex(0x0A0B0E), 14);
+    Rect area = r.Inset(14);
+    const int W = clip_->Width(), H = clip_->Height();
+    float f = std::min({area.W() / W, area.H() / H, 3.f});
+    Rect dst = Rect::Centered(area.CX(), area.CY(), W * f, H * f);
+    dst = Rect(std::round(dst.l), std::round(dst.t), std::round(dst.l) + W * f, std::round(dst.t) + H * f);
+    previewDst_ = dst;
+    ShowFrame(playhead_);
+    if (frameBmp_) {
+        float px = f * Scale();  // device pixels per frame pixel
+        auto mode = px < 0.99f ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                    : px > 1.99f ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                 : D2D1_INTERPOLATION_MODE_LINEAR;
+        gfx_.DC()->DrawBitmap(frameBmp_.Get(), dst, 1.f, mode, nullptr);
+    }
+
+    auto toDip = [&](const RECT& c) {
+        return Rect(dst.l + c.left * f, dst.t + c.top * f, dst.l + c.right * f, dst.t + c.bottom * f);
+    };
+    bool fullCrop = crop_.left == 0 && crop_.top == 0 && crop_.right == W && crop_.bottom == H;
+    Rect cr = toDip(crop_);
+    const UiInput& in = ui_.In();
+    UiId id = HashId("preview");
+
+    if (cropMode_) {
+        // Hit-test handles: 0-3 corners (TL, TR, BR, BL), 4-7 edges (T, R, B, L), 8 = move.
+        auto hitHandle = [&](float x, float y) -> int {
+            const float g = 10;
+            float pts[8][2] = {{cr.l, cr.t}, {cr.r, cr.t}, {cr.r, cr.b}, {cr.l, cr.b},
+                               {cr.CX(), cr.t}, {cr.r, cr.CY()}, {cr.CX(), cr.b}, {cr.l, cr.CY()}};
+            for (int i = 0; i < 8; ++i) {
+                if (i >= 4 && cropAspect_ > 0) break;
+                if (std::fabs(x - pts[i][0]) <= g && std::fabs(y - pts[i][1]) <= g) return i;
+            }
+            if (cr.Contains(x, y)) return 8;
+            return -1;
+        };
+        int hover = hitHandle(in.mx, in.my);
+        if (in.pressed && hover >= 0 && dst.Inset(-12).Contains(in.mx, in.my)) {
+            ui_.Click(id, dst.Inset(-12));
+            cropDrag_ = hover;
+            cropStart_ = crop_;
+            dragX_ = in.mx;
+            dragY_ = in.my;
+        }
+        if (cropDrag_ >= 0 && in.down) {
+            int dx = (int)std::lround((in.mx - dragX_) / f), dy = (int)std::lround((in.my - dragY_) / f);
+            RECT c = cropStart_;
+            const int minSz = 16;
+            if (cropDrag_ == 8) {
+                int w = c.right - c.left, h = c.bottom - c.top;
+                int x = std::clamp((int)c.left + dx, 0, W - w), y = std::clamp((int)c.top + dy, 0, H - h);
+                crop_ = {x, y, x + w, y + h};
+            } else {
+                int l = c.left, t = c.top, rr = c.right, b = c.bottom;
+                bool L = cropDrag_ == 0 || cropDrag_ == 3 || cropDrag_ == 7;
+                bool R = cropDrag_ == 1 || cropDrag_ == 2 || cropDrag_ == 5;
+                bool T = cropDrag_ == 0 || cropDrag_ == 1 || cropDrag_ == 4;
+                bool B = cropDrag_ == 2 || cropDrag_ == 3 || cropDrag_ == 6;
+                if (L) l = std::clamp((int)c.left + dx, 0, rr - minSz);
+                if (R) rr = std::clamp((int)c.right + dx, l + minSz, W);
+                if (T) t = std::clamp((int)c.top + dy, 0, b - minSz);
+                if (B) b = std::clamp((int)c.bottom + dy, t + minSz, H);
+                if (cropAspect_ > 0 && cropDrag_ < 4) {
+                    static const double aspects[] = {0, 1.0, 4.0 / 3.0, 16.0 / 9.0, 9.0 / 16.0};
+                    double a = aspects[cropAspect_];
+                    int w = rr - l;
+                    int h = (int)std::lround(w / a);
+                    int maxH = T ? b : H - t;
+                    if (h > maxH) {
+                        h = maxH;
+                        w = (int)std::lround(h * a);
+                        if (L) l = rr - w; else rr = l + w;
+                    }
+                    if (T) t = b - h; else b = t + h;
+                }
+                crop_ = {l, t, rr, b};
+            }
+            cr = toDip(crop_);
+            hasResult_ = false;
+        }
+        if (!in.down) cropDrag_ = -1;
+        int hh = cropDrag_ >= 0 ? cropDrag_ : hover;
+        if (hh == 0 || hh == 2) ui_.SetCursor(IDC_SIZENWSE);
+        else if (hh == 1 || hh == 3) ui_.SetCursor(IDC_SIZENESW);
+        else if (hh == 4 || hh == 6) ui_.SetCursor(IDC_SIZENS);
+        else if (hh == 5 || hh == 7) ui_.SetCursor(IDC_SIZEWE);
+        else if (hh == 8) ui_.SetCursor(IDC_SIZEALL);
+    } else if (ui_.Click(id, dst)) {
+        SetPlaying(!playing_);
+    }
+
+    if (!fullCrop || cropMode_) {
+        D2D1_COLOR_F dim = WithAlpha(Black, 0.6f);
+        ui_.Fill(Rect(dst.l, dst.t, dst.r, cr.t), dim);
+        ui_.Fill(Rect(dst.l, cr.b, dst.r, dst.b), dim);
+        ui_.Fill(Rect(dst.l, cr.t, cr.l, cr.b), dim);
+        ui_.Fill(Rect(cr.r, cr.t, dst.r, cr.b), dim);
+        ui_.Stroke(cr, WithAlpha(White, 0.9f), 0, 1.f);
+    }
+    if (cropMode_) {
+        for (int i = 1; i <= 2; ++i) {
+            float x = cr.l + cr.W() * i / 3, y = cr.t + cr.H() * i / 3;
+            ui_.Line(x, cr.t, x, cr.b, WithAlpha(White, 0.22f));
+            ui_.Line(cr.l, y, cr.r, y, WithAlpha(White, 0.22f));
+        }
+        float pts[8][2] = {{cr.l, cr.t}, {cr.r, cr.t}, {cr.r, cr.b}, {cr.l, cr.b},
+                           {cr.CX(), cr.t}, {cr.r, cr.CY()}, {cr.CX(), cr.b}, {cr.l, cr.CY()}};
+        for (int i = 0; i < (cropAspect_ > 0 ? 4 : 8); ++i) {
+            Rect hr = Rect::Centered(pts[i][0], pts[i][1], 10, 10);
+            ui_.Fill(hr, White, 2);
+            ui_.Stroke(hr, WithAlpha(Black, 0.4f), 2);
+        }
+        std::wstring sz = util::Format(L"%d × %d", crop_.right - crop_.left, crop_.bottom - crop_.top);
+        float w = ui_.Measure(sz, 12.f) + 16;
+        Rect lab = Rect::XYWH(cr.l, std::max(dst.t, cr.t - 28), w, 22);
+        ui_.Fill(lab, WithAlpha(Black, 0.7f), 6);
+        ui_.Text(lab, sz, 12.f, White, Align(AlignCenter));
+    }
+
+    if (!playing_ && !cropMode_) {
+        float a = ui_.Anim(HashId("preview.pausehint"), ui_.Hover(dst) ? 1.f : 0.f);
+        if (a > 0.01f) {
+            ui_.Circle(dst.CX(), dst.CY(), 30, WithAlpha(Black, 0.5f * a));
+            ui_.Icon(Rect::Centered(dst.CX() + 2, dst.CY(), 60, 60), icon::Play, 22.f, WithAlpha(White, a));
+        }
+    }
+}
+
+void App::DrawTransport(Rect r) {
+    Rect playR = r.CutLeft(44);
+    if (ui_.IconButton(HashId("tr.play"), Rect::Centered(playR.CX(), playR.CY(), 44, 44),
+                       playing_ ? icon::Pause : icon::Play, playing_ ? L"일시정지 (Space)" : L"재생 (Space)", true,
+                       18.f))
+        SetPlaying(!playing_);
+    r.CutLeft(4);
+    Rect prevR = r.CutLeft(34), nextR = r.CutLeft(34);
+    if (ui_.IconButton(HashId("tr.prev"), Rect::Centered(prevR.CX(), prevR.CY(), 34, 34), icon::Prev,
+                       L"이전 프레임 (←)", playhead_ > 0, 12.f)) {
+        SetPlaying(false);
+        Seek(playhead_ - 1);
+    }
+    if (ui_.IconButton(HashId("tr.next"), Rect::Centered(nextR.CX(), nextR.CY(), 34, 34), icon::Next,
+                       L"다음 프레임 (→)", playhead_ + 1 < clip_->Count(), 12.f)) {
+        SetPlaying(false);
+        Seek(playhead_ + 1);
+    }
+    if (clip_->HasAudio()) {
+        Rect volR = r.CutLeft(34);
+        bool slow = kSpeedOptions[settings_.speedIdx] != 1.0;
+        const wchar_t* tip = slow ? L"재생 속도가 1×일 때만 소리가 나옵니다"
+                             : previewMute_ ? L"미리보기 소리 켜기" : L"미리보기 소리 끄기";
+        if (ui_.IconButton(HashId("tr.mute"), Rect::Centered(volR.CX(), volR.CY(), 34, 34),
+                           previewMute_ || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
+            previewMute_ = !previewMute_;
+    }
+    r.CutLeft(10);
+    std::wstring time = util::FormatClock(clip_->Ts(playhead_) / 1e7, true) + L"  /  " +
+                        util::FormatClock(clip_->Seconds(), true);
+    TextStyle st;
+    st.tabular = true;
+    ui_.Text(r.CutLeft(150), time, 13.f, TextDim, st);
+
+    // Crop controls on the right.
+    Rect cropBtn = r.CutRight(92);
+    if (ui_.Button(HashId("tr.crop"), Rect::Centered(cropBtn.CX(), cropBtn.CY(), 92, 36), L"자르기",
+                   cropMode_ ? BtnStyle::Primary : BtnStyle::Secondary, icon::Crop, true, 13.f)) {
+        cropMode_ = !cropMode_;
+        if (cropMode_) SetPlaying(false);
+    }
+    if (cropMode_) {
+        r.CutRight(8);
+        Rect reset = r.CutRight(68);
+        if (ui_.Button(HashId("tr.cropreset"), Rect::Centered(reset.CX(), reset.CY(), 68, 36), L"초기화",
+                       BtnStyle::Ghost, 0, true, 13.f)) {
+            cropAspect_ = 0;
+            ResetCrop();
+            hasResult_ = false;
+        }
+        r.CutRight(6);
+        Rect seg = r.CutRight(std::min(270.f, r.W()));
+        if (ui_.Segmented(HashId("tr.aspect"), Rect::Centered(seg.CX(), seg.CY(), seg.W(), 36),
+                          {L"자유", L"1:1", L"4:3", L"16:9", L"9:16"}, cropAspect_)) {
+            ApplyCropAspect();
+            hasResult_ = false;
+        }
+    }
+}
+
+void App::DrawTimeline(Rect r) {
+    const int64_t total = std::max<int64_t>(1, clip_->EndTs());
+    Rect labels = r.CutTop(22);
+    Rect track = r.Inset(0, 2);
+    track.b -= 4;
+    auto X = [&](int64_t t) { return track.l + track.W() * (float)((double)t / total); };
+    auto T = [&](float x) { return (int64_t)((double)std::clamp((x - track.l) / track.W(), 0.f, 1.f) * total); };
+
+    double selStart = clip_->Ts(inF_) / 1e7, selEnd = RangeEndTs() / 1e7;
+    TextStyle st;
+    st.tabular = true;
+    ui_.Text(labels, L"구간  " + util::FormatClock(selStart, true) + L" – " + util::FormatClock(selEnd, true), 12.f,
+             TextDim, st);
+    st.h = AlignEnd;
+    ui_.Text(labels, util::Format(L"%.1f초 · I / O 키로 구간 지정", selEnd - selStart), 12.f, TextFaint, st);
+
+    ui_.Fill(track, Surface2, 8);
+    ui_.PushClip(track);
+    if (!thumbs_.empty()) {
+        float slot = track.W() / thumbs_.size();
+        for (size_t i = 0; i < thumbs_.size(); ++i) {
+            if (!thumbs_[i]) continue;
+            Rect d = Rect::XYWH(track.l + i * slot, track.t, slot + 0.5f, track.H());
+            // Fill the slot (center crop) keeping the thumbnail's aspect.
+            float bw = (float)thumbW_, bh = (float)thumbH_;
+            float s = std::max(d.W() / bw, d.H() / bh);
+            float sw = d.W() / s, sh = d.H() / s;
+            D2D1_RECT_F src{(bw - sw) / 2, (bh - sh) / 2, (bw + sw) / 2, (bh + sh) / 2};
+            gfx_.DC()->DrawBitmap(thumbs_[i].Get(), d, 0.9f, D2D1_INTERPOLATION_MODE_LINEAR, &src);
+        }
+    }
+    float x0 = X(clip_->Ts(inF_)), x1 = X(RangeEndTs());
+    ui_.Fill(Rect(track.l, track.t, x0, track.b), WithAlpha(Bg, 0.72f));
+    ui_.Fill(Rect(x1, track.t, track.r, track.b), WithAlpha(Bg, 0.72f));
+    ui_.PopClip();
+
+    // Trim handles (checked before the scrub area so they win the press).
+    const UiInput& in = ui_.In();
+    Rect hIn = Rect(x0, track.t, x0 + 12, track.b), hOut = Rect(x1 - 12, track.t, x1, track.b);
+    UiId idIn = HashId("tl.in"), idOut = HashId("tl.out"), idScrub = HashId("tl.scrub");
+    ui_.Click(idIn, hIn.Inset(-6, 0));
+    ui_.Click(idOut, hOut.Inset(-6, 0));
+    if (ui_.Hover(hIn.Inset(-6, 0)) || ui_.Hover(hOut.Inset(-6, 0)) || ui_.Active(idIn) || ui_.Active(idOut))
+        ui_.SetCursor(IDC_SIZEWE);
+    if (ui_.Active(idIn) && in.down) {
+        size_t idx = std::min(clip_->IndexAt(T(in.mx)), outF_);
+        if (idx != inF_) {
+            inF_ = idx;
+            hasResult_ = false;
+            Seek(inF_);
+        }
+    }
+    if (ui_.Active(idOut) && in.down) {
+        size_t idx = std::max(clip_->IndexAt(T(in.mx) - 1), inF_);
+        if (idx != outF_) {
+            outF_ = idx;
+            hasResult_ = false;
+            Seek(outF_);
+        }
+    }
+    ui_.Click(idScrub, track);
+    if (ui_.Active(idScrub)) {
+        if (in.pressed) {
+            resumeAfterScrub_ = playing_;
+            playing_ = false;
+            scrubbing_ = true;
+        }
+        if (in.down) Seek(std::clamp(clip_->IndexAt(T(in.mx)), (size_t)0, clip_->Count() - 1));
+    }
+    if (scrubbing_ && !in.down) {
+        scrubbing_ = false;
+        if (resumeAfterScrub_) SetPlaying(true);
+    }
+
+    Rect sel(x0, track.t, x1, track.b);
+    ui_.Stroke(sel.Inset(1), Accent, 6, 2.f);
+    for (Rect h : {hIn, hOut}) {
+        ui_.Fill(h, Accent, 4);
+        ui_.Line(h.CX(), h.CY() - 8, h.CX(), h.CY() + 8, WithAlpha(White, 0.85f), 1.5f);
+    }
+    float px = X(clip_->Ts(playhead_));
+    ui_.Line(px, track.t - 4, px, track.b + 2, White, 2.f);
+    ui_.Circle(px, track.t - 4, 4.5f, White);
+}
+
+void App::DrawExportPanel(Rect r) {
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), Border, 14);
+    Rect in = r.Inset(18);
+    bool busy = exporter_.Busy();
+
+    ui_.Text(in.CutTop(28), L"내보내기", 16.f, TextColor, Bold());
+    in.CutTop(8);
+
+    auto label = [&](std::wstring_view name, std::wstring_view value) {
+        Rect l = in.CutTop(20);
+        ui_.Text(l, name, 12.5f, TextDim);
+        if (!value.empty()) ui_.Text(l, value, 12.5f, TextColor, Align(AlignEnd));
+        in.CutTop(4);
+    };
+    bool changed = false;
+
+    uint32_t disabled = 0;
+    for (int i = 0; i < (int)Format::Count; ++i)
+        if (!FormatAvailable((Format)i)) disabled |= 1u << i;
+    label(L"형식", {});
+    if (ui_.Segmented(HashId("ex.fmt"), in.CutTop(34), {L"GIF", L"WebP", L"AVIF", L"MP4"}, fmt_,
+                      disabled)) {
+        changed = true;
+        hasResult_ = false;
+        if (fmt_ != (int)Format::Mp4) settings_.format = fmt_;  // the 움짤 format the next clip starts with
+    }
+    Format fmt = (Format)fmt_;
+    const bool mp4 = fmt == Format::Mp4;
+    if (mp4) ProbeEncoders();
+    std::wstring blurb = (disabled & (1u << fmt_)) ? L"이 빌드에는 포함되어 있지 않습니다"
+                         : !mp4                    ? std::wstring(FormatBlurb(fmt))
+                         : clip_->HasAudio()       ? L"어디서나 재생되는 동영상 · 소리 포함"
+                                                   : L"어디서나 재생되는 동영상";
+    ui_.Text(in.CutTop(20), blurb, 11.5f, TextFaint);
+    in.CutTop(8);
+
+    if (mp4) {
+        // Codec and bitrate follow the video recording settings.
+        Rect head = in.CutTop(20);
+        ui_.Text(head, L"인코딩", 12.5f, TextDim);
+        Rect link = head.CutRight(90);
+        bool lh = ui_.Hover(link);
+        if (ui_.Click(HashId("ex.vsettings"), link)) {
+            settingsReturn_ = screen_;
+            screen_ = Screen::Settings;
+            settingsScroll_ = 10000;  // the video section
+        }
+        ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
+        in.CutTop(4);
+        ui_.Text(in.CutTop(22), VideoSummary(), 12.5f, TextColor);
+    } else {
+        int& q = settings_.quality[fmt_];
+        label(L"품질", q >= 100 && fmt == Format::WebP ? L"무손실" : std::to_wstring(q));
+        float qv = (float)q;
+        if (ui_.Slider(HashId("ex.q"), in.CutTop(22).Inset(7, 0), qv, 1.f, 100.f)) {
+            q = (int)std::lround(qv);
+            changed = true;
+        }
+    }
+    in.CutTop(10);
+
+    int ow = 0, oh = 0;
+    OutputSize(ow, oh);
+    label(L"크기", util::Format(L"%d × %d", ow, oh));
+    changed |= ui_.Segmented(HashId("ex.scale"), in.CutTop(32), {L"100%", L"75%", L"50%", L"33%", L"25%"},
+                             settings_.scaleIdx);
+    in.CutTop(10);
+
+    const double speed = kSpeedOptions[settings_.speedIdx];
+    double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
+    size_t outFrames = 0;
+    if (mp4) {
+        outFrames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
+        outFps = fpsLimit;
+        outSec = outFrames / fpsLimit;
+    } else {
+        auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
+        for (auto& p : plan) outSec += p.durationMs / 1000.0;
+        outFrames = plan.size();
+        outFps = outSec > 0 ? outFrames / outSec : 0;
+    }
+    label(L"프레임 레이트", util::Format(L"%.0f fps", outFps));
+    changed |= ui_.Segmented(HashId("ex.fps"), in.CutTop(32), {L"원본", L"30", L"25", L"20", L"15", L"10"},
+                             settings_.outFpsIdx);
+    in.CutTop(10);
+
+    label(L"재생 속도", {});
+    int prevSpeed = settings_.speedIdx;
+    if (ui_.Segmented(HashId("ex.speed"), in.CutTop(32), {L"0.5×", L"1×", L"1.5×", L"2×"}, settings_.speedIdx)) {
+        changed = true;
+        // Re-base the preview clock so the playhead doesn't jump.
+        std::swap(prevSpeed, settings_.speedIdx);
+        size_t ph = playing_ ? PlayheadFromClock() : playhead_;
+        std::swap(prevSpeed, settings_.speedIdx);
+        playhead_ = ph;
+        SetPlaying(playing_);
+    }
+    in.CutTop(8);
+    if (!mp4) {
+        changed |= ui_.ToggleRow(HashId("ex.loop"), in.CutTop(38).Inset(-10, 0), L"반복 재생", settings_.loop);
+    } else if (clip_->HasAudio()) {
+        bool slow = speed != 1.0;
+        changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(38).Inset(-10, 0), L"소리 포함", exportAudio_,
+                                 slow ? L"속도를 바꾸면 소리는 빠집니다" : L"", !slow);
+    }
+    if (changed) {
+        hasResult_ = false;
+        settingsDirty_ = true;
+    }
+
+    // Bottom area: action buttons / progress / result.
+    Rect saveAs = in.CutBottom(36);
+    in.CutBottom(8);
+    Rect save = in.CutBottom(46);
+    in.CutBottom(10);
+    bool showResult = hasResult_ && !busy;
+    if (!showResult) {
+        std::wstring sum = mp4 ? util::Format(L"%d×%d · %.0ffps · %.1f초 · %s", ow, oh, outFps, outSec,
+                                              ExportAudio() ? L"소리 포함" : L"소리 없음")
+                               : util::Format(L"%d×%d · %.0ffps · %.1f초 · %zu프레임", ow, oh, outFps, outSec,
+                                              outFrames);
+        ui_.Text(in.CutBottom(20), sum, 12.f, TextFaint, Align(AlignCenter));
+    }
+
+    if (busy) {
+        float p = exporter_.Progress();
+        ui_.Fill(save, Surface2, 12);
+        Rect bar = Rect(save.l + 14, save.CY() + 8, save.r - 14, save.CY() + 12);
+        ui_.ProgressBar(bar, p, Accent);
+        ui_.Text(Rect(save.l + 14, save.t + 4, save.r - 14, save.CY() + 4),
+                 util::Format(L"%s 인코딩 중…  %d%%", FormatName(fmt), (int)(p * 100)), 13.f, TextColor, Bold());
+        if (ui_.Button(HashId("ex.cancel"), saveAs, L"취소", BtnStyle::Ghost, icon::Close, true, 13.f))
+            exporter_.Cancel();
+        RequestWake(ui_.Now() + 0.1);
+    } else {
+        bool avail = !(disabled & (1u << fmt_));
+        std::wstring label = std::wstring(FormatName(fmt)) + L"로 저장";
+        if (ui_.Button(HashId("ex.save"), save, label, BtnStyle::Primary, icon::Save, avail, 15.f))
+            StartExport(false);
+        if (ui_.Button(HashId("ex.saveas"), saveAs, L"다른 이름으로 저장…", BtnStyle::Secondary, 0, avail, 13.f))
+            StartExport(true);
+    }
+
+    if (showResult) {
+        Rect card = in.CutBottom(76);
+        ui_.Fill(card, WithAlpha(Success, 0.08f), 12);
+        ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.35f), 12);
+        Rect top = Rect(card.l + 12, card.t + 4, card.r - 12, card.t + 32);
+        ui_.Icon(Rect::XYWH(top.l, top.t, 18, top.H()), icon::Check, 13.f, Success);
+        // The recording itself (just saved) or the last export.
+        std::wstring size = (resultOriginal_ ? L"원본 · " : L"") + util::FormatBytes(lastResult_.bytes);
+        float sw = ui_.Measure(size, 12.f) + 4;
+        ui_.Text(Rect(top.l + 24, top.t, top.r - sw - 8, top.b), util::FileNameOf(lastResult_.path), 12.5f,
+                 TextColor, Bold());
+        ui_.Text(top, size, 12.f, TextDim, Align(AlignEnd));
+        Rect btns = Rect(card.l + 10, card.b - 40, card.r - 10, card.b - 8);
+        float bw = (btns.W() - 12) / 3;
+        if (ui_.Button(HashId("res.folder"), Rect::XYWH(btns.l, btns.t, bw, btns.H()), L"폴더", BtnStyle::Secondary,
+                       icon::Folder, true, 12.f))
+            util::OpenFolderAndSelect(lastResult_.path);
+        if (ui_.Button(HashId("res.copy"), Rect::XYWH(btns.l + bw + 6, btns.t, bw, btns.H()), L"복사",
+                       BtnStyle::Secondary, icon::Copy, true, 12.f)) {
+            if (util::CopyFileToClipboard(hwnd_, lastResult_.path))
+                Toast(L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요");
+            else
+                Toast(L"클립보드에 복사할 수 없습니다.", true);
+        }
+        if (ui_.Button(HashId("res.open"), Rect::XYWH(btns.l + 2 * (bw + 6), btns.t, bw, btns.H()), L"열기",
+                       BtnStyle::Secondary, icon::OpenFile, true, 12.f))
+            util::ShellOpen(lastResult_.path);
+    }
+}
+
+// ---------------------------------------------------------------- settings
+
+void App::SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
+                     const std::function<void(Rect)>& control) {
+    Rect row = area.CutTop(68);
+    Rect ctl = row.CutRight(controlW);
+    row.CutRight(16);
+    ui_.Text(Rect(row.l, row.t + 12, row.r, row.t + 34), title, 14.f, TextColor, Bold());
+    ui_.Text(Rect(row.l, row.t + 34, row.r, row.b - 10), desc, 12.f, TextFaint);
+    control(Rect::Centered(ctl.CX(), row.CY(), ctl.W(), 36));
+    ui_.Line(area.l, area.t - 0.5f, area.r, area.t - 0.5f, Border);
+}
+
+void App::SettingSection(Rect& area, std::wstring_view title) {
+    Rect h = area.CutTop(46);
+    TextStyle st = Bold();
+    st.v = AlignEnd;
+    ui_.Text(Rect(h.l, h.t, h.r, h.b - 10), title, 12.5f, AccentHi, st);
+    ui_.Line(area.l, area.t - 0.5f, area.r, area.t - 0.5f, Border);
+}
+
+void App::DrawSettings(Rect r) {
+    r.CutTop(20);
+    float w = std::min(800.f, r.W());
+    Rect card = Rect(r.CX() - w / 2, r.t, r.CX() + w / 2, r.b);
+    ui_.Fill(card, Surface, 14);
+    ui_.Stroke(card.Inset(0.5f), Border, 14);
+    Rect in = card.Inset(28, 20);
+    ui_.Text(in.CutTop(36), L"설정", 20.f, TextColor, Bold());
+    std::wstring formats;
+    for (int i = 0; i < (int)Format::Mp4; ++i)
+        if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
+    ui_.Text(in.CutBottom(20), L"OzMaker 0.3 · 움짤 형식: " + formats + L" · 동영상: MP4", 12.f, TextFaint);
+    in.CutBottom(8);
+
+    // Scroll view
+    in.CutTop(4);
+    Rect view = in;
+    float maxScroll = std::max(0.f, settingsContentH_ - view.H());
+    if (ui_.Hover(view) && ui_.In().wheel != 0) settingsScroll_ -= ui_.In().wheel * 90.f;
+    settingsScroll_ = std::clamp(settingsScroll_, 0.f, maxScroll);
+    float scroll = ui_.Anim(HashId("set.scroll"), settingsScroll_, 22.f);
+    ui_.PushClip(view);
+    Rect area(view.l, view.t - scroll, view.r - (maxScroll > 0 ? 12 : 0), view.t - scroll + 100000);
+    const float top = area.t;
+    bool changed = false;
+    ProbeEncoders();
+
+    SettingSection(area, L"일반");
+    SettingRow(area, L"저장 폴더", settings_.outDir, 196, [&](Rect c) {
+        Rect a = c.CutLeft(94);
+        c.CutLeft(8);
+        if (ui_.Button(HashId("set.openDir"), a, L"열기", BtnStyle::Secondary, icon::Folder, true, 13.f)) {
+            util::EnsureDir(settings_.outDir);
+            util::ShellOpen(settings_.outDir);
+        }
+        if (ui_.Button(HashId("set.changeDir"), c, L"변경", BtnStyle::Secondary, 0, true, 13.f)) {
+            std::wstring dir;
+            if (util::PickFolder(hwnd_, settings_.outDir, dir)) {
+                settings_.outDir = dir;
+                changed = true;
+            }
+        }
+    });
+
+    std::wstring hkDesc = hotkeyOk_ ? L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"
+                                    : L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요";
+    SettingRow(area, L"녹화 단축키", hkDesc, 230, [&](Rect c) {
+        std::wstring label = capturingHotkey_ ? L"키 조합을 누르세요…" : util::HotkeyToString(settings_.hkMods, settings_.hkVk);
+        if (ui_.Button(HashId("set.hotkey"), c, label, capturingHotkey_ ? BtnStyle::Primary : BtnStyle::Secondary,
+                       icon::Keyboard, true, 13.f))
+            capturingHotkey_ = !capturingHotkey_;
+    });
+
+    SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.cd"), c, {L"없음", L"3초", L"5초"}, settings_.countdown);
+               });
+
+    SettingRow(area, L"창 캡처 방식", L"자동: 전체화면 게임만 화면 캡처 · 검은 화면이 녹화되면 ‘화면’으로 바꾸세요",
+               230, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.mode"), c, {L"자동", L"창", L"화면"}, settings_.captureMode);
+               });
+
+    SettingRow(area, L"녹화 중 표시", L"녹화 시간 · 중지 버튼 · 영역 테두리 (녹화 결과에는 찍히지 않습니다)", 300,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.overlay"), c, {L"항상", L"전체화면 제외", L"숨김"},
+                                            settings_.overlayMode);
+               });
+
+    SettingRow(area, L"효과음", L"녹화 시작 · 중지 · 저장 시 짧은 알림음", 60, [&](Rect c) {
+        changed |= ui_.Toggle(HashId("set.sound"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.sounds);
+    });
+
+    int closeIdx = settings_.closeToTray ? 0 : 1;
+    SettingRow(area, L"닫기 버튼", L"트레이로 숨기면 창을 닫아도 단축키로 녹화할 수 있습니다", 260, [&](Rect c) {
+        if (ui_.Segmented(HashId("set.close"), c, {L"트레이로 숨기기", L"종료"}, closeIdx)) {
+            settings_.closeToTray = closeIdx == 0;
+            changed = true;
+        }
+    });
+
+    // ---- video
+    SettingSection(area, L"동영상 (MP4)");
+    const bool hevcOk = !encName_[1][1].empty() || !encName_[1][0].empty();
+    SettingRow(area, L"코덱",
+               hevcOk ? L"H.264: 어디서나 재생 · HEVC: 같은 화질에 용량 약 절반 (일부 기기 · 메신저 미지원)"
+                      : L"H.264: 어디서나 재생 · 이 PC에는 HEVC 인코더가 없습니다",
+               230, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.vcodec"), c, {L"H.264", L"HEVC"}, settings_.vCodec,
+                                            hevcOk ? 0 : 0b10);
+               });
+    if (!hevcOk && settings_.vCodec == 1) settings_.vCodec = 0;
+
+    const std::wstring& hwName = encName_[settings_.vCodec][1];
+    std::wstring hwDesc = hwName.empty() ? L"그래픽카드 인코더를 찾지 못해 CPU로 인코딩합니다"
+                                         : L"그래픽카드 인코더 사용: " + hwName + L" (게임 성능에 영향이 거의 없음)";
+    SettingRow(area, L"하드웨어 인코딩", hwDesc, 60, [&](Rect c) {
+        changed |= ui_.Toggle(HashId("set.vhw"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.vHardware);
+    });
+
+    SettingRow(area, L"프레임 레이트", L"게임은 60, 화면 설명 · 강의는 30이면 충분합니다", 230, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.vfps"), c, {L"24", L"30", L"60"}, settings_.vFpsIdx);
+    });
+
+    SettingRow(area, L"해상도", L"원본보다 크게 키우지는 않습니다 · 세로 화면은 짧은 쪽 기준", 330, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.vres"), c, {L"원본", L"2160p", L"1440p", L"1080p", L"720p"},
+                                 settings_.vResIdx);
+    });
+
+    std::wstring brDesc = L"자동: 해상도 · 프레임에 맞춰 정합니다 (Mbps)";
+    {
+        RecTarget t;
+        if (CurrentTarget(t, nullptr)) {
+            int sw, sh, ow, oh;
+            SourceSize(t, sw, sh);
+            PlannedSize(sw, sh, ow, oh);
+            UINT32 auto_ = Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], settings_.vCodec == 1);
+            brDesc = util::Format(L"자동: 지금 대상(%d×%d)이면 약 %.1f Mbps · 1분에 %.0f MB", ow, oh, auto_ / 1e6,
+                                  auto_ / 8.0 * 60 / 1e6);
+        }
+    }
+    SettingRow(area, L"비트레이트", brDesc, 360, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.vbr"), c, {L"자동", L"6", L"10", L"16", L"25", L"40", L"60"},
+                                 settings_.vBitrateIdx);
+    });
+
+    SettingRow(area, L"비트레이트 방식", L"VBR: 움직임에 따라 조절해 화질 우선 · CBR: 일정한 용량 (스트리밍 · 업로드 규격)",
+               230, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.vrc"), c, {L"VBR", L"CBR"}, settings_.vRateCtrl);
+               });
+
+    SettingRow(area, L"키프레임 간격", L"짧을수록 편집 프로그램에서 탐색이 빠르고, 용량은 조금 늘어납니다", 230,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.vkey"), c, {L"1초", L"2초", L"5초"}, settings_.vKeyIdx);
+               });
+
+    SettingRow(area, L"인코딩 품질", L"고품질은 같은 용량에서 더 선명하지만 GPU/CPU를 더 씁니다", 260, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.vpreset"), c, {L"빠르게", L"균형", L"고품질"}, settings_.vPresetIdx);
+    });
+
+    SettingRow(area, L"소리 녹음",
+               AudioCapture::ProcessLoopbackSupported()
+                   ? L"창 캡처: 그 창(프로그램)의 소리만 · 전체 화면 · 영역: 시스템 전체 소리"
+                   : L"전체 화면 · 영역: 시스템 전체 소리 · 창 캡처는 Windows 10 2004 이상에서만 녹음됩니다",
+               60, [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.audio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.audio);
+               });
+
+    SettingRow(area, L"오디오 비트레이트", L"AAC · 160 kbps면 게임 · 음악 모두 충분합니다", 260, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.abr"), c, {L"96", L"128", L"160", L"192"}, settings_.aBitrateIdx);
+    });
+
+    SettingRow(area, L"샘플레이트", L"영상 편집에는 48 kHz가 표준입니다", 230, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.arate"), c, {L"44.1 kHz", L"48 kHz"}, settings_.aRateIdx);
+    });
+
+    settingsContentH_ = area.t - top + 8;
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(30.f, view.H() * view.H() / settingsContentH_);
+        float ty = view.t + (view.H() - th) * (scroll / maxScroll);
+        ui_.Fill(Rect::XYWH(view.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
+        // Edges show that the list continues.
+        if (scroll > 1) ui_.Line(view.l, view.t + 0.5f, view.r, view.t + 0.5f, BorderStrong);
+        if (scroll < maxScroll - 1) ui_.Line(view.l, view.b - 0.5f, view.r, view.b - 0.5f, BorderStrong);
+    }
+    if (changed) settingsDirty_ = true;
+}
