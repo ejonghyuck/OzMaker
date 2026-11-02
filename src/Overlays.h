@@ -31,9 +31,12 @@ public:
     // target: the recorded area in screen pixels.
     void ShowCountdown(const RECT& target, int value);
     // outside: place the pill just outside the area (regions) instead of inside its top edge.
-    void ShowPill(const RECT& target, bool outside, std::function<void()> onStop);
+    void ShowPill(const RECT& target, bool outside, std::function<void()> onStop, std::function<void()> onPause);
+    void SetPaused(bool paused);
     void ShowFrame(const RECT& area);
     void Update(double elapsed, size_t frames);
+    // Screenshot tests: the pill drawn at the origin without a window.
+    void PaintTest(Painter& p, double elapsed, bool paused, int hover);
     void Hide();
     bool Visible() const { return mode_ != Mode::None; }
 
@@ -44,7 +47,10 @@ private:
     void Ensure();
     void Place(const RECT& target, int wDip, int hDip, bool center, bool outside);
     void Redraw(bool move);
+    void Paint(Painter& p);
     Rect StopRect() const;
+    Rect PauseRect() const;
+    int ButtonAt(float x, float y) const;  // 1 = pause, 2 = stop, 0 = none
 
     HINSTANCE inst_ = nullptr;
     ID2D1Factory1* factory_ = nullptr;
@@ -55,8 +61,9 @@ private:
     double elapsed_ = 0;
     size_t frames_ = 0;
     int countdown_ = 0;
-    bool hoverStop_ = false, tracking_ = false;
-    std::function<void()> onStop_;
+    int hover_ = 0;  // ButtonAt under the mouse
+    bool tracking_ = false, paused_ = false;
+    std::function<void()> onStop_, onPause_;
     HWND frame_[4] = {};
 };
 

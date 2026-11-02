@@ -90,7 +90,7 @@ void App::DrawHeader(Rect r) {
                        icon::Back) ||
             ui_.In().Key(VK_ESCAPE)) {
             screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
-            SetCapturingHotkey(false);
+            SetCapturingHotkey(0);
             if (screen_ == Screen::Home) RefreshWindows();
         }
     }
@@ -114,13 +114,19 @@ void App::DrawHeader(Rect r) {
         DrawFilesButton(right);
     }
     if (rec_ == RecState::Recording) {
-        std::wstring t = L"REC  " + util::FormatClock(capture_.Elapsed(), true);
-        Rect pill = Rect::Centered(r.CX(), r.CY(), 120, 30);
-        ui_.Fill(pill, WithAlpha(Rec, 0.16f), 15);
-        ui_.Circle(pill.l + 16, pill.CY(), 4.5f, Rec);
+        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(capture_.Elapsed(), true);
+        const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
+        Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
+        ui_.Fill(pill, WithAlpha(tint, 0.16f), 15);
+        if (recPaused_) {
+            ui_.Fill(Rect::XYWH(pill.l + 12, pill.CY() - 5, 3, 10), tint, 1);
+            ui_.Fill(Rect::XYWH(pill.l + 17, pill.CY() - 5, 3, 10), tint, 1);
+        } else {
+            ui_.Circle(pill.l + 16, pill.CY(), 4.5f, Rec);
+        }
         TextStyle st = Bold();
         st.tabular = true;
-        ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, RecHi, st);
+        ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, recPaused_ ? Warning : RecHi, st);
     }
     ui_.Line(r.l, r.b - 0.5f, r.r, r.b - 0.5f, Border, 1.f);
 }
@@ -1480,7 +1486,7 @@ void App::SettingSection(Rect& area, std::wstring_view title) {
 void App::OpenSettings(int tab) {
     if (screen_ != Screen::Settings) settingsReturn_ = screen_;
     screen_ = Screen::Settings;
-    SetCapturingHotkey(false);
+    SetCapturingHotkey(0);
     if (tab >= 0 && tab != settings_.settingsTab) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
@@ -1528,7 +1534,7 @@ void App::DrawSettings(Rect r) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
         settingsDirty_ = true;
-        SetCapturingHotkey(false);
+        SetCapturingHotkey(0);
     }
 
     // Scroll view, one per tab
@@ -1626,12 +1632,26 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
 void App::SettingsRecord(Rect& area, bool& changed) {
     std::wstring hkDesc = hotkeyOk_ ? L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"
                                     : L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요";
-    SettingRow(area, L"녹화 단축키", hkDesc, 230, [&](Rect c) {
-        std::wstring label = capturingHotkey_ ? L"키 조합을 누르세요…" : util::HotkeyToString(settings_.hkMods, settings_.hkVk);
-        if (ui_.Button(HashId("set.hotkey"), c, label, capturingHotkey_ ? BtnStyle::Primary : BtnStyle::Secondary,
+    auto hotkeyButton = [&](Rect c, int which, UINT mods, UINT vk) {
+        bool on = capturingHotkey_ == which;
+        std::wstring label = on ? L"키 조합을 누르세요…" : util::HotkeyToString(mods, vk);
+        if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
                        icon::Keyboard, true, 13.f))
-            SetCapturingHotkey(!capturingHotkey_);
-    });
+            SetCapturingHotkey(on ? 0 : which);
+    };
+    SettingRow(area, L"녹화 단축키", hkDesc, 230,
+               [&](Rect c) { hotkeyButton(c, kHotkeyRecord, settings_.hkMods, settings_.hkVk); });
+
+    SettingRow(area, L"일시정지 단축키",
+               pauseHotkeyOk_ ? L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"
+                              : L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요",
+               230, [&](Rect c) { hotkeyButton(c, kHotkeyPause, settings_.hkPauseMods, settings_.hkPauseVk); });
+
+    SettingRow(area, L"최대 녹화 길이", L"이 길이가 되면 저장하고 편집 화면을 엽니다 · 움짤과 동영상 모두", 300,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.maxlen"), c, {L"끔", L"10분", L"30분", L"1시간"},
+                                            settings_.maxLengthIdx);
+               });
 
     SettingRow(area, L"시작 카운트다운", L"녹화 버튼을 누른 뒤 대상 창으로 전환할 시간 (단축키는 즉시 시작)", 230,
                [&](Rect c) {
@@ -1643,7 +1663,7 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                    changed |= ui_.Segmented(HashId("set.mode"), c, {L"자동", L"창", L"화면"}, settings_.captureMode);
                });
 
-    SettingRow(area, L"녹화 중 표시", L"녹화 시간 · 중지 버튼 · 영역 테두리 (녹화 결과에는 찍히지 않습니다)", 300,
+    SettingRow(area, L"녹화 중 표시", L"녹화 시간 · 일시정지 · 중지 버튼 · 영역 테두리 (녹화 결과에는 찍히지 않습니다)", 300,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.overlay"), c, {L"항상", L"전체화면 제외", L"숨김"},
                                             settings_.overlayMode);

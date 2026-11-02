@@ -25,6 +25,11 @@ inline constexpr int kPresetOptions[] = {0, 50, 100};                       // q
 inline constexpr int kAudioBitrateOptions[] = {96, 128, 160, 192};          // kbps (AAC)
 inline constexpr int kAudioRateOptions[] = {44100, 48000};
 
+// Recording limits (#17)
+inline constexpr int kMaxLengthOptions[] = {0, 10, 30, 60};  // minutes, 0 = no limit
+inline constexpr uint64_t kLowDiskWarn = 1ull << 30;        // warn before recording below this much free space
+inline constexpr uint64_t kLowDiskStop = 300ull << 20;      // and stop (saving what there is) below this
+
 enum Source { kSourceWindow = 0, kSourceDisplay = 1, kSourceRegion = 2 };
 enum Output { kOutputClip = 0, kOutputVideo = 1 };
 enum CaptureMode { kCaptureAuto = 0, kCaptureWindow = 1, kCaptureDisplay = 2 };
@@ -55,6 +60,9 @@ struct Settings {
     bool windowMax = false;
     UINT hkMods = MOD_CONTROL | MOD_ALT;
     UINT hkVk = 'R';
+    UINT hkPauseMods = MOD_CONTROL | MOD_ALT;  // pause / resume, registered only while recording
+    UINT hkPauseVk = 'P';
+    int maxLengthIdx = 0;  // kMaxLengthOptions
     std::wstring outDir;
 
     // video (MP4)

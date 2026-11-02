@@ -1,7 +1,7 @@
 // Headless test entry points (command line):
 //   --selftest <dir>                      synthetic clip -> frame store round trip -> every available encoder
 //   --screenshot <dir>                    renders each screen to PNG for visual review
-//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute]
+//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause]
 //                                         records a real window (or its monitor / its area) and exports it
 //   --analyze <file.mp4> <dir> [freq ...] decodes an MP4: timing, size, test-tone levels
 //   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export
@@ -700,6 +700,17 @@ int App::RunScreenshots(const std::wstring& dir) {
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
             regionPicker_.PaintTest(p, mr, a, c);
         });
+        // The recording pill: recording (stop hovered) and paused (resume hovered), at 150 %.
+        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 360, 150, 144, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, 240, 100), theme::Hex(0x2B4C7E));
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 6));
+            overlay_.PaintTest(p, 73.4, false, 2);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 54));
+            overlay_.PaintTest(p, 73.4, true, 1);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        });
         gfx_.RenderToPng((dir + L"\\region_adjust.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
             Painter p;
             p.Bind(dc);
@@ -1013,6 +1024,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     bool hevc = mp4 && a[7].find(L"hevc") != std::wstring::npos;
     bool software = mp4 && a[7].find(L"sw") != std::wstring::npos;
     bool audio = a.size() > 8 && a[8] == L"audio";
+    bool pause = a.size() > 9 && a[9] == L"pause";  // paused for the middle third: the result is a third shorter
     CaptureOptions o;
     o.target = target;
     o.fps = a.size() > 4 ? _wtoi(a[4].c_str()) : 30;
@@ -1062,12 +1074,24 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         return 1;
     }
     log(util::Format(L"start took %.0f ms", (util::NowSeconds() - t0) * 1000));
-    double end = util::NowSeconds() + seconds;
+    double begin = util::NowSeconds(), end = begin + seconds;
+    int phase = 0;
     while (util::NowSeconds() < end) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
         MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, 0);
+        double t = util::NowSeconds() - begin;
+        if (pause && phase == 0 && t >= seconds / 3) {
+            capture_.SetPaused(true);
+            log(util::Format(L"paused at %.2fs (recorded %.2fs)", t, capture_.Elapsed()));
+            phase = 1;
+        } else if (pause && phase == 1 && t >= seconds * 2 / 3) {
+            capture_.SetPaused(false);
+            log(util::Format(L"resumed at %.2fs (recorded %.2fs)", t, capture_.Elapsed()));
+            phase = 2;
+        }
     }
+    if (pause) log(util::Format(L"recorded %.2fs of %.2fs", capture_.Elapsed(), seconds));
     log(util::Format(L"stopping after %zu frames", capture_.Frames()));
     t0 = util::NowSeconds();
     CaptureResult res = capture_.Stop();

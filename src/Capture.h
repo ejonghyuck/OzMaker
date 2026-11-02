@@ -55,7 +55,10 @@ public:
 
     bool Running() const { return running_; }
     bool StoreFailed() const;  // clip mode: the temp file couldn't be written (disk full)
-    double Elapsed() const;
+    // While paused nothing is recorded, and the recording continues afterwards as if the pause never happened.
+    void SetPaused(bool on);
+    bool Paused() const { return pausedAt_ != 0; }
+    double Elapsed() const;  // recorded time, pauses left out
     size_t Frames() const;
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
@@ -108,7 +111,9 @@ private:
     int outW_ = 0, outH_ = 0;
     bool setupDone_ = false, setupFailed_ = false;
     int64_t firstTs_ = -1, nextDue_ = 0, interval_ = 0, startQpc_ = 0;
-    int64_t lastTs_ = 0, lastArrivalQpc_ = 0;
+    int64_t lastTs_ = 0, lastArrivalQpc_ = 0;  // the last frame: its time in the clip, when it came (minus pauses)
+    std::atomic<int64_t> pausedAt_{0};     // QPC (100 ns) of the pause in progress, 0 = not paused
+    std::atomic<int64_t> pausedTotal_{0};  // length of the pauses so far
     std::atomic<size_t> frames_{0};
     mutable std::mutex mtx_;
     std::atomic<bool> running_{false};
@@ -117,7 +122,7 @@ private:
     std::unique_ptr<Mp4Writer> writer_;
     AudioCapture audio_;
     std::thread ticker_;
-    HANDLE tickStop_ = nullptr, firstFrame_ = nullptr;
+    HANDLE tickStop_ = nullptr, firstFrame_ = nullptr, resumed_ = nullptr;
     std::wstring videoError_, notice_;
     std::atomic<bool> failed_{false};
 };

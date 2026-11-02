@@ -23,8 +23,11 @@ public:
     static DWORD AudioProcessOf(HWND hwnd);
 
     bool Start(Source src, DWORD pid, int sampleRate, int64_t originQpc, Sink sink, std::wstring& err);
-    // Stops and pads silence so the stream lasts until endQpc (0 = no padding).
+    // Stops and pads silence so the stream lasts until endQpc (0 = no padding; while paused, until the pause).
     void Stop(int64_t endQpc);
+    // Nothing is delivered while paused; after Resume the stream carries on as if the pause never happened.
+    void Pause(int64_t qpc);
+    void Resume(int64_t qpc);
     bool Running() const { return thread_.joinable(); }
 
 private:
@@ -55,4 +58,6 @@ private:
     std::vector<int16_t> scratch_;
 
     int64_t written_ = 0;  // output frames delivered so far
+    std::mutex mtx_;        // origin_, pausedAt_ and the sink: Pause/Resume come from another thread
+    int64_t pausedAt_ = 0;  // QPC of the pause in progress, 0 = none
 };

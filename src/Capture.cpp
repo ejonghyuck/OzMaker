@@ -112,6 +112,8 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         interval_ = 10'000'000 / std::max(1, opt.fps) / (video ? 2 : 1);
         firstTs_ = -1;
         frames_ = 0;
+        pausedAt_ = 0;
+        pausedTotal_ = 0;
         running_ = true;
         frameToken_ = pool_.FrameArrived([this](auto const& sender, auto const&) { OnFrame(sender); });
         closedToken_ = item_.Closed([this](auto const&, auto const&) {
@@ -133,6 +135,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             }
             tickStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             firstFrame_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            resumed_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);
             ticker_ = std::thread([this] { TickLoop(); });
         }
         session_.StartCapture();
@@ -143,6 +146,11 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             SetEvent(tickStop_);
             ticker_.join();
         }
+        for (HANDLE* h : {&tickStop_, &firstFrame_, &resumed_})
+            if (*h) {
+                CloseHandle(*h);
+                *h = nullptr;
+            }
         audio_.Stop(0);
         writer_.reset();
         ReleaseGpu();
@@ -151,7 +159,27 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
     return true;
 }
 
-double Capture::Elapsed() const { return running_ ? (util::Qpc100ns() - startQpc_) / 1e7 : 0; }
+double Capture::Elapsed() const {
+    if (!running_) return 0;
+    int64_t at = pausedAt_, now = at ? at : util::Qpc100ns();
+    return (now - startQpc_ - pausedTotal_) / 1e7;
+}
+
+void Capture::SetPaused(bool on) {
+    if (!running_ || on == Paused()) return;
+    int64_t now = util::Qpc100ns();
+    if (on) {
+        if (resumed_) ResetEvent(resumed_);
+        pausedAt_ = now;
+        if (opt_.video) audio_.Pause(now);
+    } else {
+        // The total first: the ticker reads pausedAt_, then the total.
+        pausedTotal_ += now - pausedAt_;
+        pausedAt_ = 0;
+        if (opt_.video) audio_.Resume(now);
+        if (resumed_) SetEvent(resumed_);
+    }
+}
 
 size_t Capture::Frames() const { return frames_.load(); }
 
@@ -432,9 +460,14 @@ void Capture::TickLoop() {
         const int fps = std::max(1, opt_.fps);
         // The ticks before the first frame (encoder start-up) are caught up in a burst showing that frame;
         // once running in real time, a stall skips ticks instead.
+        // While paused no ticks are encoded; afterwards they continue where they stopped, later by the pause.
         bool synced = false;
         for (int64_t k = 0;; ++k) {
-            int64_t due = startQpc_ + k * 10'000'000 / fps;
+            if (pausedAt_) {
+                HANDLE waits[2] = {tickStop_, resumed_};
+                if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+            }
+            int64_t due = startQpc_ + pausedTotal_ + k * 10'000'000 / fps;
             int64_t now = util::Qpc100ns();
             if (due > now) {
                 synced = true;
@@ -443,10 +476,14 @@ void Capture::TickLoop() {
                 SetWaitableTimer(timer, &li, 0, nullptr, nullptr, FALSE);
                 HANDLE waits[2] = {tickStop_, timer};
                 if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+                if (pausedAt_) {
+                    --k;  // paused while waiting: this tick comes after the pause
+                    continue;
+                }
             } else if (WaitForSingleObject(tickStop_, 0) == WAIT_OBJECT_0) {
                 break;
             } else if (synced) {
-                int64_t cur = (now - startQpc_) * fps / 10'000'000;
+                int64_t cur = (now - startQpc_ - pausedTotal_) * fps / 10'000'000;
                 if (cur > k + 2) k = cur;
             }
             // Never under mtx_: the frame callback may own the device lock while it waits for mtx_.
@@ -476,9 +513,11 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
     if (!frame) return;
 
     auto cs = frame.ContentSize();
-    int64_t ts = frame.SystemRelativeTime().count();
+    int64_t ts = frame.SystemRelativeTime().count() - pausedTotal_;  // the recording's own clock
     bool accept = false;
-    if (firstTs_ < 0) {
+    if (pausedAt_) {
+        // nothing while paused
+    } else if (firstTs_ < 0) {
         accept = true;
         firstTs_ = ts;
         nextDue_ = ts + interval_;
@@ -500,7 +539,7 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
                 if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) {
                     Process(tex.Get(), sr, ts - firstTs_, covered_);
                     lastTs_ = ts - firstTs_;
-                    lastArrivalQpc_ = util::Qpc100ns();
+                    lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
                 }
             } catch (...) {
             }
@@ -519,7 +558,8 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
 CaptureResult Capture::Stop() {
     CaptureResult res;
     if (!running_.exchange(false)) return res;
-    int64_t stopQpc = util::Qpc100ns();
+    // Stopped while paused: the recording ends where the pause began.
+    int64_t stopQpc = pausedAt_ ? pausedAt_.load() : util::Qpc100ns();
     try {
         if (pool_) pool_.FrameArrived(frameToken_);
         if (item_) item_.Closed(closedToken_);
@@ -535,7 +575,7 @@ CaptureResult Capture::Stop() {
         res.video = true;
         res.path = opt_.video->path;
         res.notice = notice_;
-        res.seconds = (stopQpc - startQpc_) / 1e7;
+        res.seconds = (stopQpc - startQpc_ - pausedTotal_) / 1e7;
         // An error mid-recording keeps what was encoded before it.
         std::wstring finishErr;
         res.ok = writer_->Finish(finishErr);
@@ -552,13 +592,14 @@ CaptureResult Capture::Stop() {
         writer_.reset();
         CloseHandle(tickStop_);
         CloseHandle(firstFrame_);
-        tickStop_ = firstFrame_ = nullptr;
+        CloseHandle(resumed_);
+        tickStop_ = firstFrame_ = resumed_ = nullptr;
     } else {
         std::lock_guard lk(mtx_);
         while (!pending_.empty()) DrainOne();
         if (store_) {
             // Last frame stays on screen until the moment Stop was pressed.
-            int64_t endTs = lastTs_ + std::max<int64_t>(0, stopQpc - lastArrivalQpc_);
+            int64_t endTs = lastTs_ + std::max<int64_t>(0, stopQpc - pausedTotal_ - lastArrivalQpc_);
             store_->Finish(endTs);
             if (store_->Count() > 0) res.clip = store_;
             store_.reset();

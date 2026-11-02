@@ -77,6 +77,9 @@ void Settings::Load() {
     windowMax = ReadInt(ini, L"WindowMax", windowMax, 0, 1) != 0;
     hkMods = (UINT)ReadInt(ini, L"HotkeyMods", (int)hkMods, 0, 0xF);
     hkVk = (UINT)ReadInt(ini, L"HotkeyKey", (int)hkVk, 1, 0xFE);
+    hkPauseMods = (UINT)ReadInt(ini, L"PauseHotkeyMods", (int)hkPauseMods, 0, 0xF);
+    hkPauseVk = (UINT)ReadInt(ini, L"PauseHotkeyKey", (int)hkPauseVk, 1, 0xFE);
+    maxLengthIdx = ReadInt(ini, L"MaxLength", maxLengthIdx, 0, _countof(kMaxLengthOptions) - 1);
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
@@ -150,6 +153,9 @@ void Settings::Save() const {
     num(L"WindowMax", windowMax);
     num(L"HotkeyMods", (long)hkMods);
     num(L"HotkeyKey", (long)hkVk);
+    num(L"PauseHotkeyMods", (long)hkPauseMods);
+    num(L"PauseHotkeyKey", (long)hkPauseVk);
+    num(L"MaxLength", maxLengthIdx);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
     num(L"ExportSize", scaleIdx);

@@ -151,14 +151,21 @@ void RecOverlay::ShowCountdown(const RECT& target, int value) {
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
 }
 
-void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop) {
+namespace {
+constexpr float kPillW = 228, kPillH = 40;
+}
+
+void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop,
+                          std::function<void()> onPause) {
     Ensure();
     onStop_ = std::move(onStop);
+    onPause_ = std::move(onPause);
     mode_ = Mode::Pill;
     elapsed_ = 0;
     frames_ = 0;
-    hoverStop_ = false;
-    Place(target, 196, 40, false, outside);
+    hover_ = 0;
+    paused_ = false;
+    Place(target, (int)kPillW, (int)kPillH, false, outside);
     Redraw(true);
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
 }
@@ -201,9 +208,16 @@ void RecOverlay::Update(double elapsed, size_t frames) {
     Redraw(false);
 }
 
+void RecOverlay::SetPaused(bool paused) {
+    if (paused_ == paused) return;
+    paused_ = paused;
+    Redraw(false);
+}
+
 void RecOverlay::Hide() {
     mode_ = Mode::None;
     onStop_ = nullptr;
+    onPause_ = nullptr;
     if (win_.Hwnd()) ShowWindow(win_.Hwnd(), SW_HIDE);
     for (HWND& f : frame_) {
         if (f) DestroyWindow(f);
@@ -211,13 +225,35 @@ void RecOverlay::Hide() {
     }
 }
 
-Rect RecOverlay::StopRect() const { return Rect::Centered(196 - 21, 20, 28, 28); }
+Rect RecOverlay::StopRect() const { return Rect::Centered(kPillW - 21, kPillH / 2, 28, 28); }
+Rect RecOverlay::PauseRect() const { return Rect::Centered(kPillW - 53, kPillH / 2, 28, 28); }
+
+int RecOverlay::ButtonAt(float x, float y) const {
+    if (PauseRect().Inset(-2).Contains(x, y) && onPause_) return 1;
+    if (StopRect().Inset(-2).Contains(x, y)) return 2;
+    return 0;
+}
 
 void RecOverlay::Redraw(bool move) {
     if (mode_ == Mode::None) return;
     // Keep the current position if the user dragged the pill.
     if (!move) GetWindowRect(win_.Hwnd(), &rect_);
-    win_.Render(rect_, scale_, move, [&](Painter& p) {
+    win_.Render(rect_, scale_, move, [&](Painter& p) { Paint(p); });
+}
+
+void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover) {
+    mode_ = Mode::Pill;
+    elapsed_ = elapsed;
+    paused_ = paused;
+    hover_ = hover;
+    onPause_ = [] {};
+    Paint(p);
+    mode_ = Mode::None;
+    onPause_ = nullptr;
+}
+
+void RecOverlay::Paint(Painter& p) {
+    {
         if (mode_ == Mode::Countdown) {
             p.Circle(66, 66, 62, Hex(0x111318, 0.88f));
             p.Ring(66, 66, 62, WithAlpha(White, 0.10f), 1.f);
@@ -230,23 +266,40 @@ void RecOverlay::Redraw(bool move) {
             p.Text(Rect(0, 86, 132, 112), L"녹화 준비", 12.f, TextDim, sub);
             return;
         }
-        Rect r(0.5f, 0.5f, 195.5f, 39.5f);
+        Rect r(0.5f, 0.5f, kPillW - 0.5f, kPillH - 0.5f);
         p.Fill(r, Hex(0x111318, 0.92f), 20);
-        p.Stroke(r, WithAlpha(White, 0.09f), 20);
-        float pulse = 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6);
-        p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
-        p.Circle(19, 20, 5, Rec);
-        TextStyle rec;
-        rec.weight = kBold;
-        p.Text(Rect(32, 0, 70, 40), L"REC", 11.5f, Rec, rec);
+        p.Stroke(r, WithAlpha(paused_ ? Warning : White, paused_ ? 0.35f : 0.09f), 20);
+        TextStyle label;
+        label.weight = kBold;
+        if (paused_) {
+            p.Fill(Rect::XYWH(14, 14, 3.5f, 12), Warning, 1);
+            p.Fill(Rect::XYWH(20.5f, 14, 3.5f, 12), Warning, 1);
+            p.Text(Rect(32, 0, 90, 40), L"일시정지", 11.5f, Warning, label);
+        } else {
+            float pulse = 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6);
+            p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
+            p.Circle(19, 20, 5, Rec);
+            p.Text(Rect(32, 0, 90, 40), L"REC", 11.5f, Rec, label);
+        }
         TextStyle tm;
         tm.weight = kSemibold;
         tm.tabular = true;
-        p.Text(Rect(66, 0, 160, 40), util::FormatClock(elapsed_, true), 15.f, White, tm);
+        p.Text(Rect(paused_ ? 88.f : 66.f, 0, kPillW - 68, 40), util::FormatClock(elapsed_, true), 15.f,
+               paused_ ? TextDim : White, tm);
+        // Pause / resume, then stop.
+        Rect pr = PauseRect();
+        p.Circle(pr.CX(), pr.CY(), 14, WithAlpha(White, hover_ == 1 ? 0.22f : 0.10f));
+        D2D1_COLOR_F ink = hover_ == 1 ? White : Hex(0xE6E8EE);
+        if (paused_) {
+            p.Icon(pr.Offset(1, 0), 0xE768 /*Play*/, 11.f, ink);
+        } else {
+            p.Fill(Rect::XYWH(pr.CX() - 4.5f, pr.CY() - 5.5f, 3, 11), ink, 1);
+            p.Fill(Rect::XYWH(pr.CX() + 1.5f, pr.CY() - 5.5f, 3, 11), ink, 1);
+        }
         Rect sr = StopRect();
-        p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hoverStop_ ? 0.22f : 0.10f));
-        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), hoverStop_ ? White : Hex(0xE6E8EE), 2);
-    });
+        p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hover_ == 2 ? 0.22f : 0.10f));
+        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), hover_ == 2 ? White : Hex(0xE6E8EE), 2);
+    }
 }
 
 LRESULT CALLBACK RecOverlay::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -267,38 +320,37 @@ LRESULT RecOverlay::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_NCHITTEST: {
             if (mode_ != Mode::Pill) return HTTRANSPARENT;
             auto [x, y] = toDip(l, true);
-            return StopRect().Inset(-4).Contains(x, y) ? HTCLIENT : HTCAPTION;
+            return ButtonAt(x, y) ? HTCLIENT : HTCAPTION;
         }
         case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, hoverStop_ ? IDC_HAND : IDC_SIZEALL));
+            SetCursor(LoadCursorW(nullptr, hover_ ? IDC_HAND : IDC_SIZEALL));
             return TRUE;
         case WM_MOUSEMOVE: {
             auto [x, y] = toDip(l, false);
-            bool hov = StopRect().Inset(-4).Contains(x, y);
+            int hov = ButtonAt(x, y);
             if (!tracking_) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
                 TrackMouseEvent(&tme);
                 tracking_ = true;
             }
-            if (hov != hoverStop_) {
-                hoverStop_ = hov;
+            if (hov != hover_) {
+                hover_ = hov;
                 Redraw(false);
             }
             return 0;
         }
         case WM_MOUSELEAVE:
             tracking_ = false;
-            if (hoverStop_) {
-                hoverStop_ = false;
+            if (hover_) {
+                hover_ = 0;
                 Redraw(false);
             }
             return 0;
         case WM_LBUTTONUP: {
             auto [x, y] = toDip(l, false);
-            if (StopRect().Inset(-4).Contains(x, y) && onStop_) {
-                auto cb = onStop_;
-                cb();
-            }
+            int b = ButtonAt(x, y);
+            auto cb = b == 1 ? onPause_ : b == 2 ? onStop_ : nullptr;
+            if (cb) cb();
             return 0;
         }
     }

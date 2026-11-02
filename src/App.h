@@ -40,6 +40,7 @@ private:
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
     enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate };
     enum class RecState { Idle, Countdown, Recording };
+    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
 
     // ---- window plumbing (App.cpp)
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -114,6 +115,10 @@ private:
     void StopRecording();
     void OnVideoSaved(const CaptureResult& r);
     void OnHotkey();
+    void TogglePause();
+    // Every recording tick: the length limit and the free space (#17). Stops with a reason when one is reached.
+    void CheckLimits();
+    std::wstring RecordingDir() const;  // where the recording grows: the MP4's folder, or the clip's temp file
     bool NotifyQuietly() const;  // a fullscreen app is in front of a hotkey recording
     void ReportError(const std::wstring& title, const std::wstring& text);
     bool UseMonitorCapture(HWND target) const;
@@ -165,7 +170,8 @@ private:
 
     // ---- system
     void RegisterRecordHotkey();
-    void SetCapturingHotkey(bool on);
+    void RegisterPauseHotkey();  // only while recording, so the keys stay free for other programs otherwise
+    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause, 0 = none
     std::wstring HotkeyLabel() const;  // the record hotkey, or a note that there is none
     void TrayAdd();
     void TrayUpdate();
@@ -227,6 +233,9 @@ private:
     RecTarget recTarget_;
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     std::wstring recNotice_;
+    std::wstring stopReason_;  // why the recording stopped by itself (length limit, disk space), shown after it
+    bool recPaused_ = false;
+    double nextDiskCheck_ = 0;
     std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")
     std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
@@ -318,7 +327,8 @@ private:
     bool toastError_ = false;
     double toastUntil_ = 0;
 
-    bool capturingHotkey_ = false, hotkeyOk_ = true;
+    int capturingHotkey_ = 0;  // the hotkey being chosen in the settings
+    bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;

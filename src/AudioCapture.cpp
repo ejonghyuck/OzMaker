@@ -76,6 +76,7 @@ bool AudioCapture::Start(Source src, DWORD pid, int sampleRate, int64_t originQp
     origin_ = originQpc;
     sink_ = std::move(sink);
     written_ = 0;
+    pausedAt_ = 0;
     convert_ = false;
     resamplePos_ = 0;
     lastL_ = lastR_ = 0;
@@ -102,11 +103,25 @@ void AudioCapture::Stop(int64_t endQpc) {
     if (!thread_.joinable()) return;
     SetEvent(stop_);
     thread_.join();
-    if (endQpc > 0) PadTo((endQpc - origin_) * rate_ / 10'000'000);
+    if (endQpc > 0) PadTo(((pausedAt_ ? pausedAt_ : endQpc) - origin_) * rate_ / 10'000'000);
+    pausedAt_ = 0;
     CloseHandle(stop_);
     CloseHandle(ready_);
     stop_ = ready_ = nullptr;
     sink_ = nullptr;
+}
+
+void AudioCapture::Pause(int64_t qpc) {
+    std::lock_guard lk(mtx_);
+    if (!pausedAt_) pausedAt_ = qpc;
+}
+
+void AudioCapture::Resume(int64_t qpc) {
+    std::lock_guard lk(mtx_);
+    if (!pausedAt_) return;
+    PadTo((pausedAt_ - origin_) * rate_ / 10'000'000);  // the stream reaches the pause, then the clock skips it
+    origin_ += qpc - pausedAt_;
+    pausedAt_ = 0;
 }
 
 HRESULT AudioCapture::Open(ComPtr<IAudioClient>& client, ComPtr<IAudioCaptureClient>& cap, HANDLE event) {
@@ -241,7 +256,10 @@ void AudioCapture::Run() {
                 int64_t qpc = (int64_t)qpcPos;
                 if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) || qpc == 0)
                     qpc = util::Qpc100ns() - (int64_t)frames * 10'000'000 / frameRate;
-                Deliver(data, frames, (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0, qpc);
+                {
+                    std::lock_guard lk(mtx_);
+                    if (!pausedAt_ || qpc < pausedAt_) Deliver(data, frames, (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0, qpc);
+                }
                 cap->ReleaseBuffer(frames);
                 got = true;
             }
@@ -249,7 +267,10 @@ void AudioCapture::Run() {
             if (got) {
                 lastPacket = now;
             } else if (now - lastPacket > idlePad) {
-                PadTo((now - idlePad - origin_) * rate_ / 10'000'000);
+                std::lock_guard lk(mtx_);
+                int64_t upTo = now - idlePad;
+                if (pausedAt_) upTo = std::min(upTo, pausedAt_);
+                PadTo((upTo - origin_) * rate_ / 10'000'000);
             }
         }
         if (client) client->Stop();
