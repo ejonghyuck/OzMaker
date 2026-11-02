@@ -89,6 +89,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
     if (args.size() >= 2 && args[0] == L"--analyze") return RunAnalyzeTest(cmdLine);
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
+    if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
                             args.size() >= 4 ? _wtoi(args[3].c_str()) : 360);
@@ -300,7 +301,8 @@ void App::RememberPlacement() {
 void App::Toast(std::wstring text, bool error) {
     toast_ = std::move(text);
     toastError_ = error;
-    toastUntil_ = util::NowSeconds() + (error ? 5.0 : 3.0);
+    // Long enough to read: longer messages stay longer.
+    toastUntil_ = util::NowSeconds() + std::min(12.0, (error ? 5.0 : 3.0) + toast_.size() / 25.0);
     Invalidate();
 }
 

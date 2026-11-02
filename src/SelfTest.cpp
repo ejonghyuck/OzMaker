@@ -336,6 +336,15 @@ int App::RunScreenshots(const std::wstring& dir) {
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
             regionPicker_.PaintTest(p, mr, a, c);
         });
+        gfx_.RenderToPng((dir + L"\\region_adjust.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH(mw * 0.18f, mh * 0.16f, mw * 0.5f, mh * 0.55f), theme::Hex(0xF3F4F6), 8);
+            p.Fill(Rect::XYWH(mw * 0.3f, mh * 0.3f, mw * 0.25f, mh * 0.3f), theme::Hex(0xFF5E87), 6);
+            POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
+            regionPicker_.PaintTest(p, mr, a, c, true);
+        });
     }
 
     screen_ = Screen::Settings;
@@ -363,6 +372,11 @@ int App::RunScreenshots(const std::wstring& dir) {
     toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
     toastUntil_ = clock + 60;
     shot(L"editor_toast.png", 96);
+    toast_ = L"동영상 인코더를 시작하지 못했습니다(0x8007000E). 설정 › 동영상에서 하드웨어 인코딩을 끄거나 해상도를 "
+             L"낮춰 보세요. 그래픽 드라이버를 최신으로 업데이트하면 해결되는 경우도 많습니다.";
+    toastError_ = true;
+    shot(L"editor_toast_long.png", 96);
+    toastError_ = false;
     toastUntil_ = 0;
     CloseEditor();
 
@@ -1161,6 +1175,109 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     shot(L"editor_video_fast.png");
     settings_.speedIdx = 1;
     CloseEditor();
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+// Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys.
+int App::RunRegionTest(const std::wstring& dir) {
+    util::EnsureDir(dir);
+    Log log(dir + L"\\region.log");
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const int ox = mi.rcMonitor.left, oy = mi.rcMonitor.top;
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    bool done = false, ok = false;
+    RECT got{};
+    auto pump = [&](double s) {
+        double until = util::NowSeconds() + s;
+        MSG msg;
+        while (util::NowSeconds() < until) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(5);
+        }
+    };
+    auto start = [&] {
+        done = ok = false;
+        regionPicker_.Start({}, [&](bool o, RECT r) {
+            done = true;
+            ok = o;
+            got = r;
+        });
+        pump(0.15);
+    };
+    // Monitor-relative points to the picker's client coordinates (it covers the virtual screen).
+    auto post = [&](UINT msg, int x, int y, WPARAM w = 0) {
+        PostMessageW(regionPicker_.Hwnd(), msg, w, MAKELPARAM(ox + x - vx, oy + y - vy));
+    };
+    auto drag = [&](int x0, int y0, int x1, int y1) {
+        post(WM_MOUSEMOVE, x0, y0);
+        post(WM_LBUTTONDOWN, x0, y0, MK_LBUTTON);
+        for (int t = 1; t <= 4; ++t) post(WM_MOUSEMOVE, x0 + (x1 - x0) * t / 4, y0 + (y1 - y0) * t / 4, MK_LBUTTON);
+        post(WM_LBUTTONUP, x1, y1);
+        pump(0.12);
+    };
+    auto key = [&](UINT vk) {
+        PostMessageW(regionPicker_.Hwnd(), WM_KEYDOWN, vk, 0);
+        pump(0.08);
+    };
+    auto rel = [&](RECT r) {
+        return util::Format(L"%d,%d-%d,%d", r.left - ox, r.top - oy, r.right - ox, r.bottom - oy);
+    };
+    auto is = [&](RECT r, int l, int t, int rr, int b) {
+        return r.left - ox == l && r.top - oy == t && r.right - ox == rr && r.bottom - oy == b;
+    };
+
+    start();
+    drag(200, 150, 1000, 600);
+    RECT s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && is(s, 200, 150, 1001, 601), L"drag, then adjusting: " + rel(s));
+    drag(600, 375, 700, 425);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 200, 1101, 651), L"move by 100,50: " + rel(s));
+    drag(1101, 651, 1151, 681);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 200, 1151, 681), L"bottom-right handle +50,+30: " + rel(s));
+    RECT b = regionPicker_.ToolbarButton(3);  // 16:9
+    post(WM_LBUTTONDOWN, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy, MK_LBUTTON);
+    post(WM_LBUTTONUP, (b.left + b.right) / 2 - ox, (b.top + b.bottom) / 2 - oy);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(is(s, 300, 201, 1151, 680), L"16:9 keeps width and centre: " + rel(s));
+    drag(s.right - ox, s.bottom - oy, s.right - ox + 100, s.bottom - oy + 20);
+    s = regionPicker_.AdjustedArea();
+    double k = (s.right - s.left) / (double)(s.bottom - s.top);
+    check(s.left - ox == 300 && s.top - oy == 201 && std::fabs(k - 16.0 / 9) < 0.01 && s.right - ox == 1251,
+          util::Format(L"corner drag keeps 16:9 (%.4f): ", k) + rel(s));
+    drag(s.right - ox, (s.top + s.bottom) / 2 - oy, s.right - ox - 300, (s.top + s.bottom) / 2 - oy);
+    s = regionPicker_.AdjustedArea();
+    k = (s.right - s.left) / (double)(s.bottom - s.top);
+    check(s.left - ox == 300 && s.right - ox == 951 && std::fabs(k - 16.0 / 9) < 0.01,
+          util::Format(L"right edge drag keeps 16:9 (%.4f): ", k) + rel(s));
+    RECT before = s;
+    key(VK_RIGHT);
+    s = regionPicker_.AdjustedArea();
+    check(s.left == before.left + 1 && s.right == before.right + 1 && s.top == before.top, L"arrow key moves 1px: " + rel(s));
+    key(VK_RETURN);
+    check(done && ok && EqualRect(&got, &s) && !regionPicker_.Active(), L"Enter confirms: " + rel(got));
+
+    start();
+    post(WM_MOUSEMOVE, 400, 300);
+    post(WM_LBUTTONDOWN, 400, 300, MK_LBUTTON);
+    post(WM_LBUTTONUP, 400, 300);
+    pump(0.12);
+    s = regionPicker_.AdjustedArea();
+    check(!done && regionPicker_.Adjusting() && EqualRect(&s, &mi.rcMonitor), L"click (no window) takes the screen: " + rel(s));
+    key(VK_ESCAPE);
+    check(done && !ok && !regionPicker_.Active(), L"Esc cancels");
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }

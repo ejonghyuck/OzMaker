@@ -157,6 +157,7 @@ private:
     int RunAnalyzeTest(const std::wstring& args);
     int RunVideoTest(const std::wstring& dir, int w, int h);
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
+    int RunRegionTest(const std::wstring& dir);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps);
 
     // ---- state

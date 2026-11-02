@@ -79,7 +79,8 @@ void App::DrawHeader(Rect r) {
     } else {
         Rect b = right.CutRight(110);
         if (ui_.Button(HashId("hdr.back"), Rect::Centered(b.CX(), b.CY(), 110, 36), L"돌아가기", BtnStyle::Ghost,
-                       icon::Back)) {
+                       icon::Back) ||
+            ui_.In().Key(VK_ESCAPE)) {
             screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
             SetCapturingHotkey(false);
             if (screen_ == Screen::Home) RefreshWindows();
@@ -121,14 +122,26 @@ void App::DrawToast(Rect client) {
     float a = ui_.Anim(HashId("toast"), visible ? 1.f : 0.f, 12.f);
     if (visible) RequestWake(toastUntil_);
     if (a <= 0.01f) return;
-    float tw = std::min(client.W() - 80, ui_.Measure(toast_, 13.f) + 60);
-    Rect r = Rect::Centered(client.CX(), client.b - 44 + (1 - a) * 16, tw, 40);
-    ui_.Fill(r.Offset(0, 3), WithAlpha(Black, 0.35f * a), 20);
-    ui_.Fill(r, WithAlpha(toastError_ ? Hex(0x3A1A20) : Hex(0x222733), a), 20);
-    ui_.Stroke(r.Inset(0.5f), WithAlpha(toastError_ ? Rec : BorderStrong, 0.7f * a), 20);
-    ui_.Icon(Rect::XYWH(r.l + 12, r.t, 24, r.H()), toastError_ ? icon::Warning : icon::Check, 14.f,
+    // One line when it fits, else wrapped onto as many as it needs (error messages can be long).
+    const float maxW = std::min(600.f, client.W() - 80), lineW = ui_.Measure(toast_, 13.f);
+    float tw = std::min(maxW, lineW + 60), th = 40;
+    TextStyle st;
+    if (lineW + 60 > maxW) {
+        st.wrap = true;
+        st.v = AlignStart;
+        DWRITE_TEXT_METRICS m{};
+        auto lay = Fonts::Layout(toast_, 13.f, st, tw - 58, 1000);
+        if (lay && SUCCEEDED(lay->GetMetrics(&m))) th = std::max(40.f, std::ceil(m.height) + 22);
+    }
+    Rect r = Rect::Centered(client.CX(), client.b - 24 - th / 2 + (1 - a) * 16, tw, th);
+    float radius = std::min(20.f, th / 2);
+    ui_.Fill(r.Offset(0, 3), WithAlpha(Black, 0.35f * a), radius);
+    ui_.Fill(r, WithAlpha(toastError_ ? Hex(0x3A1A20) : Hex(0x222733), a), radius);
+    ui_.Stroke(r.Inset(0.5f), WithAlpha(toastError_ ? Rec : BorderStrong, 0.7f * a), radius);
+    ui_.Icon(Rect::XYWH(r.l + 12, r.t, 24, 40), toastError_ ? icon::Warning : icon::Check, 14.f,
              WithAlpha(toastError_ ? RecHi : Success, a));
-    ui_.Text(Rect(r.l + 42, r.t, r.r - 16, r.b), toast_, 13.f, WithAlpha(TextColor, a));
+    ui_.Text(st.wrap ? Rect(r.l + 42, r.t + 11, r.r - 16, r.b - 11) : Rect(r.l + 42, r.t, r.r - 16, r.b), toast_, 13.f,
+             WithAlpha(TextColor, a), st);
 }
 
 // ---------------------------------------------------------------- files
