@@ -16,6 +16,7 @@ public:
     bool Begin(const EncoderParams& p, std::wstring& err) override {
         w_ = p.width;
         h_ = p.height;
+        alpha_ = p.alpha;
         path_ = p.path;
         enc_ = avifEncoderCreate();
         if (!enc_) return Fail(err, L"AVIF 인코더를 만들 수 없습니다.");
@@ -41,7 +42,7 @@ public:
         avifRGBImage rgb;
         avifRGBImageSetDefaults(&rgb, img_);
         rgb.format = AVIF_RGB_FORMAT_BGRA;
-        rgb.ignoreAlpha = AVIF_TRUE;
+        rgb.ignoreAlpha = alpha_ ? AVIF_FALSE : AVIF_TRUE;  // with alpha, the image gets an alpha plane
         rgb.pixels = const_cast<uint8_t*>(bgra);
         rgb.rowBytes = (uint32_t)w_ * 4;
         avifResult r = avifImageRGBToYUV(img_, &rgb);
@@ -77,6 +78,7 @@ private:
     avifEncoder* enc_ = nullptr;
     avifImage* img_ = nullptr;
     int w_ = 0, h_ = 0;
+    bool alpha_ = false;
     std::wstring path_;
 };
 

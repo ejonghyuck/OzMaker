@@ -12,7 +12,7 @@ struct ExportJob {
     size_t first = 0, last = 0;  // inclusive frame range
     RECT crop{};                 // in clip pixels
     int outW = 0, outH = 0;
-    double fpsLimit = 0;         // most frames per second of output (after speed); 0 = all; MP4: the constant rate
+    double fpsLimit = 0;         // most frames per second of output (after speed); 0 = all; video: the constant rate
     double speed = 1.0;
     Format format = Format::Gif;
     int quality = 80;
@@ -22,8 +22,9 @@ struct ExportJob {
     int direction = 0;           // 움짤: 0 as recorded, 1 reversed, 2 boomerang (there and back)
     std::wstring caption;        // one line over every frame (Caption.h), empty = none
     int captionPos = 0;          // caption::Pos
-    VideoConfig video;           // MP4: codec and bitrate; size and rate come from the fields above
-    AudioConfig audio;           // MP4: enabled = keep the clip's sound (only at speed 1)
+    VideoConfig video;           // MP4: codec and bitrate; WebM: the bitrate only (0 = by quality); size and rate
+                                 // come from the fields above
+    AudioConfig audio;           // MP4, WebM: enabled = keep the clip's sound (only at speed 1)
     // MP4: copy frames first..last out of this (the clip's file) without encoding them again; encoded when that fails.
     std::shared_ptr<const mp4::CutSource> cut;
     std::wstring path;
@@ -96,6 +97,7 @@ private:
     void Run(ExportJob job);
     bool RunImage(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
     bool RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
+    bool RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
     bool RunCut(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
 
     std::thread thread_;

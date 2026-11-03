@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "AnimClip.h"
 #include "Caption.h"
 #include "Crash.h"
 #include "Mp4Cut.h"
@@ -77,7 +78,9 @@ void App::DrawFrame(Rect client) {
     if (rec_ != RecState::Idle) updateOpen_ = false;
     if (screen_ != Screen::Home) timerOpen_ = false;
     const bool modal = question_.has_value();
-    const bool popover = !modal && (filesOpen_ || updateOpen_ || timerOpen_);
+    if (modal) menu_ = {};
+    const bool popover = !modal && (filesOpen_ || updateOpen_ || timerOpen_ || menu_.owner);
+    menu_.seen = false;
     // An Alert's buttons lie over the page (the record button is under it on Home): while the pointer is on the
     // alert, where it was drawn last frame, the page under it takes no input.
     const bool onAlert = toastSticky_ && ui_.Now() < toastUntil_ && toastRect_.Contains(ui_.In().mx, ui_.In().my);
@@ -93,6 +96,7 @@ void App::DrawFrame(Rect client) {
     }
     // Floating surfaces last, each in a float: that is what keeps them above the page and the live window preview
     // (a DWM thumbnail, which DWM draws above everything here) out from under them. See Ui::BeginFloat.
+    if (menu_.owner && !menu_.seen) menu_ = {};  // its field is gone (another screen, scrolled away)
     if (popover) {
         ui_.SetInputBlocked(false);
         ui_.BeginFloat();
@@ -100,8 +104,10 @@ void App::DrawFrame(Rect client) {
             DrawFilesPopover(client);
         else if (updateOpen_)
             DrawUpdatePopover(client);
-        else
+        else if (timerOpen_)
             DrawTimerPopover(client);
+        else if (menu_.owner)
+            DrawMenuPopover(client);
         ui_.EndFloat();
     }
     if (modal) {
@@ -853,7 +859,8 @@ void App::DrawCapturePreview(Rect preview) {
     std::wstring hk = HotkeyLabel();
     auto placeholder = [&](std::wstring_view title, std::wstring_view body, bool editHint) {
         // The line about the 편집 tab only where it fits under the rest.
-        const std::wstring_view a = tr(L"갖고 있는 동영상은 "), link = tr(L"편집"), b = tr(L" 탭에서 엽니다. 창에 끌어다 놓아도 됩니다.");
+        const std::wstring_view a = tr(L"갖고 있는 동영상이나 움짤은 "), link = tr(L"편집"),
+                                b = tr(L" 탭에서 엽니다. 창에 끌어다 놓아도 됩니다.");
         const float wa = ui_.Measure(a, 13.f), wl = ui_.Measure(link, 13.f, kBold), wb = ui_.Measure(b, 13.f);
         const float hintW = wa + wl + wb + 32;
         editHint = editHint && hintW <= view.W() - 20 && view.H() >= 230;
@@ -1257,8 +1264,9 @@ void App::DrawTimerPopover(Rect client) {
         bool hevc = false;
         SourceSize(t, sw, sh);
         PlannedSize(sw, sh, ow, oh, &hevc);
-        const double video = settings_.vBitrateIdx ? kVideoBitrateOptions[settings_.vBitrateIdx] * 1e6
-                                                   : Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], hevc);
+        const double video = settings_.VideoBitrate()
+                                 ? settings_.VideoBitrate()
+                                 : Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], hevc);
         const double audio = settings_.audio || settings_.mic ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000.0 : 0;
         const uint64_t bytes = (uint64_t)((video + audio) / 8 * minutes * 60), free = util::FreeBytes(settings_.outDir);
         space = util::Format(tr(L"이 길이면 약 %s · 남은 공간 %s"), util::FormatBytes(bytes).c_str(),
@@ -1316,6 +1324,111 @@ void App::DrawTimerPopover(Rect client) {
     }
     if (changed) {
         settingsDirty_ = true;
+        Invalidate();
+    }
+}
+
+// ---------------------------------------------------------------- drop-down lists
+
+bool App::Dropdown(UiId id, const Rect& r, std::wstring_view label, std::wstring_view name,
+                   std::vector<MenuItem> items, int& value, D2D1_COLOR_F ink) {
+    bool picked = false;
+    if (menuPicked_ == id) {
+        menuPicked_ = 0;
+        picked = menuPickedValue_ != value;
+        value = menuPickedValue_;
+    }
+    const bool open = menu_.owner == id;
+    const bool hov = ui_.Hover(r);
+    if (ui_.Click(id, r)) {
+        menu_ = {id, r, std::wstring(name), std::move(items), value, true, ui_.FocusRing()};
+        filesOpen_ = updateOpen_ = timerOpen_ = false;
+    } else if (open) {
+        menu_.anchor = r;
+        menu_.name = name;
+        menu_.items = std::move(items);
+        menu_.value = value;
+        menu_.seen = true;
+    }
+    ui_.Describe(id, std::wstring(name) + L", " + std::wstring(label));
+    const bool lit = hov || menu_.owner == id;
+    ui_.Fill(r, lit ? Surface3 : Surface2, 8);
+    ui_.Stroke(r.Inset(0.5f), menu_.owner == id ? Accent : lit ? BorderStrong : Border, 8);
+    Rect t(r.l + 12, r.t, r.r - 30, r.b);
+    ui_.PushClip(t);
+    ui_.Text(t, label, 13.f, ink);
+    ui_.PopClip();
+    ui_.Icon(Rect(r.r - 30, r.t, r.r - 8, r.b), menu_.owner == id ? icon::ChevronUp : icon::ChevronDown, 10.f, TextDim);
+    return picked;
+}
+
+// The open Dropdown's items, under its field (above it when there is no room). A click elsewhere or Esc closes it;
+// with the keyboard, the arrows move through the items and Enter or Space picks one.
+void App::DrawMenuPopover(Rect client) {
+    const auto& in = ui_.In();
+    const float itemH = 32, pad = 6, lineH = 9;
+    float w = menu_.anchor.W(), h = pad * 2;
+    for (const MenuItem& it : menu_.items) {
+        w = std::max(w, ui_.Measure(it.text, 13.f, kSemibold) + 52);
+        h += itemH + (it.line ? lineH : 0);
+    }
+    w = std::min(w, client.W() - 24);
+    float top = menu_.anchor.b + 4;
+    if (top + h > client.b - 8) top = std::max(client.t + 64, menu_.anchor.t - 4 - h);
+    const Rect box = Rect::XYWH(std::clamp(menu_.anchor.l, client.l + 12, client.r - 12 - w), top, w, h);
+    auto close = [&] {
+        if (menu_.keys) ui_.SetKeyboardFocus(menu_.owner);  // back to its field
+        menu_ = {};
+        Invalidate();
+    };
+    if ((in.pressed && !box.Contains(in.mx, in.my)) || in.Key(VK_ESCAPE)) {
+        close();
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Shadow, 0.45f), 12);
+    ui_.Fill(box, Surface2, 10);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 10);
+    ui_.Declare(HashId("menu.box"), box, Role::Group, menu_.name);
+    std::vector<UiId> keys;  // the items the arrows move through
+    int at = -1, chosen = -1;
+    Rect c = box.Inset(pad);
+    for (size_t i = 0; i < menu_.items.size(); ++i) {
+        const MenuItem& it = menu_.items[i];
+        if (it.line) {
+            c.CutTop(4);
+            ui_.Line(c.l + 8, c.t + 0.5f, c.r - 8, c.t + 0.5f, Border);
+            c.CutTop(lineH - 4);
+        }
+        const Rect row = c.CutTop(itemH);
+        const UiId iid = HashId("menu.item", (uint32_t)i);
+        const bool on = it.enabled && it.value == menu_.value;
+        if (ui_.Click(iid, row, it.enabled)) {
+            menuPicked_ = menu_.owner;
+            menuPickedValue_ = it.value;
+            close();
+            return;
+        }
+        if (UiNode* n = ui_.Describe(iid, it.text, Role::Item)) n->on = on;
+        if (it.enabled) {
+            if (ui_.KeyboardFocus() == iid) at = (int)keys.size();
+            if (on) chosen = (int)keys.size();
+            keys.push_back(iid);
+        }
+        const bool lit = it.enabled && (ui_.Hover(row) || (ui_.FocusRing() && ui_.KeyboardFocus() == iid));
+        if (lit) ui_.Fill(row, Surface3, 6);
+        if (on) ui_.Icon(Rect(row.l + 6, row.t, row.l + 30, row.b), icon::Check, 11.f, AccentHi);
+        ui_.Text(Rect(row.l + 34, row.t, row.r - 10, row.b), it.text, 13.f, it.enabled ? TextColor : TextFaint,
+                 on ? Bold() : TextStyle{});
+    }
+    if (keys.empty()) return;
+    // Opened from the keyboard: the focus goes to the chosen item.
+    if (menu_.keys && at < 0) ui_.SetKeyboardFocus(keys[chosen >= 0 ? chosen : 0]);
+    const int d = in.Key(VK_DOWN) ? 1 : in.Key(VK_UP) ? -1 : 0;
+    if (d) {
+        const int n = (int)keys.size();
+        const int from = at >= 0 ? at : chosen >= 0 ? chosen : (d > 0 ? -1 : 0);
+        ui_.SetKeyboardFocus(keys[(from + d + n) % n]);
+        menu_.keys = true;
         Invalidate();
     }
 }
@@ -1406,8 +1519,35 @@ std::wstring App::ClipTitle() const {
     return clip_->SourcePath().empty() ? clipName_ : util::FileNameOf(clip_->SourcePath());
 }
 
+// Under an opened 움짤's transparent parts (#41): a checkerboard while it is saved as a 움짤, which keeps them, and
+// white for a video, which fills them so.
+void App::DrawAlphaBacking(const Rect& dst) {
+    if (IsVideoFormat(fmt_)) {
+        ui_.Fill(dst, D2D1::ColorF(1, 1, 1));
+        return;
+    }
+    if (!checker_ || checkerGen_ != gfx_.Generation()) {
+        constexpr int kCell = 10;
+        uint32_t px[kCell * 2 * kCell * 2];
+        for (int y = 0; y < kCell * 2; ++y)
+            for (int x = 0; x < kCell * 2; ++x) px[y * kCell * 2 + x] = (x < kCell) == (y < kCell) ? 0xFFFFFFFF : 0xFFD4D4D4;
+        ComPtr<ID2D1Bitmap1> bmp = gfx_.CreateBitmap(kCell * 2, kCell * 2, px, kCell * 2 * 4);
+        checker_.Reset();
+        if (bmp)
+            gfx_.DC()->CreateBitmapBrush(bmp.Get(),
+                                         D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP,
+                                                                      D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR),
+                                         &checker_);
+        checkerGen_ = gfx_.Generation();
+    }
+    if (!checker_) return;
+    checker_->SetTransform(D2D1::Matrix3x2F::Translation(dst.l, dst.t));
+    gfx_.DC()->FillRectangle(D2D1::RectF(dst.l, dst.t, dst.r, dst.b), checker_.Get());
+}
+
 void App::DrawFileBar(Rect r) {
-    const bool video = !clip_->SourcePath().empty();
+    const bool video = clip_->IsVideo();
+    auto* anim = dynamic_cast<const AnimClip*>(clip_.get());
     const bool held = std::any_of(held_.begin(), held_.end(), [&](const HeldClip& h) { return h.clip == clip_; });
     Rect close = r.CutRight(84);
     close = Rect::Centered(close.CX(), close.CY(), 84, 32);
@@ -1418,11 +1558,19 @@ void App::DrawFileBar(Rect r) {
     Rect ic = r.CutLeft(18);
     if (video)
         ui_.Icon(ic, icon::Video, 14.f, AccentHi);
+    else if (anim)
+        ui_.Icon(ic, icon::Photo, 14.f, Success);
     else
         ui_.Circle(ic.CX(), ic.CY(), 5.f, Rec);
     r.CutLeft(8);
-    std::wstring meta = std::wstring(video ? tr(L"동영상") : held ? tr(L"움짤 녹화 · 저장하지 않음") : tr(L"움짤 녹화")) +
-                        util::Format(L" · %d×%d · ", clip_->Width(), clip_->Height()) +
+    std::wstring kind = video  ? tr(L"동영상")
+                        : held ? tr(L"움짤 녹화 · 저장하지 않음")
+                               : tr(L"움짤 녹화");
+    if (anim) {
+        kind = util::Format(tr(L"%s 파일 · 프레임 %zu개"), FormatName(anim->FileFormat()), clip_->Count());
+        if (anim->HasAlpha()) kind += tr(L" · 투명 있음");
+    }
+    std::wstring meta = kind + util::Format(L" · %d×%d · ", clip_->Width(), clip_->Height()) +
                         util::FormatClock(clip_->Seconds(), true);
     const std::wstring name = ClipTitle();
     const float mw = ui_.Measure(meta, 12.f) + 4;
@@ -1444,16 +1592,16 @@ void App::DrawEditHome(Rect r) {
     ui_.Fill(ic, WithAlpha(Accent, 0.16f), 16);
     ui_.Icon(ic, icon::Download, 24.f, AccentHi);
     y += 56 + 12;
-    ui_.Text(Rect(dz.l, y, dz.r, y + 26), tr(L"동영상을 여기에 끌어다 놓으세요"), 18.f, TextColor, Bold(AlignCenter));
+    ui_.Text(Rect(dz.l, y, dz.r, y + 26), tr(L"동영상이나 움짤을 여기에 끌어다 놓으세요"), 18.f, TextColor,
+             Bold(AlignCenter));
     y += 26 + 6;
     TextStyle lines = Align(AlignCenter, AlignStart);
     lines.wrap = true;
     ui_.Text(Rect(dz.l + 20, y, dz.r - 20, y + 42),
-             tr(L"MP4, MOV, MKV, WebM 같은 동영상을 열 수 있습니다.\nGIF, WebP 같은 움짤은 아직 열 수 없습니다."), 13.f,
-             TextDim, lines);
+             tr(L"MP4, MOV, MKV, WebM 같은 동영상과\nGIF, WebP, AVIF 움짤을 열 수 있습니다."), 13.f, TextDim, lines);
     y += 42 + 14;
-    const float bw = ui_.Measure(tr(L"동영상 열기…"), 13.f, kSemibold) + 13 + 8 + 40;
-    if (ui_.Button(HashId("edit.browse"), Rect::Centered(dz.CX(), y + 18, bw, 36), tr(L"동영상 열기…"), BtnStyle::Primary,
+    const float bw = ui_.Measure(tr(L"파일 열기…"), 13.f, kSemibold) + 13 + 8 + 40;
+    if (ui_.Button(HashId("edit.browse"), Rect::Centered(dz.CX(), y + 18, bw, 36), tr(L"파일 열기…"), BtnStyle::Primary,
                    icon::OpenFile, true, 13.f))
         BrowseForVideo();
 
@@ -1521,9 +1669,8 @@ void App::DrawEditHome(Rect r) {
         item(rr, f.video ? icon::Video : icon::Photo, f.video ? Accent : Success, util::FileNameOf(f.path),
              util::FormatBytes(f.bytes) + L" · " + util::FormatAgo(f.age));
         const UiId eid = HashId("edit.recent", (uint32_t)i);
-        if (ui_.Button(eid, edit(rr), tr(L"편집"), BtnStyle::Secondary, icon::Cut, f.video, 12.5f))
+        if (ui_.Button(eid, edit(rr), tr(L"편집"), BtnStyle::Secondary, icon::Cut, true, 12.5f))
             act = Act::OpenRecent, actAt = i;
-        if (!f.video) ui_.Tooltip(eid, edit(rr), tr(L"움짤은 아직 편집할 수 없습니다"));
         if (ui_.IconButton(HashId("edit.folder", (uint32_t)i), side(rr), icon::Folder, tr(L"폴더에서 보기")))
             act = Act::Folder, actAt = i;
         Rect name(rr.l, rr.t, edit(rr).l - 10, rr.b);
@@ -1539,16 +1686,16 @@ void App::DrawEditHome(Rect r) {
 }
 
 void App::DrawDropCue(Rect client) {
-    const bool yes = dragKind_ == DragKind::Video;
+    const bool yes = DragOpens();
     const D2D1_COLOR_F tint = yes ? Accent : Warning;
     ui_.Fill(client, WithAlpha(P.DropScrim, 0.86f));
     Rect box = client.Inset(14);
     ui_.Fill(box, WithAlpha(tint, yes ? 0.10f : 0.07f), 18);
     ui_.StrokeDashed(box, tint, 18, 2.5f, 9.f, 6.f);
-    const wchar_t *title = tr(L"이 파일은 열 수 없습니다"), *sub = tr(L"동영상 파일만 열 수 있습니다");
+    const wchar_t *title = tr(L"이 파일은 열 수 없습니다"), *sub = tr(L"동영상이나 움짤 파일만 열 수 있습니다");
     switch (dragKind_) {
         case DragKind::Video: title = tr(L"놓으면 편집 탭에서 엽니다"), sub = tr(L"MP4, MOV, MKV, WebM 같은 동영상"); break;
-        case DragKind::Anim: title = tr(L"움짤은 아직 열 수 없습니다"); break;
+        case DragKind::Anim: title = tr(L"놓으면 편집 탭에서 엽니다"), sub = tr(L"GIF, WebP, AVIF 움짤"); break;
         case DragKind::Busy:
             if (rec_ != RecState::Idle)
                 title = tr(L"녹화하는 동안은 열 수 없습니다"), sub = tr(L"녹화를 멈춘 뒤에 놓으세요");
@@ -1596,6 +1743,7 @@ void App::DrawPreview(Rect r) {
                     : px > 1.99f ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                                  : D2D1_INTERPOLATION_MODE_LINEAR;
         ui_.Painted(dst);
+        if (clip_->HasAlpha()) DrawAlphaBacking(dst);
         gfx_.DC()->DrawBitmap(frameBmp_.Get(), dst, 1.f, mode, nullptr);
     }
 
@@ -1937,17 +2085,18 @@ void App::DrawExportPanel(Rect r) {
     for (int i = 0; i < (int)Format::Count; ++i)
         if (!FormatAvailable((Format)i)) disabled |= 1u << i;
     Format fmt = (Format)fmt_;
-    const bool mp4 = fmt == Format::Mp4;
+    const bool mp4 = fmt == Format::Mp4, webm = fmt == Format::WebM;
+    const bool isVideo = IsVideoFormat(fmt);  // MP4 or WebM: a constant rate, sound, always forward
     const double speed = kSpeedOptions[settings_.speedIdx];
     int ow = 0, oh = 0;
     OutputSize(ow, oh);
     double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
-    const int direction = mp4 ? 0 : settings_.directionIdx;
+    const int direction = isVideo ? 0 : settings_.directionIdx;
     PlanSummary& pc = planCache_;
     if (pc.clip != clip_.get() || pc.count != clip_->Count() || pc.first != inF_ || pc.last != outF_ ||
-        pc.fps != fpsLimit || pc.speed != speed || pc.mp4 != mp4 || pc.direction != direction) {
-        pc = {clip_.get(), clip_->Count(), inF_, outF_, fpsLimit, speed, mp4, direction};
-        if (mp4) {
+        pc.fps != fpsLimit || pc.speed != speed || pc.video != isVideo || pc.direction != direction) {
+        pc = {clip_.get(), clip_->Count(), inF_, outF_, fpsLimit, speed, isVideo, direction};
+        if (isVideo) {
             pc.frames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
         } else {
             auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed, direction);
@@ -1956,7 +2105,7 @@ void App::DrawExportPanel(Rect r) {
         }
     }
     const size_t outFrames = pc.frames;
-    if (mp4) {
+    if (isVideo) {
         outFps = fpsLimit;
         outSec = outFrames / fpsLimit;
     } else {
@@ -2002,31 +2151,52 @@ void App::DrawExportPanel(Rect r) {
     };
     bool changed = false;
 
-    label(tr(L"형식"), {});
-    if (ui_.Segmented(HashId("ex.fmt"), in.CutTop(34), {L"GIF", L"WebP", L"AVIF", L"MP4"}, fmt_,
-                      disabled)) {
-        changed = true;
-        hasResult_ = false;
-        if (fmt_ != (int)Format::Mp4) settings_.format = fmt_;  // the 움짤 format the next clip starts with
-        // 움짤 and MP4 each keep their own 화질.
-        settings_.UseExportKind(fmt_ == (int)Format::Mp4);
-        if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
-        FollowDirection();  // MP4 always plays forward
-    }
-    if (mp4) ProbeEncoders();
-    std::wstring blurb = (disabled & (1u << fmt_)) ? tr(L"이 빌드에는 포함되어 있지 않습니다")
-                         : !mp4                    ? std::wstring(FormatBlurb(fmt))
-                         : ExportAudio()           ? tr(L"어디서나 재생되는 동영상 · 소리 포함")
-                                                   : tr(L"어디서나 재생되는 동영상");
-    ui_.Text(in.CutTop(20), blurb, 11.5f, TextFaint);
-    in.CutTop(8);
-
     // A hint under a row, on two lines when one is too short.
     auto hintText = [&](const wchar_t* hint, D2D1_COLOR_F c) {
         TextStyle st;
         st.wrap = true;
         ui_.Text(in.CutTop(ui_.Measure(hint, 11.5f) > in.W() ? 34.f : 20.f), hint, 11.5f, c, st);
     };
+
+    // 움짤 on one row and the videos on the next (#40), so it shows which kind sound, 반복 and 재생 방향 go with.
+    label(tr(L"형식"), {});
+    {
+        // The kinds in a column, 40 wide unless a translation needs more.
+        const float col = std::max({40.f, ui_.Measure(tr(L"움짤"), 12.f), ui_.Measure(tr(L"동영상"), 12.f)});
+        auto row = [&](UiId id, const wchar_t* kind, const wchar_t* name, int first,
+                       std::initializer_list<std::wstring_view> items) {
+            Rect line = in.CutTop(32);
+            ui_.Text(line.CutLeft(col), tr(kind), 12.f, TextFaint);
+            line.CutLeft(8);
+            int sel = fmt_ >= first && fmt_ < first + (int)items.size() ? fmt_ - first : -1;
+            ui_.Name(tr(name));
+            if (!ui_.Segmented(id, line, items, sel, disabled >> first)) return false;
+            fmt_ = first + sel;
+            return true;
+        };
+        bool picked = row(HashId("ex.fmt"), L"움짤", L"움짤 형식", 0, {L"GIF", L"WebP", L"AVIF"});
+        in.CutTop(6);
+        picked |= row(HashId("ex.fmt.video"), L"동영상", L"동영상 형식", (int)Format::Mp4, {L"MP4", L"WebM"});
+        if (picked) {
+            changed = true;
+            hasResult_ = false;
+            if (!IsVideoFormat(fmt_)) settings_.format = fmt_;  // the 움짤 format the next clip starts with
+            // 움짤 and the videos each keep their own 화질.
+            settings_.UseExportKind(IsVideoFormat(fmt_));
+            if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, IsVideoFormat(fmt_));
+            FollowDirection();  // a video always plays forward
+        }
+    }
+    in.CutTop(4);
+    if (fmt == Format::Mp4) ProbeEncoders();
+    std::wstring blurb = (disabled & (1u << fmt_)) ? tr(L"이 빌드에는 포함되어 있지 않습니다")
+                         : fmt == Format::WebM
+                             ? tr(L"브라우저 · GitHub에서 바로 재생 · 소리 포함 가능 · CPU로 인코딩해서 MP4보다 느림")
+                         : fmt != Format::Mp4 ? std::wstring(FormatBlurb(fmt))
+                         : ExportAudio()      ? tr(L"어디서나 재생되는 동영상 · 소리 포함")
+                                              : tr(L"어디서나 재생되는 동영상");
+    hintText(blurb.c_str(), TextFaint);
+    in.CutTop(8);
 
     // 화질 sets the size, frame rate and GIF lossy level at once. 용량 맞추기 picks those itself while it is on.
     {
@@ -2041,7 +2211,7 @@ void App::DrawExportPanel(Rect r) {
         if (ui_.Segmented(HashId("ex.preset"), in.CutTop(32), {tr(L"고화질"), tr(L"보통"), tr(L"저용량")}, preset,
                           fit ? 7u : 0u)) {
             settings_.exportPreset = preset;
-            settings_.ApplyPreset(preset, mp4);
+            settings_.ApplyPreset(preset, isVideo);
             changed = true;
         }
         static const wchar_t* const kPresetHint[] = {L"원본 크기 그대로입니다. 용량이 큽니다.",
@@ -2059,7 +2229,7 @@ void App::DrawExportPanel(Rect r) {
         in.CutTop(8);
     }
 
-    // 용량 맞추기: size, frame rate and quality (MP4: the bitrate) are picked to land under the size.
+    // 용량 맞추기: size, frame rate and quality (MP4, WebM: the bitrate) are picked to land under the size.
     {
         const bool missed = target && fitMissed_ && !fitting_;
         label(tr(L"용량 맞추기"), !target ? L"" : fitting_ ? tr(L"맞추는 중…") : missed ? L"" : tr(L"맞춤"));
@@ -2071,12 +2241,12 @@ void App::DrawExportPanel(Rect r) {
             if (!settings_.targetIdx) {
                 fitBitrate_ = 0;
                 // Back to what 화질 asks for.
-                if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, mp4);
+                if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, isVideo);
             }
         }
         if (int mb = kTargetMB[settings_.targetIdx]) {
             const wchar_t* hint = missed     ? tr(L"가장 작게 해도 넘습니다 · 구간을 줄여 보세요")
-                                  : mp4      ? tr(L"비트레이트를 이 용량에 맞춥니다")
+                                  : isVideo  ? tr(L"비트레이트를 이 용량에 맞춥니다")
                                   : mb == 20 ? tr(L"크기·프레임·품질을 맞춤 · 디스코드 무료 한도")
                                   : mb == 15 ? tr(L"크기·프레임·품질을 맞춤 · X(트위터) GIF 한도")
                                              : tr(L"크기·프레임 레이트·품질을 이 용량에 맞춥니다");
@@ -2085,7 +2255,7 @@ void App::DrawExportPanel(Rect r) {
         in.CutTop(8);
     }
 
-    if (mp4 && clip_->HasAudio()) {
+    if (isVideo && clip_->HasAudio()) {
         auto* video = dynamic_cast<const VideoClip*>(clip_.get());
         if (video && !video->AudioExportable()) {
             bool off = false;
@@ -2118,8 +2288,11 @@ void App::DrawExportPanel(Rect r) {
         static const wchar_t* const kLoopNames[] = {L"계속 반복", L"한 번 재생", L"3번 반복"};
         std::wstring sum;
         auto part = [&](const std::wstring& p) { sum += (sum.empty() ? L"" : L" · ") + p; };
-        if (!mp4) {
-            int q = settings_.quality[fmt_];
+        // fmt, not fmt_: a format picked in this frame shows from the next one.
+        if (webm) {
+            part(settings_.targetIdx ? std::wstring(L"VP9") : tr(L"VP9 · 품질 ") + std::to_wstring(settings_.webmQuality));
+        } else if (!isVideo) {
+            int q = settings_.quality[(int)fmt];
             part(q >= 100 && fmt == Format::WebP ? tr(L"무손실") : tr(L"품질 ") + std::to_wstring(q));
             if (fmt == Format::Gif) part(util::Format(tr(L"손실 압축 %s"), tr(kLossyNames[settings_.gifLossy])));
         }
@@ -2127,8 +2300,8 @@ void App::DrawExportPanel(Rect r) {
         part(util::Format(L"%.0ffps", outFps));
         part(util::Format(L"%g×", speed));
         if (direction) part(direction == 1 ? tr(L"거꾸로") : tr(L"부메랑"));
-        if (!mp4) part(tr(kLoopNames[settings_.loopIdx]));
-        if (!mp4 && settings_.holdLast) part(tr(L"끝에서 멈춤"));
+        if (!isVideo) part(tr(kLoopNames[settings_.loopIdx]));
+        if (!isVideo && settings_.holdLast) part(tr(L"끝에서 멈춤"));
         ui_.Text(t, sum, 11.5f, TextFaint);
         in.CutTop(8);
     }
@@ -2138,7 +2311,7 @@ void App::DrawExportPanel(Rect r) {
         auto byHand = [&](bool c) {
             if (!c) return;
             changed = true;
-            settings_.exportPreset = settings_.MatchPreset(mp4, fmt == Format::Gif);
+            settings_.exportPreset = settings_.MatchPreset(isVideo, fmt == Format::Gif);
         };
         if (mp4) {
             // Codec and bitrate follow the video recording settings.
@@ -2154,8 +2327,28 @@ void App::DrawExportPanel(Rect r) {
             OutputSize(ow, oh);
             const bool hevc = UseHevc(std::max(ow, oh));
             ui_.Text(in.CutTop(22), VideoSummary(hevc, hevc && settings_.vCodec == kCodecAuto), 12.5f, TextColor);
+        } else if (webm) {
+            // VP9 by quality (#40). Under 용량 맞추기 a bitrate takes its place.
+            const wchar_t* how = ExportAudio() ? tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩 · 소리는 Opus")
+                                               : tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩");
+            if (settings_.targetIdx) {
+                label(tr(L"인코딩"), {});
+                std::wstring text = how;
+                if (fitBitrate_) text += util::Format(tr(L" · 약 %.1f Mbps"), fitBitrate_ / 1e6);
+                hintText(text.c_str(), TextColor);
+            } else {
+                int& q = settings_.webmQuality;
+                label(tr(L"품질"), std::to_wstring(q));
+                float qv = (float)q;
+                if (ui_.Slider(HashId("ex.q"), in.CutTop(22).Inset(7, 0), qv, 1.f, 100.f)) {
+                    q = (int)std::lround(qv);
+                    changed = true;
+                }
+                in.CutTop(4);
+                hintText(how, TextFaint);
+            }
         } else {
-            int& q = settings_.quality[fmt_];
+            int& q = settings_.quality[(int)fmt];
             label(tr(L"품질"), q >= 100 && fmt == Format::WebP ? tr(L"무손실") : std::to_wstring(q));
             float qv = (float)q;
             if (ui_.Slider(HashId("ex.q"), in.CutTop(22).Inset(7, 0), qv, 1.f, 100.f)) {
@@ -2199,7 +2392,7 @@ void App::DrawExportPanel(Rect r) {
             RestartClock();
         }
         in.CutTop(8);
-        if (!mp4) {
+        if (!isVideo) {
             // The preview plays the same way.
             label(tr(L"재생 방향"), {});
             if (ui_.Segmented(HashId("ex.dir"), in.CutTop(32), {tr(L"그대로"), tr(L"거꾸로"), tr(L"부메랑")},
@@ -2243,7 +2436,7 @@ void App::DrawExportPanel(Rect r) {
         ui_.Text(summary, sum, 12.f, TextDim, Align(AlignCenter));
     } else if (!showResult) {
         std::wstring sum = util::Format(tr(L"%d×%d · %.0ffps · %.1f초"), ow, oh, outFps, outSec);
-        if (mp4) sum += ExportAudio() ? tr(L" · 소리 포함") : tr(L" · 소리 없음");
+        if (isVideo) sum += ExportAudio() ? tr(L" · 소리 포함") : tr(L" · 소리 없음");
         // The estimate, once it matches what is on screen.
         bool current = estValid_ && estKey_ == EstimateKey();
         bool over = current && target && estBytes_ > target;
@@ -2258,8 +2451,15 @@ void App::DrawExportPanel(Rect r) {
         ui_.Fill(save, Surface2, 12);
         Rect bar = Rect(save.l + 14, save.CY() + 8, save.r - 14, save.CY() + 12);
         ui_.ProgressBar(bar, p, Accent);
-        ui_.Text(Rect(save.l + 14, save.t + 4, save.r - 14, save.CY() + 4),
-                 util::Format(tr(L"%s 인코딩 중…  %d%%"), FormatName(fmt), (int)(p * 100)), 13.f, TextColor, Bold());
+        std::wstring text = util::Format(tr(L"%s 인코딩 중…  %d%%"), FormatName(fmt), (int)(p * 100));
+        // WebM is encoded on the CPU and takes a while (#40): how long is left, once there is enough to tell.
+        const double took = util::NowSeconds() - exportStarted_;
+        if (fmt == Format::WebM && p >= 0.03f && took >= 2) {
+            const double left = took * (1 - p) / p;
+            text += left < 90 ? util::Format(tr(L" · 약 %d초 남음"), std::max(1, (int)std::lround(left)))
+                              : util::Format(tr(L" · 약 %d분 남음"), (int)std::lround(left / 60));
+        }
+        ui_.Text(Rect(save.l + 14, save.t + 4, save.r - 14, save.CY() + 4), text, 13.f, TextColor, Bold());
         if (ui_.Button(HashId("ex.cancel"), saveAs, tr(L"취소"), BtnStyle::Ghost, icon::Close, true, 13.f))
             exporter_.Cancel();
         RequestWake(ui_.Now() + 0.1);
@@ -2536,18 +2736,14 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
 
     // A list rather than buttons, so more languages fit later.
     SettingRow(area, tr(L"언어"), tr(L"‘시스템’은 Windows 표시 언어가 한국어면 한국어, 아니면 영어입니다."), 300, [&](Rect c) {
-        UiId id = HashId("set.language");
-        bool hov = ui_.Hover(c);
-        if (ui_.Click(id, c) && LanguageMenu(c)) {
+        std::vector<MenuItem> items{{LanguageName(kLangSystem), kLangSystem},
+                                    {LanguageName(kLangKorean), kLangKorean, true},
+                                    {LanguageName(kLangEnglish), kLangEnglish}};
+        if (Dropdown(HashId("set.language"), c, LanguageName(settings_.language), tr(L"언어"), std::move(items),
+                     settings_.language, TextColor)) {
             changed = true;
             ApplyLanguage();
         }
-        const std::wstring name = LanguageName(settings_.language);
-        ui_.Describe(id, tr(L"언어, ") + name);
-        ui_.Fill(c, hov ? Surface3 : Surface2, 8);
-        ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
-        ui_.Text(Rect(c.l + 12, c.t, c.r - 30, c.b), name, 13.f, TextColor);
-        ui_.Icon(Rect(c.r - 30, c.t, c.r - 8, c.b), icon::ChevronDown, 10.f, TextDim);
     });
 
     const bool portable = Settings::Portable() || portableForTest_;
@@ -2757,6 +2953,24 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                });
 }
 
+// Mbps as typed in 설정 › 동영상 › 비트레이트, in kbps; -1 when it isn't a number.
+static int ParseMbps(std::wstring_view t) {
+    const size_t dot = t.find(L'.');
+    const std::wstring_view whole = t.substr(0, dot), tenth = dot == t.npos ? std::wstring_view{} : t.substr(dot + 1);
+    if ((whole.empty() && tenth.empty()) || whole.size() > 5 || tenth.size() > 1) return -1;
+    int kbps = 0;
+    for (wchar_t c : whole) {
+        if (c < L'0' || c > L'9') return -1;
+        kbps = kbps * 10 + (c - L'0');
+    }
+    kbps *= 1000;
+    if (!tenth.empty()) {
+        if (tenth[0] < L'0' || tenth[0] > L'9') return -1;
+        kbps += (tenth[0] - L'0') * 100;
+    }
+    return kbps;
+}
+
 void App::SettingsVideo(Rect& area, bool& changed) {
     ProbeEncoders();
     const bool hevcOk = HevcEncoder();
@@ -2802,10 +3016,79 @@ void App::SettingsVideo(Rect& area, bool& changed) {
                                   auto_ / 8.0 * 60 / 1e6);
         }
     }
-    SettingRow(area, tr(L"비트레이트"), brDesc, 360, [&](Rect c) {
-        changed |= ui_.Segmented(HashId("set.vbr"), c, {tr(L"자동"), L"6", L"10", L"16", L"25", L"40", L"60"},
-                                 settings_.vBitrateIdx);
-    });
+    // #53: the steps in a list, and a field for any number of Mbps (a tenth at most). Typing in it makes it 직접 입력;
+    // a number out of range becomes the nearest one when the field lets go, and the line under the row says so.
+    const UiId brField = HashId("set.vbrField");
+    const bool brTyping = ui_.FocusedField() == brField;
+    const int brKbps = ParseMbps(brText_);
+    if (brTypingWas_ && !brTyping) {
+        if (brKbps < 0) {
+            brNote_.clear();
+        } else if (brKbps < kVideoBitrateMinKbps || brKbps > kVideoBitrateMaxKbps) {
+            settings_.vBitrateKbps = std::clamp(brKbps, kVideoBitrateMinKbps, kVideoBitrateMaxKbps);
+            brNote_ = util::Format(brKbps < kVideoBitrateMinKbps ? tr(L"%s은(는) 너무 작아서 %s Mbps로 맞췄습니다")
+                                                                 : tr(L"%s은(는) 너무 커서 %s Mbps로 맞췄습니다"),
+                                   brText_.c_str(), MbpsText(settings_.vBitrateKbps).c_str());
+            changed = true;
+        }
+    }
+    brTypingWas_ = brTyping;
+    if (!brTyping) brText_ = MbpsText(settings_.vBitrateKbps);  // as typed only while typing
+    const bool brCustom = settings_.vBitrateIdx == kVideoBitrateCustom;
+    if (brCustom) brDesc = tr(L"직접 정한 값으로 녹화합니다 · 편집 화면의 MP4 저장도 이 값을 씁니다");
+    const std::wstring range = MbpsText(kVideoBitrateMinKbps) + L" – " + MbpsText(kVideoBitrateMaxKbps) + L" Mbps";
+    std::wstring hint = tr(L"숫자를 넣으면 ‘직접 입력’이 됩니다 · ") + range;
+    bool warn = false;
+    if (brCustom) {
+        const int k = ParseMbps(brText_);
+        warn = true;
+        if (k < 0)
+            hint = tr(L"숫자를 넣어 주세요 (소수는 한 자리까지) · ") + range;
+        else if (k < kVideoBitrateMinKbps || k > kVideoBitrateMaxKbps)
+            hint = util::Format(tr(L"%s 사이로 넣어 주세요 · 칸을 벗어나면 %s Mbps로 맞춥니다"), range.c_str(),
+                                MbpsText(std::clamp(k, kVideoBitrateMinKbps, kVideoBitrateMaxKbps)).c_str());
+        else {
+            hint = util::Format(tr(L"1분에 약 %d MB · "), (int)std::lround(k * 0.0075)) + range;
+            if (!brNote_.empty()) hint = brNote_ + L" · " + hint;
+            warn = !brNote_.empty();
+        }
+    }
+    const float unitW = ui_.Measure(L"Mbps", 13.f) + 2;
+    Rect brMore = SettingRow(
+        area, tr(L"비트레이트"), brDesc, 150 + 10 + 78 + 6 + unitW,
+        [&](Rect c) {
+            std::vector<MenuItem> items{{tr(L"자동"), 0}};
+            for (int i = 1; i < kVideoBitrateCustom; ++i)
+                items.push_back({std::to_wstring(kVideoBitrateOptions[i]) + L" Mbps", i, i == 1});
+            items.push_back({tr(L"직접 입력"), kVideoBitrateCustom, true});
+            const std::wstring label = items[settings_.vBitrateIdx].text;  // before the list moves into Dropdown
+            if (Dropdown(HashId("set.vbr"), c.CutLeft(150), label, tr(L"비트레이트"), std::move(items),
+                         settings_.vBitrateIdx, TextColor)) {
+                changed = true;
+                brNote_.clear();
+                if (settings_.vBitrateIdx == kVideoBitrateCustom) ui_.Focus(brField);
+            }
+            c.CutLeft(10);
+            if (ui_.TextField(brField, Rect::Centered(c.l + 39, c.CY(), 78, 32), brText_, L"", 5)) {
+                std::wstring t;  // digits, one '.', and one digit after it
+                for (wchar_t ch : brText_) {
+                    const size_t dot = t.find(L'.');
+                    if (ch == L'.' && dot == t.npos) t += ch;
+                    if (ch >= L'0' && ch <= L'9' && (dot == t.npos || t.size() - dot < 2)) t += ch;
+                }
+                brText_ = t;
+                settings_.vBitrateIdx = kVideoBitrateCustom;
+                brNote_.clear();
+                const int k = ParseMbps(brText_);
+                if (k >= kVideoBitrateMinKbps && k <= kVideoBitrateMaxKbps) settings_.vBitrateKbps = k;
+                changed = true;
+            }
+            ui_.Describe(brField, tr(L"비트레이트 (Mbps)"), Role::Edit);
+            c.CutLeft(78 + 6);
+            ui_.Text(c, L"Mbps", 13.f, TextDim);
+        },
+        16 + 14.f);
+    ui_.Text(brMore.CutTop(16), hint, 12.f, warn ? Warning : TextFaint);
 
     SettingRow(area, tr(L"비트레이트 방식"), tr(L"VBR: 움직임에 따라 조절해 화질 우선 · CBR: 일정한 용량 (스트리밍 · 업로드 규격)"),
                230, [&](Rect c) {
@@ -2847,20 +3130,20 @@ void App::SettingsAudio(Rect& area, bool& changed) {
                            : !micKnown         ? tr(L"고른 장치가 연결되어 있지 않습니다 · 연결하거나 다른 장치를 고르세요")
                                                : tr(L"기본 장치로 두면 Windows에서 기본 장치를 바꿀 때 함께 바뀝니다");
     SettingRow(area, tr(L"마이크 장치"), micDesc, 300, [&](Rect c) {
-        UiId id = HashId("set.micDevice");
-        bool hov = ui_.Hover(c);
-        if (ui_.Click(id, c) && MicMenu(c)) {
+        const UiId id = HashId("set.micDevice");
+        int pick = settings_.micDevice.empty() ? 0 : -1;  // -1: a device that isn't connected
+        for (size_t i = 0; i < micDevices_.size(); ++i)
+            if (micDevices_[i].id == settings_.micDevice) pick = (int)i + 1;
+        const bool wasOpen = menu_.owner == id;
+        if (Dropdown(id, c, MicDeviceName(), tr(L"마이크 장치"), MicItems(), pick, micKnown ? TextColor : Warning)) {
+            settings_.micDevice = pick > 0 && pick <= (int)micDevices_.size() ? micDevices_[pick - 1].id : L"";
             changed = true;
             if (micTest_.Running()) StartMicTest();  // now on the new device
         }
-        ui_.Describe(id, tr(L"마이크 장치, ") + MicDeviceName());
-        ui_.Fill(c, hov ? Surface3 : Surface2, 8);
-        ui_.Stroke(c.Inset(0.5f), hov ? BorderStrong : Border, 8);
-        Rect t(c.l + 12, c.t, c.r - 30, c.b);
-        ui_.PushClip(t);
-        ui_.Text(t, MicDeviceName(), 13.f, micKnown ? TextColor : Warning);
-        ui_.PopClip();
-        ui_.Icon(Rect(c.r - 30, c.t, c.r - 8, c.b), icon::ChevronDown, 10.f, TextDim);
+        if (!wasOpen && menu_.owner == id && !testWindowsOnly_) {
+            micDevices_ = AudioCapture::InputDevices();  // what is plugged in now
+            menu_.items = MicItems();
+        }
     });
     SettingRow(area, tr(L"마이크 음량"), tr(L"목소리가 작거나 크게 들리면 조절하세요 · 100%는 장치 그대로"), 300, [&](Rect c) {
         Rect label = c.CutRight(52);
@@ -2926,10 +3209,12 @@ void App::SettingsAbout(Rect& area) {
              TextDim);
     ui_.Line(area.l, area.t - 0.5f, area.r, area.t - 0.5f, Border);
 
-    std::wstring formats;
-    for (int i = 0; i < (int)Format::Mp4; ++i)
-        if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
-    SettingRow(area, tr(L"지원 형식"), tr(L"움짤: ") + formats + tr(L" · 동영상: MP4"), 0, [](Rect) {});
+    std::wstring formats, videos;
+    for (int i = 0; i < (int)Format::Count; ++i) {
+        std::wstring& list = IsVideoFormat(i) ? videos : formats;
+        if (FormatAvailable((Format)i)) list += (list.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
+    }
+    SettingRow(area, tr(L"지원 형식"), tr(L"움짤: ") + formats + tr(L" · 동영상: ") + videos, 0, [](Rect) {});
 
     const bool portable = Settings::Portable() || portableForTest_;
     SettingRow(area, tr(L"설정 파일"),

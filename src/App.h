@@ -13,6 +13,16 @@
 
 enum class Screen { Home, Editor, Settings };
 
+class AnimClip;
+
+// An item of App::Dropdown's list.
+struct MenuItem {
+    std::wstring text;
+    int value = 0;
+    bool line = false;  // a separator above it
+    bool enabled = true;
+};
+
 // What a recording captures: a window, a whole monitor or a fixed screen area.
 struct RecTarget {
     int source = kSourceWindow;
@@ -39,10 +49,11 @@ private:
         WM_APP_UPDATE,
         WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
         WM_APP_HOOKED_KEY,  // the keyboard hook took a combination while a hotkey is being chosen (#50)
+        WM_APP_ANIM_LOADED,  // a 움짤 file finished decoding (#41)
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
-    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest };
+    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad };
     enum class RecState { Idle, Countdown, Recording };
     enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
 
@@ -159,12 +170,22 @@ private:
     std::wstring VideoSummary(bool hevc, bool bigHevc = false) const;
     std::wstring AudioSummary(int source) const;
     std::wstring MicDeviceName() const;
-    bool MicMenu(const Rect& anchor);
+    std::vector<MenuItem> MicItems();  // Windows' default, then each input device; the value is its micDevices_ index + 1
     std::wstring LanguageName(int choice) const;  // a LanguageChoice
-    bool LanguageMenu(const Rect& anchor);
+    static std::wstring MbpsText(int kbps);       // "12.5", "20"
+    // A drop-down list drawn by the app (#53: not a native menu, so it looks like the rest of it). The field shows
+    // `label`; a click opens the items under it as a popover. True in the frame an item was picked: `value` is its
+    // value. `name` is what a screen reader calls the field.
+    bool Dropdown(UiId id, const Rect& r, std::wstring_view label, std::wstring_view name,
+                  std::vector<MenuItem> items, int& value, D2D1_COLOR_F ink);
+    void DrawMenuPopover(Rect client);
+    void DrawAlphaBacking(const Rect& dst);
 
     // ---- files: opening videos, recent files, recordings not exported yet
     void OpenMediaFile(const std::wstring& path);
+    void OpenAnimFile(const std::wstring& path);
+    void ShowAnimProgress();
+    void OnAnimLoaded();
     void BrowseForVideo();
     void AddRecent(const std::wstring& path);
     void RefreshRecent();
@@ -230,6 +251,7 @@ private:
     void StartFit();
     void OnEstimate();
     bool ExportAudio() const;
+    int ExportQuality() const;  // the 품질 of the format chosen: the 움짤 one, WebM's (#40), 0 for MP4
     // MP4 of a video: why the range has to be encoded again; "" when it is copied as it is (Mp4Cut.h); null when
     // copying can't be done here at all.
     const wchar_t* CopyBlocker() const;
@@ -341,6 +363,21 @@ private:
     bool timerOpen_ = false;  // the timer's popover on the 녹화 tab
     Rect timerChip_;
     std::wstring timerText_[2];  // 직접 입력's hours and minutes as typed
+    // The open Dropdown: its field, its items, and the value picked from it for the field to take next frame.
+    struct OpenMenu {
+        UiId owner = 0;
+        Rect anchor;
+        std::wstring name;
+        std::vector<MenuItem> items;
+        int value = 0;
+        bool seen = false;  // its field was drawn this frame (it closes when the field goes)
+        bool keys = false;  // opened from the keyboard: the focus ring goes into the list
+    } menu_;
+    UiId menuPicked_ = 0;
+    int menuPickedValue_ = 0;
+    std::wstring brText_;  // 설정 › 동영상 비트레이트 직접 입력, as typed
+    std::wstring brNote_;  // what became of a number out of range
+    bool brTypingWas_ = false;  // the field had the focus last frame: it lets go when that changes
     int countdownLeft_ = 0;
     RecOverlay overlay_;
     PickerOverlay picker_;
@@ -368,6 +405,22 @@ private:
     int cropAspect_ = 0;
     int cropDrag_ = -1;
     std::shared_ptr<const mp4::CutSource> cutSource_;  // a video that can be cut without encoding it again
+    // A 움짤 file decoding on a worker (#41). Dropping it stops the worker and waits for it.
+    struct AnimLoad {
+        std::wstring path;
+        std::thread thread;
+        std::atomic<bool> cancel{false}, done{false};
+        std::atomic<float> progress{0};
+        std::shared_ptr<AnimClip> clip;
+        std::wstring err;
+        ~AnimLoad() {
+            cancel = true;
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<AnimLoad> animLoad_;
+    ComPtr<ID2D1BitmapBrush1> checker_;  // under an opened 움짤's transparent parts
+    UINT checkerGen_ = 0;
     std::wstring caption_;      // 자막: one line over the whole clip (#22), kept for the clip open
     int captionPos_ = 0;        // caption::Pos
     bool captionOpen_ = false;  // the caption bar is up
@@ -408,6 +461,7 @@ private:
     class DropTarget;
     enum class DragKind { None, Video, Anim, Other, Busy };
     DragKind ClassifyDrop(const std::wstring& path) const;
+    bool DragOpens() const { return dragKind_ == DragKind::Video || dragKind_ == DragKind::Anim; }
     ComPtr<IDropTarget> MakeDropTarget();
     ComPtr<IDropTarget> dropTarget_;
     DragKind dragKind_ = DragKind::None;
@@ -424,9 +478,10 @@ private:
     uint64_t estBytes_ = 0;
     bool estValid_ = false, fitting_ = false, fitMissed_ = false;
     std::vector<FitKnobs> fitKnobs_;
-    UINT32 fitBitrate_ = 0;     // MP4 under a target: the video bitrate that fits
+    UINT32 fitBitrate_ = 0;     // MP4 and WebM under a target: the video bitrate that fits
     double fitCorrection_ = 1;  // actual / estimated, after an export came out over the target
     uint64_t exportEstimate_ = 0;
+    double exportStarted_ = 0;  // util::NowSeconds() when the export started: WebM's time left (#40)
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
     bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
     bool portableForTest_ = false;   // screenshots: the settings as a portable copy shows them
@@ -486,7 +541,7 @@ private:
         const Clip* clip = nullptr;
         size_t count = 0, first = 0, last = 0;
         double fps = 0, speed = 0;
-        bool mp4 = false;
+        bool video = false;  // MP4 or WebM
         int direction = 0;
         size_t frames = 0;
         double ms = 0;

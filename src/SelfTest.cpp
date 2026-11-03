@@ -15,6 +15,7 @@
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
 #include "App.h"
+#include "AnimClip.h"
 #include "Caption.h"
 #include "Crash.h"
 #include "Mp4Cut.h"
@@ -23,6 +24,16 @@
 #include "Util.h"
 #include "Version.h"
 #include "VideoClip.h"
+#include "WebmWriter.h"
+
+#if __has_include(<mkvparser/mkvparser.h>) && __has_include(<vpx/vp8dx.h>) && __has_include(<opus/opus.h>) && \
+    __has_include(<libyuv.h>)
+#include <libyuv.h>
+#include <mkvparser/mkvparser.h>
+#include <opus/opus.h>
+#include <vpx/vp8dx.h>
+#include <vpx/vpx_decoder.h>
+#endif
 
 namespace {
 
@@ -34,6 +45,21 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
                   bool fragmented = false, bool crash = false);
 bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got);
 int ReadIndex(const uint8_t* p, int w, int h);
+void DrawIndexed(uint8_t* p, int w, int h, int index, double t);
+
+// What a WebM file holds (#40), read back with libwebm's parser and decoded with libvpx and Opus, so the check
+// doesn't depend on the WebM decoders Windows may or may not have.
+struct WebmContents {
+    bool ok = false;
+    std::wstring err;
+    int width = 0, height = 0;
+    double seconds = 0;              // the segment's duration
+    std::vector<int> indexes;        // ReadIndex of each frame
+    std::vector<uint8_t> first;      // the first frame, BGRA
+    std::vector<int16_t> audio;      // 48 kHz stereo, the encoder's pre-skip dropped
+};
+bool WebmReaderBuilt();
+WebmContents ReadWebm(const std::wstring& path);
 
 struct TopBox {
     std::string type;
@@ -86,6 +112,56 @@ bool HasVideoProcessor() {
         return false;
     ComPtr<ID3D11VideoDevice> vd;
     return SUCCEEDED(dev.As(&vd));
+}
+
+// A made-up 움짤 with see-through parts (#41): premultiplied frames of their own lengths.
+class AlphaClip : public Clip {
+public:
+    explicit AlphaClip(std::shared_ptr<FrameStore> s) : s_(std::move(s)) {}
+    int Width() const override { return s_->Width(); }
+    int Height() const override { return s_->Height(); }
+    size_t Count() const override { return s_->Count(); }
+    int64_t Ts(size_t i) const override { return s_->Ts(i); }
+    int64_t EndTs() const override { return s_->EndTs(); }
+    std::unique_ptr<FrameReader> NewReader() const override { return s_->NewReader(); }
+    bool HasAlpha() const override { return true; }
+
+private:
+    std::shared_ptr<FrameStore> s_;
+};
+
+// Frame i of it: a red square moving right over nothing, a half-clear green band along the top; frame 3 is clear all
+// over. Premultiplied BGRA.
+void DrawAlphaFrame(uint8_t* px, int w, int h, int i) {
+    memset(px, 0, (size_t)w * h * 4);
+    if (i == 3) return;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t* p = px + ((size_t)y * w + x) * 4;
+            if (y < 8) p[1] = p[3] = 200;  // green at 200 of 255
+            if (x >= 8 + i * 12 && x < 32 + i * 12 && y >= 20 && y < 44) p[0] = p[1] = 0, p[2] = p[3] = 255;
+        }
+}
+
+// A sticker for the screenshots, at t (0-1) of its loop: a ball rolling left and right over nothing, with a soft
+// shadow under it. Premultiplied BGRA.
+void DrawSticker(uint8_t* px, int w, int h, double t) {
+    memset(px, 0, (size_t)w * h * 4);
+    const double r = h * 0.28, cx = w * 0.3 + w * 0.4 * (0.5 - 0.5 * std::cos(t * 6.2832)), cy = h * 0.42;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t* p = px + ((size_t)y * w + x) * 4;
+            const double sx = (x + 0.5 - cx) / (r * 1.1), sy = (y + 0.5 - (cy + r * 1.25)) / (r * 0.22);
+            const double shadow = std::clamp(1 - (sx * sx + sy * sy), 0.0, 1.0) * 0.35;
+            const double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+            const double ball = std::clamp(r - d + 0.5, 0.0, 1.0);
+            const double light = 1 - 0.35 * std::clamp((x - cx + y - cy) / (2 * r) + 0.5, 0.0, 1.0);
+            const double a = ball + shadow * (1 - ball);
+            p[0] = (uint8_t)std::lround(250 * light * ball);
+            p[1] = (uint8_t)std::lround(139 * light * ball);
+            p[2] = (uint8_t)std::lround(167 * light * ball);
+            p[3] = (uint8_t)std::lround(255 * a);
+        }
 }
 
 // NETSCAPE loop count of a GIF: -1 = no loop block (plays once), 0 = forever, n = repeats after the first play.
@@ -724,9 +800,9 @@ int App::RunSelfTest(const std::wstring& dir) {
         job.outW = W;
         job.outH = H;
         job.format = fmt;
-        job.quality = f < (int)Format::Mp4 ? settings_.quality[f] : 0;
+        job.quality = fmt == Format::WebM ? settings_.webmQuality : f < (int)Format::Mp4 ? settings_.quality[f] : 0;
         if (fmt == Format::Gif) job.lossy = settings_.gifLossy;
-        if (fmt == Format::Mp4) job.fpsLimit = fps;
+        if (IsVideoFormat(fmt)) job.fpsLimit = fps;
         job.path = dir + L"\\selftest." + FormatExt(fmt);
         double s = util::NowSeconds();
         ExportResult r = ExportSync(ex, job);
@@ -734,7 +810,7 @@ int App::RunSelfTest(const std::wstring& dir) {
                          util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds, (util::NowSeconds() - s) * 1000,
                          r.error.c_str()));
         // The size guess against the real thing. MP4 is VBR (this test picture needs far less than the bitrate),
-        // so only 움짤 must be close.
+        // so only 움짤 and WebM (by quality, guessed from real encodes) must be close.
         {
             std::atomic<bool> cancel{false};
             s = util::NowSeconds();
@@ -747,6 +823,15 @@ int App::RunSelfTest(const std::wstring& dir) {
             if (!good) ++failures;
         }
         if (!r.ok) ++failures;
+        // WebM read back (#40): every frame there, at the size written.
+        if (fmt == Format::WebM && r.ok && WebmReaderBuilt()) {
+            WebmContents wc = ReadWebm(job.path);
+            bool good = wc.ok && (int)wc.indexes.size() == r.frames && wc.width == W && wc.height == H &&
+                        std::fabs(wc.seconds - r.frames / fps) < 0.002;
+            log(util::Format(L"WebM read back: %s %zu frames %dx%d, %.3fs %s", good ? L"ok" : L"FAIL",
+                             wc.indexes.size(), wc.width, wc.height, wc.seconds, wc.err.c_str()));
+            if (!good) ++failures;
+        }
         // AVIF from quality 90 keeps the colour at full resolution (4:4:4, #23).
         if (fmt == Format::Avif) {
             job.quality = 95;
@@ -799,6 +884,155 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"GIF 2x: %s %d frames, file plays %.2fs %s", r.ok ? L"ok" : L"FAIL", r.frames, cs / 100.0,
                          r.error.c_str()));
         if (!r.ok || std::fabs(cs / 100.0 - N / fps / 2) > 0.03) ++failures;
+    }
+    // 움짤 files opened in the editor (#41): a clip with see-through parts saved as GIF, WebP and AVIF and read back
+    // (AnimClip): as many frames, as long each, still see-through where it was (where the square was a frame before
+    // too: GIF clears it), colours close. As MP4 the clear parts are white.
+    {
+        const int aw = 96, ah = 64, an = 6;
+        const double lens[an] = {100, 40, 250, 70, 120, 500};
+        auto store = std::make_shared<FrameStore>();
+        std::wstring err;
+        bool made = store->Open(aw, ah, err, false);
+        int64_t ts = 0;
+        for (int i = 0; made && i < an; ++i) {
+            auto buf = store->Acquire();
+            DrawAlphaFrame(buf->data(), aw, ah, i);
+            made = store->Submit(buf, ts, true);
+            ts += std::llround(lens[i] * 1e4);
+        }
+        store->Finish(ts);
+        auto aclip = std::make_shared<AlphaClip>(store);
+        for (Format fmt : {Format::Gif, Format::WebP, Format::Avif, Format::Mp4, Format::WebM}) {
+            if (!FormatAvailable(fmt) || (fmt == Format::Mp4 && !HasVideoProcessor())) continue;
+            ExportJob job;
+            job.clip = aclip;
+            job.last = an - 1;
+            job.crop = {0, 0, aw, ah};
+            job.outW = aw;
+            job.outH = ah;
+            job.format = fmt;
+            job.quality = fmt == Format::Mp4 ? 0 : 90;
+            if (IsVideoFormat(fmt)) job.fpsLimit = 50;
+            job.path = dir + L"\\selftest_alpha." + FormatExt(fmt);
+            ExportResult r = ExportSync(ex, job);
+            std::wstring got;
+            bool ok = r.ok;
+            if (ok && fmt == Format::Mp4) {
+                auto v = VideoClip::Open(job.path, err);
+                auto rd = v ? v->NewReader() : nullptr;
+                const uint8_t* px = rd ? rd->Get(0) : nullptr;
+                const uint8_t* corner = px ? px + ((size_t)(ah - 1) * aw + aw - 1) * 4 : nullptr;
+                ok = corner && corner[0] > 235 && corner[1] > 235 && corner[2] > 235;
+                if (corner) got = util::Format(L"clear corner %d,%d,%d", corner[2], corner[1], corner[0]);
+            } else if (ok && fmt == Format::WebM) {
+                WebmContents wc = ReadWebm(job.path);
+                const uint8_t* corner =
+                    wc.ok && wc.width == aw && wc.height == ah ? wc.first.data() + ((size_t)(ah - 1) * aw + aw - 1) * 4
+                                                               : nullptr;
+                ok = !WebmReaderBuilt() || (corner && corner[0] > 235 && corner[1] > 235 && corner[2] > 235);
+                got = corner ? util::Format(L"clear corner %d,%d,%d", corner[2], corner[1], corner[0]) : wc.err;
+            } else if (ok) {
+                std::atomic<bool> cancel{false};
+                std::atomic<float> progress{0};
+                auto back = AnimClip::Open(job.path, cancel, progress, err);
+                ok = back && back->Count() == (size_t)an && back->HasAlpha() && back->FileFormat() == fmt &&
+                     back->Width() == aw && back->Height() == ah;
+                got = back ? util::Format(L"%zu frames, alpha %d", back->Count(), back->HasAlpha()) : err;
+                auto rd = ok ? back->NewReader() : nullptr;
+                for (int i = 0; ok && i < an; ++i) {
+                    const int64_t end = i + 1 < an ? back->Ts(i + 1) : back->EndTs();
+                    const double ms = (end - back->Ts(i)) / 1e4;
+                    const uint8_t* px = rd->Get(i);
+                    auto at = [&](int x, int y) { return px + ((size_t)y * aw + x) * 4; };
+                    // In this frame's square; in the last one's but not this one's.
+                    const uint8_t *sq = at(20 + i * 12, 32), *was = at(i * 12, 32), *band = at(aw - 4, 3);
+                    const bool square = i == 3 ? sq[3] == 0 : sq[3] > 240 && sq[2] > 200 && sq[1] < 60;
+                    const bool cleared = i == 0 || was[3] == 0;
+                    // The band: GIF keeps it (200 ≥ half), the others keep it half clear.
+                    const bool half = i == 3 ? band[3] == 0
+                                      : fmt == Format::Gif ? band[3] == 255
+                                                           : band[3] > 170 && band[3] < 230;
+                    if (!px || std::fabs(ms - lens[i]) > 10 || !square || !cleared || !half) {
+                        got += util::Format(L" · frame %d: %.0f ms, square a%d r%d g%d, behind a%d, band a%d", i, ms,
+                                            sq[3], sq[2], sq[1], was[3], band[3]);
+                        ok = false;
+                    }
+                }
+            }
+            log(util::Format(L"%s with alpha: %s %s · %s %s", FormatName(fmt), ok ? L"ok" : L"FAIL",
+                             util::FormatBytes(r.bytes).c_str(), got.c_str(), r.error.c_str()));
+            if (!ok) ++failures;
+        }
+        // In the editor it starts in its own format at 고화질, while the 움짤 recordings keep their 화질 (저용량 here),
+        // in the settings file too, and get it back when it closes. Saved as a GIF again, its name gets _trim.
+        std::atomic<bool> cancel{false};
+        std::atomic<float> progress{0};
+        if (auto gif = AnimClip::Open(dir + L"\\selftest_alpha.gif", cancel, progress, err)) {
+            const Settings was = settings_;
+            settings_.UseExportKind(false);
+            settings_.exportPreset = 2;
+            settings_.ApplyPreset(2, false);
+            OpenEditor(gif);
+            const bool own = fmt_ == (int)Format::Gif && settings_.exportPreset == 0 && settings_.scaleIdx == 0 &&
+                             settings_.outFpsIdx == 0;
+            settings_.Save();
+            const int saved = (int)GetPrivateProfileIntW(L"OzMaker", L"ExportPreset", -9, Settings::FilePath().c_str());
+            const std::wstring gifName = ExportName(Format::Gif), webpName = ExportName(Format::WebP);
+            const bool named = gifName.rfind(L"selftest_alpha_trim", 0) == 0 && webpName.rfind(L"selftest_alpha", 0) == 0 &&
+                               webpName.find(L"_trim") == std::wstring::npos;
+            CloseClip();
+            const bool back = settings_.exportPreset == 2 && !settings_.recordingAnim;
+            const bool ok = own && saved == 2 && named && back;
+            log(util::Format(L"opened 움짤 in the editor: %s own format at 고화질 %d, recordings' 화질 saved %d, back %d, "
+                             L"names %s %s",
+                             ok ? L"ok" : L"FAIL", own, saved, back, gifName.c_str(), webpName.c_str()));
+            if (!ok) ++failures;
+            StopThumbnails();
+            settings_ = was;
+            settings_.Save();
+        } else {
+            log(L"opened 움짤 in the editor: FAIL " + err);
+            ++failures;
+        }
+    }
+    // WebM sound (#40): one second of 30 fps video with 44.1 kHz sound, which goes to Opus at 48 kHz. Read back, every
+    // frame is in order, the tone still steps from 440 to 880 Hz at 0.500 s, and the sound lasts as long as it did.
+    if (FormatAvailable(Format::WebM) && WebmReaderBuilt()) {
+        const int ww = 192, wh = 128, wn = 30;
+        WebmWriter::Config wcfg;
+        wcfg.width = ww;
+        wcfg.height = wh;
+        wcfg.fps = 30;
+        wcfg.audio = true;
+        wcfg.sampleRate = 44100;
+        const std::wstring wpath = dir + L"\\selftest_sound.webm";
+        WebmWriter w;
+        std::wstring werr;
+        bool ok = w.Open(wpath, wcfg, werr);
+        std::vector<uint8_t> px((size_t)ww * wh * 4);
+        std::vector<int16_t> pcm(1470 * 2);  // one frame's sound
+        for (int i = 0; ok && i < wn; ++i) {
+            DrawIndexed(px.data(), ww, wh, i, i / 30.0);
+            ok = w.AddVideo(px.data(), werr);
+            for (int k = 0; k < 1470; ++k) {
+                const double t = (i * 1470 + k) / 44100.0;
+                pcm[k * 2] = pcm[k * 2 + 1] = (int16_t)(12000 * std::sin(2 * 3.14159265358979 * (t < 0.5 ? 440 : 880) * t));
+            }
+            w.PushAudio(pcm.data(), 1470);
+        }
+        ok = ok && w.Finish(werr);
+        WebmContents wc = ok ? ReadWebm(wpath) : WebmContents{};
+        int wrong = 0;
+        for (size_t i = 0; i < wc.indexes.size(); ++i) wrong += wc.indexes[i] != (int)i;
+        const double step = ToneSwitch(wc.audio, 48000, 0.1, 440, 880), len = wc.audio.size() / 2 / 48000.0;
+        ok = ok && wc.ok && wc.indexes.size() == (size_t)wn && !wrong && std::fabs(step - 0.5) < 0.02 &&
+             std::fabs(len - 1.0) < 0.005;
+        log(util::Format(L"WebM sound: %s %zu frames (%d out of place), 440->880 at %.3fs (0.500), %.4fs of sound, "
+                         L"%.2fs long %s",
+                         ok ? L"ok" : L"FAIL", wc.indexes.size(), wrong, step, len, wc.seconds,
+                         (wc.err.empty() ? werr : wc.err).c_str()));
+        if (!ok) ++failures;
     }
     // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
     // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
@@ -1035,10 +1269,10 @@ int App::RunSelfTest(const std::wstring& dir) {
             if (!good) ++failures;
         }
         // Files dragged over the window (OLE, as Explorer drags them): the whole window says what a drop would do,
-        // the preview included. Only a video drops, and it opens once the drop has returned (WM_APP_OPEN).
+        // the preview included. A video or a 움짤 (#41) drops, and opens once the drop has returned (WM_APP_OPEN).
         {
-            std::wstring mp4 = dir + L"\\끌어오기.mp4", gif = dir + L"\\끌어오기.gif";
-            for (const std::wstring& f : {mp4, gif}) {
+            std::wstring mp4 = dir + L"\\끌어오기.mp4", gif = dir + L"\\끌어오기.gif", txt = dir + L"\\끌어오기.txt";
+            for (const std::wstring& f : {mp4, gif, txt}) {
                 HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
                 if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
             }
@@ -1051,19 +1285,26 @@ int App::RunSelfTest(const std::wstring& dir) {
             };
             const DWORD all = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
             DWORD effect = all;
-            auto gifData = dataFor(gif), mp4Data = dataFor(mp4);
+            auto gifData = dataFor(gif), mp4Data = dataFor(mp4), txtData = dataFor(txt);
             auto target = MakeDropTarget();  // what CreateMainWindow registers (this test has no main window)
-            bool ok = gifData && mp4Data;
-            if (ok) ok = SUCCEEDED(target->DragEnter(gifData.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
-                         dragKind_ == DragKind::Anim && effect == DROPEFFECT_NONE;
-            const std::wstring gifEnter = util::Format(L"data %d/%d, GIF kind %d effect %lu", !!gifData, !!mp4Data,
-                                                       (int)dragKind_, effect);
+            bool ok = gifData && mp4Data && txtData;
+            if (ok) ok = SUCCEEDED(target->DragEnter(txtData.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
+                         dragKind_ == DragKind::Other && effect == DROPEFFECT_NONE;
+            const std::wstring txtEnter = util::Format(L"data %d/%d/%d, text kind %d effect %lu", !!gifData, !!mp4Data,
+                                                       !!txtData, (int)dragKind_, effect);
             frames(3);
-            const bool gifShown = ui_.LayerErrors() == 0 &&
+            const bool txtShown = ui_.LayerErrors() == 0 &&
                                   std::any_of(ui_.Floats().begin(), ui_.Floats().end(),
                                               [](const Rect& f) { return f.W() >= 1120 && f.H() >= 780; });
             target->DragLeave();
             const bool left = dragKind_ == DragKind::None;
+            effect = all;
+            if (ok) ok = SUCCEEDED(target->DragEnter(gifData.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
+                         dragKind_ == DragKind::Anim && effect == DROPEFFECT_COPY;
+            effect = all;
+            if (ok) ok = SUCCEEDED(target->Drop(gifData.Get(), MK_LBUTTON, {0, 0}, &effect));
+            const bool gifDropped = ok && effect == DROPEFFECT_COPY && pendingOpen_ == gif;
+            pendingOpen_.clear();  // an empty stand-in, not a 움짤
             effect = all;
             if (ok) ok = SUCCEEDED(target->DragEnter(mp4Data.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
                          dragKind_ == DragKind::Video && effect == DROPEFFECT_COPY && dragName_ == L"끌어오기.mp4";
@@ -1075,14 +1316,15 @@ int App::RunSelfTest(const std::wstring& dir) {
             if (ok) ok = SUCCEEDED(target->Drop(mp4Data.Get(), MK_LBUTTON, {0, 0}, &effect));
             const bool dropped = ok && effect == DROPEFFECT_COPY && dragKind_ == DragKind::None && pendingOpen_ == mp4;
             pendingOpen_.clear();  // an empty stand-in, not a video: nothing for WM_APP_OPEN to open
-            good = ok && gifShown && left && clean && uncovered == 0 && dropped;
-            log(util::Format(L"drag over the window: %s GIF refused with a cue %d, cue gone on leave %d, video cue over "
-                             L"the preview (%zu parts left) %d, the drop opens it afterwards %d%s",
-                             good ? L"ok" : L"FAIL", gifShown, left, uncovered, clean, dropped,
-                             good ? L"" : (L" (" + gifEnter + L")").c_str()));
+            good = ok && txtShown && left && gifDropped && clean && uncovered == 0 && dropped;
+            log(util::Format(L"drag over the window: %s text refused with a cue %d, cue gone on leave %d, GIF dropped "
+                             L"%d, video cue over the preview (%zu parts left) %d, the drop opens it afterwards %d%s",
+                             good ? L"ok" : L"FAIL", txtShown, left, gifDropped, uncovered, clean, dropped,
+                             good ? L"" : (L" (" + txtEnter + L")").c_str()));
             if (!good) ++failures;
             DeleteFileW(mp4.c_str());
             DeleteFileW(gif.c_str());
+            DeleteFileW(txt.c_str());
         }
         // A failure (an Alert) stays until it is closed, in a float like any toast. Its button opens the settings
         // tab that fixes it; a plain toast still goes by itself.
@@ -2676,6 +2918,26 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         shot(L"settings_video_hevc.png", 96);
         hevcForTest_ = -1;
         settings_.vCodec = codecWas;
+        // 비트레이트 (#53): 직접 입력 at 12.5 Mbps, its list open, then 200 typed and the field let go: it becomes
+        // 150 Mbps and the line under the row says so.
+        settings_.vBitrateIdx = kVideoBitrateCustom;
+        settings_.vBitrateKbps = 12500;
+        shot(L"settings_video_bitrate.png", 96);
+        menu_ = {};
+        menu_.owner = HashId("set.vbr");
+        shot(L"settings_video_bitrate_menu.png", 96);
+        menu_ = {};
+        brText_ = L"200";
+        brTypingWas_ = true;
+        shot(L"settings_video_bitrate_note.png", 96);
+        brNote_.clear();
+        settings_.vBitrateIdx = 0;
+        settings_.vBitrateKbps = 20000;
+        // 일반 › 언어, its list open: drawn like the rest of the app, not a Windows menu.
+        settings_.settingsTab = kTabGeneral;
+        menu_.owner = HashId("set.language");
+        shot(L"settings_language_menu.png", 96);
+        menu_ = {};
     }
     {
         // 설정 › 녹화 with 0.6.5's rows: the record timer on 직접 입력 (3시간 20분, stopping), 작업 표시줄로 최소화
@@ -2779,6 +3041,13 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     fmt_ = (int)Format::Mp4;  // MP4: the same preset gives other values; 인코딩 instead of 품질
     settings_.ApplyPreset(settings_.exportPreset = 1, true);
     shot(L"editor_mp4.png", 96);
+    // WebM (#40): chosen on the second row, its 품질 and the VP9 line; under 용량 맞추기, the bitrate instead.
+    fmt_ = (int)Format::WebM;
+    shot(L"editor_webm.png", 96);
+    settings_.targetIdx = 2;
+    shot(L"editor_webm_target.png", 96);
+    settings_.targetIdx = 0;
+    fitBitrate_ = 0;
     fmt_ = (int)Format::Gif;
     settings_.exportDetails = false;
     settings_.ApplyPreset(settings_.exportPreset = 1, false);
@@ -2903,6 +3172,52 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         CloseClip();
     } else {
         log(L"editor_mp4_copy.png: skipped, no test video (" + err + L")");
+    }
+    {
+        // An opened 움짤 file with see-through parts (#41): its own format, the file bar, the checkerboard under it;
+        // as MP4, white.
+        const int sw = 240, sh = 160, sn = 24;
+        auto store = std::make_shared<FrameStore>();
+        std::wstring err;
+        bool made = store->Open(sw, sh, err, false);
+        for (int i = 0; made && i < sn; ++i) {
+            auto buf = store->Acquire();
+            DrawSticker(buf->data(), sw, sh, i / (double)sn);
+            made = store->Submit(buf, (int64_t)(i * 1e7 / 12), true);
+        }
+        store->Finish((int64_t)(sn * 1e7 / 12));
+        const Format f = FormatAvailable(Format::WebP) ? Format::WebP : Format::Gif;
+        ExportJob job;
+        job.clip = std::make_shared<AlphaClip>(store);
+        job.last = sn - 1;
+        job.crop = {0, 0, sw, sh};
+        job.outW = sw;
+        job.outH = sh;
+        job.format = f;
+        job.quality = 90;
+        job.path = dir + L"\\스티커." + FormatExt(f);
+        Exporter ex;
+        std::atomic<bool> cancel{false};
+        std::atomic<float> progress{0};
+        auto anim = made && ExportSync(ex, job).ok ? AnimClip::Open(job.path, cancel, progress, err) : nullptr;
+        if (anim) {
+            OpenEditor(anim);
+            if (thumbThread_.joinable()) thumbThread_.join();
+            thumbs_.clear();
+            for (auto& px : thumbPixels_) thumbs_.push_back(gfx_.CreateBitmap(thumbW_, thumbH_, px.data(), thumbW_ * 4));
+            playing_ = false;
+            playhead_ = 6;
+            estBytes_ = EstimateBytes(MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[fmt_]), cancel);
+            estKey_ = EstimateKey();
+            estValid_ = true;
+            shot(L"editor_anim.png", 96);
+            fmt_ = (int)Format::Mp4;
+            shot(L"editor_anim_mp4.png", 96);
+            CloseClip();
+        } else {
+            log(L"editor_anim.png: skipped (" + err + L")");
+        }
+        DeleteFileW(job.path.c_str());
     }
     screen_ = Screen::Home;
     keep.reset();
@@ -3964,6 +4279,125 @@ std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double secon
     return out;
 }
 
+#if __has_include(<mkvparser/mkvparser.h>) && __has_include(<vpx/vp8dx.h>) && __has_include(<opus/opus.h>) && \
+    __has_include(<libyuv.h>)
+class WebmFile : public mkvparser::IMkvReader {
+public:
+    explicit WebmFile(FILE* f) : f_(f) {
+        _fseeki64(f_, 0, SEEK_END);
+        size_ = _ftelli64(f_);
+    }
+    int Read(long long pos, long len, unsigned char* buf) override {
+        if (pos < 0 || len < 0 || pos + len > size_) return -1;
+        _fseeki64(f_, pos, SEEK_SET);
+        return fread(buf, 1, len, f_) == (size_t)len ? 0 : -1;
+    }
+    int Length(long long* total, long long* available) override {
+        if (total) *total = size_;
+        if (available) *available = size_;
+        return 0;
+    }
+
+private:
+    FILE* f_;
+    long long size_ = 0;
+};
+
+bool WebmReaderBuilt() { return true; }
+
+WebmContents ReadWebm(const std::wstring& path) {
+    WebmContents c;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") || !f) {
+        c.err = L"can't open";
+        return c;
+    }
+    WebmFile file(f);
+    long long pos = 0;
+    mkvparser::EBMLHeader ebml;
+    mkvparser::Segment* raw = nullptr;
+    if (ebml.Parse(&file, pos) < 0 || !ebml.m_docType || strcmp(ebml.m_docType, "webm") != 0 ||
+        mkvparser::Segment::CreateInstance(&file, pos, raw) != 0 || !raw) {
+        fclose(f);
+        c.err = L"not a WebM file";
+        return c;
+    }
+    std::unique_ptr<mkvparser::Segment> seg(raw);
+    vpx_codec_ctx_t vpx{};
+    vpx_codec_dec_cfg_t cfg{1, 0, 0};
+    int oerr = 0;
+    OpusDecoder* opus = opus_decoder_create(48000, 2, &oerr);
+    long long videoNum = -1, audioNum = -1;
+    size_t preSkip = 0;
+    if (seg->Load() < 0 || vpx_codec_dec_init(&vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK || !opus) {
+        c.err = L"can't load it";
+    } else {
+        c.seconds = seg->GetInfo()->GetDuration() / 1e9;
+        const mkvparser::Tracks* tracks = seg->GetTracks();
+        for (unsigned long i = 0; i < tracks->GetTracksCount(); ++i) {
+            const mkvparser::Track* t = tracks->GetTrackByIndex(i);
+            if (!t || !t->GetCodecId()) continue;
+            if (t->GetType() == mkvparser::Track::kVideo && strcmp(t->GetCodecId(), "V_VP9") == 0) {
+                videoNum = t->GetNumber();
+                c.width = (int)static_cast<const mkvparser::VideoTrack*>(t)->GetWidth();
+                c.height = (int)static_cast<const mkvparser::VideoTrack*>(t)->GetHeight();
+            } else if (t->GetType() == mkvparser::Track::kAudio && strcmp(t->GetCodecId(), "A_OPUS") == 0) {
+                audioNum = t->GetNumber();
+                size_t n = 0;
+                const unsigned char* head = t->GetCodecPrivate(n);
+                if (head && n >= 12) preSkip = head[10] | head[11] << 8;  // OpusHead
+            }
+        }
+        std::vector<unsigned char> buf;
+        std::vector<int16_t> pcm(5760 * 2);
+        std::vector<uint8_t> bgra;
+        c.ok = videoNum >= 0;
+        for (const mkvparser::Cluster* cl = seg->GetFirst(); c.ok && cl && !cl->EOS(); cl = seg->GetNext(cl)) {
+            const mkvparser::BlockEntry* be = nullptr;
+            if (cl->GetFirst(be) < 0) break;
+            while (c.ok && be && !be->EOS()) {
+                const mkvparser::Block* b = be->GetBlock();
+                for (int k = 0; c.ok && k < b->GetFrameCount(); ++k) {
+                    const mkvparser::Block::Frame& fr = b->GetFrame(k);
+                    buf.resize((size_t)fr.len);
+                    if (fr.Read(&file, buf.data()) < 0) {
+                        c.ok = false;
+                        c.err = L"can't read a block";
+                    } else if (b->GetTrackNumber() == videoNum) {
+                        if (vpx_codec_decode(&vpx, buf.data(), (unsigned)buf.size(), nullptr, 0) != VPX_CODEC_OK) {
+                            c.ok = false;
+                            c.err = L"VP9 decoding failed";
+                        }
+                        vpx_codec_iter_t it = nullptr;
+                        while (vpx_image_t* img = vpx_codec_get_frame(&vpx, &it)) {
+                            const int w = (int)img->d_w, h = (int)img->d_h;
+                            bgra.resize((size_t)w * h * 4);
+                            libyuv::I420ToARGB(img->planes[0], img->stride[0], img->planes[1], img->stride[1],
+                                               img->planes[2], img->stride[2], bgra.data(), w * 4, w, h);
+                            c.indexes.push_back(ReadIndex(bgra.data(), w, h));
+                            if (c.first.empty()) c.first = bgra;
+                        }
+                    } else if (b->GetTrackNumber() == audioNum) {
+                        int n = opus_decode(opus, buf.data(), (opus_int32)buf.size(), pcm.data(), 5760, 0);
+                        n -= (int)std::min<long long>(n, b->GetDiscardPadding() * 48000 / 1'000'000'000);
+                        if (n > 0) c.audio.insert(c.audio.end(), pcm.begin(), pcm.begin() + n * 2);
+                    }
+                }
+                if (cl->GetNext(be, be) < 0) break;
+            }
+        }
+        c.audio.erase(c.audio.begin(), c.audio.begin() + std::min(c.audio.size(), preSkip * 2));
+    }
+    vpx_codec_destroy(&vpx);
+    if (opus) opus_decoder_destroy(opus);
+    fclose(f);
+    return c;
+}
+#else
+bool WebmReaderBuilt() { return false; }
+WebmContents ReadWebm(const std::wstring&) { return {}; }
+#endif
+
 }  // namespace
 
 int App::RunVideoTest(const std::wstring& dir, int W, int H) {
@@ -4132,6 +4566,34 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
                                e1, e2, (sw1 - e1) * 1000));
         }
     }
+    // The same trim as WebM (#40), read back with libwebm: every frame in order, the sound where it was.
+    if (FormatAvailable(Format::WebM) && WebmReaderBuilt()) {
+        ExportJob job;
+        job.clip = clip;
+        job.first = 37;
+        job.last = 150;
+        job.crop = {0, 0, W, H};
+        job.outW = W;
+        job.outH = H;
+        job.fpsLimit = fps;
+        job.format = Format::WebM;
+        job.quality = 70;
+        job.audio.enabled = true;
+        job.path = dir + L"\\vt_trim.webm";
+        t0 = util::NowSeconds();
+        ExportResult r = ExportSync(ex, job);
+        WebmContents wc = r.ok ? ReadWebm(job.path) : WebmContents{};
+        int bad = 0;
+        for (size_t k = 0; k < wc.indexes.size(); ++k) bad += wc.indexes[k] != 37 + (int)k;
+        double sw1 = ToneSwitch(wc.audio, 48000, 0.05, 440, 880), sw2 = ToneSwitch(wc.audio, 48000, sw1 + 0.2, 880, 1320);
+        double e1 = srcSwitch - clip->Ts(37) / 1e7, e2 = e1 + 1.0;
+        check(r.ok && r.audio && wc.ok && wc.indexes.size() == 114 && bad == 0 && std::fabs(sw1 - e1) < 0.03 &&
+                  std::fabs(sw2 - e2) < 0.03,
+              util::Format(L"WebM trim: %zu frames, %d out of place, audio %d, switches at %.3f / %.3f s, expected "
+                           L"%.3f / %.3f, %s, %.0f ms %s",
+                           wc.indexes.size(), bad, r.audio, sw1, sw2, e1, e2, util::FormatBytes(r.bytes).c_str(),
+                           (util::NowSeconds() - t0) * 1000, (r.error + wc.err).c_str()));
+    }
     // Cropped, half size, 2x speed at 30 fps: no sound, every 4th source frame.
     {
         ExportJob job;
@@ -4264,6 +4726,14 @@ int App::RunEncoderTest(const std::wstring& dir) {
         {L"no sound", [](VideoConfig&, bool& sound) { sound = false; }},
         {L"not fragmented", [](VideoConfig& v, bool&) { v.fragmented = false; }},
         {L"software only", [](VideoConfig& v, bool&) { v.hardware = false; }},
+        // 설정 › 동영상 › 비트레이트 직접 입력 (#53): its ends.
+        {L"150 Mbps (the custom maximum)", [](VideoConfig& v, bool&) { v.bitrate = kVideoBitrateMaxKbps * 1000u; }},
+        {L"H.264 VBR 150 Mbps",
+         [](VideoConfig& v, bool&) { v.hevc = v.cbr = false, v.bitrate = kVideoBitrateMaxKbps * 1000u; }},
+        {L"H.264 0.5 Mbps (the custom minimum)",
+         [](VideoConfig& v, bool&) { v.hevc = false, v.bitrate = kVideoBitrateMinKbps * 1000u; }},
+        {L"software H.264 150 Mbps",
+         [](VideoConfig& v, bool&) { v.hevc = v.hardware = false, v.bitrate = kVideoBitrateMaxKbps * 1000u; }},
     };
     int failures = 0;
     for (const auto& [name, change] : cases) {
@@ -4272,9 +4742,10 @@ int App::RunEncoderTest(const std::wstring& dir) {
         change(v, sound);
         std::wstring err, got;
         const bool ok = ProbeMp4(dir + L"\\probe.mp4", v, sound, err, got);
-        log(util::Format(L"%s: %s · %s %dx%d %s, keyframes %d · %s", name, ok ? L"ok" : L"FAIL",
-                         v.hevc ? L"HEVC" : L"H.264", v.width, v.height, v.cbr ? L"CBR" : L"VBR", v.gopFrames,
-                         (ok ? got : err + L" · " + got).c_str()));
+        const std::wstring rate = v.bitrate ? util::Format(L"%.1f Mbps", v.bitrate / 1e6) : L"auto";
+        log(util::Format(L"%s: %s · %s %dx%d %s %s, keyframes %d · %s", name, ok ? L"ok" : L"FAIL",
+                         v.hevc ? L"HEVC" : L"H.264", v.width, v.height, v.cbr ? L"CBR" : L"VBR", rate.c_str(),
+                         v.gopFrames, (ok ? got : err + L" · " + got).c_str()));
         if (!ok) ++failures;
     }
     DeleteFileW((dir + L"\\probe.mp4").c_str());

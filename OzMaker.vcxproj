@@ -27,7 +27,8 @@
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
     <WholeProgramOptimization>true</WholeProgramOptimization>
   </PropertyGroup>
-  <!-- vcpkg (optional): provides libwebp / libavif. Without it WebP and AVIF export are left out. -->
+  <!-- vcpkg (optional): provides libwebp, libavif, libvpx, Opus and libwebm. Without it WebP, AVIF and WebM are left
+       out. -->
   <PropertyGroup Label="Vcpkg">
     <OzVcpkgRoot Condition="'$(VCPKG_ROOT)' != ''">$(VCPKG_ROOT)</OzVcpkgRoot>
     <OzVcpkgRoot Condition="'$(OzVcpkgRoot)' == ''">$(MSBuildThisFileDirectory)..\vcpkg</OzVcpkgRoot>
@@ -56,6 +57,8 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- libwebm's headers include each other from its own folder. -->
+      <AdditionalIncludeDirectories Condition="'$(OzUseVcpkg)' == 'true'">%(AdditionalIncludeDirectories);$(_ZVcpkgCurrentInstalledDir)include\webm</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -101,6 +104,7 @@
     <ClCompile Include="src\App.cpp" />
     <ClCompile Include="src\AudioCapture.cpp" />
     <ClCompile Include="src\AudioPreview.cpp" />
+    <ClCompile Include="src\AnimClip.cpp" />
     <ClCompile Include="src\Clip.cpp" />
     <ClCompile Include="src\Crash.cpp" />
     <ClCompile Include="src\VideoClip.cpp" />
@@ -124,6 +128,7 @@
     <ClCompile Include="src\Ui.cpp" />
     <ClCompile Include="src\Updater.cpp" />
     <ClCompile Include="src\Util.cpp" />
+    <ClCompile Include="src\WebmWriter.cpp" />
     <ClCompile Include="src\WindowList.cpp" />
     <ClCompile Include="src\encoders\Encoder.cpp" />
     <ClCompile Include="src\encoders\GifEncoder.cpp" />
@@ -136,6 +141,7 @@
     <ClInclude Include="src\App.h" />
     <ClInclude Include="src\AudioCapture.h" />
     <ClInclude Include="src\AudioPreview.h" />
+    <ClInclude Include="src\AnimClip.h" />
     <ClInclude Include="src\Clip.h" />
     <ClInclude Include="src\Crash.h" />
     <ClInclude Include="src\VideoClip.h" />
@@ -159,6 +165,7 @@
     <ClInclude Include="src\Updater.h" />
     <ClInclude Include="src\Version.h" />
     <ClInclude Include="src\Util.h" />
+    <ClInclude Include="src\WebmWriter.h" />
     <ClInclude Include="src\WindowList.h" />
     <ClInclude Include="src\encoders\Encoder.h" />
     <ClInclude Include="res\resource.h" />

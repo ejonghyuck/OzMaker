@@ -62,7 +62,7 @@ jobs:
 
       - name: Self-test
         shell: pwsh
-        run: ./tools/ci-selftest.ps1 -Require GIF,WebP,AVIF
+        run: ./tools/ci-selftest.ps1 -Require GIF,WebP,AVIF,WebM
 
       - name: Package
         shell: pwsh

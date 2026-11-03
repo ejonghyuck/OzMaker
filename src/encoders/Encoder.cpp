@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "encoders/Encoder.h"
 #include "Mp4Writer.h"
+#include "WebmWriter.h"
 
 std::unique_ptr<IEncoder> CreateEncoder(Format f) {
     switch (f) {
@@ -17,6 +18,7 @@ bool FormatAvailable(Format f) {
             !Mp4Writer::FindEncoder(false, false).empty() || !Mp4Writer::FindEncoder(false, true).empty();
         return mp4;
     }
+    if (f == Format::WebM) return WebmWriter::Available();
     return CreateEncoder(f) != nullptr;
 }
 
@@ -26,6 +28,7 @@ const wchar_t* FormatName(Format f) {
         case Format::WebP: return L"WebP";
         case Format::Avif: return L"AVIF";
         case Format::Mp4: return L"MP4";
+        case Format::WebM: return L"WebM";
         default: return L"";
     }
 }
@@ -36,11 +39,12 @@ const wchar_t* FormatExt(Format f) {
         case Format::WebP: return L"webp";
         case Format::Avif: return L"avif";
         case Format::Mp4: return L"mp4";
+        case Format::WebM: return L"webm";
         default: return L"";
     }
 }
 
-double FormatMaxFps(Format f) { return f == Format::Gif ? 50.0 : f == Format::Mp4 ? 120.0 : 60.0; }
+double FormatMaxFps(Format f) { return f == Format::Gif ? 50.0 : IsVideoFormat(f) ? 120.0 : 60.0; }
 
 bool WriteWholeFile(const std::wstring& path, const void* data, size_t size) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

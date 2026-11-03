@@ -108,6 +108,7 @@ void Overlay::Blend(uint8_t* bgra) const {
             d[0] = (uint8_t)(s[0] + (d[0] * k + 127) / 255);
             d[1] = (uint8_t)(s[1] + (d[1] * k + 127) / 255);
             d[2] = (uint8_t)(s[2] + (d[2] * k + 127) / 255);
+            d[3] = (uint8_t)(a + (d[3] * k + 127) / 255);  // over a transparent part of an opened 움짤 too
         }
     }
 }

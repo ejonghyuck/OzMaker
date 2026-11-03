@@ -16,6 +16,7 @@ public:
     bool Begin(const EncoderParams& p, std::wstring& err) override {
         w_ = p.width;
         h_ = p.height;
+        alpha_ = p.alpha;
         path_ = p.path;
         WebPAnimEncoderOptions ao;
         if (!WebPAnimEncoderOptionsInit(&ao)) return Fail(err, L"libwebp 버전이 맞지 않습니다.");
@@ -45,7 +46,7 @@ public:
         pic.width = w_;
         pic.height = h_;
         pic.use_argb = 1;
-        bool ok = WebPPictureImportBGRX(&pic, bgra, w_ * 4) &&
+        bool ok = (alpha_ ? WebPPictureImportBGRA(&pic, bgra, w_ * 4) : WebPPictureImportBGRX(&pic, bgra, w_ * 4)) &&
                   WebPAnimEncoderAdd(enc_, &pic, (int)std::llround(t_), &cfg_);
         WebPPictureFree(&pic);
         t_ += std::max(1.0, durationMs);
@@ -80,6 +81,7 @@ private:
     WebPAnimEncoder* enc_ = nullptr;
     WebPConfig cfg_{};
     int w_ = 0, h_ = 0;
+    bool alpha_ = false;
     double t_ = 0;
     std::wstring path_;
 };

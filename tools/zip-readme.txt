@@ -1,5 +1,5 @@
 OzMaker {version}
-게임·프로그램 화면을 움짤(GIF · WebP · AVIF)과 MP4로 만드는 Windows 녹화 도구
+게임·프로그램 화면을 움짤(GIF · WebP · AVIF)과 동영상(MP4 · WebM)으로 만드는 Windows 녹화 도구
 
 ■ 실행
   OzMaker.exe를 실행하면 됩니다. 설치는 없습니다.

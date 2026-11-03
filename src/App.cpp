@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "AnimClip.h"
 #include "Crash.h"
 #include "Mp4Cut.h"
 #include "Resize.h"
@@ -181,7 +182,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
 // ---------------------------------------------------------------- drag and drop
 
 // The first of the files dragged over the window. While they are over it, the whole window says what dropping them
-// would do (DrawDropCue); only a video can be dropped.
+// would do (DrawDropCue); a video or a 움짤 can be dropped.
 class App::DropTarget : public IDropTarget {
 public:
     explicit DropTarget(App* app) : app_(app) {}
@@ -216,7 +217,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
         if (!path_.empty()) app_->dragKind_ = app_->ClassifyDrop(path_);  // a recording may have started meanwhile
-        *effect = app_->dragKind_ == DragKind::Video ? (*effect & DROPEFFECT_COPY) : DROPEFFECT_NONE;
+        *effect = app_->DragOpens() ? (*effect & DROPEFFECT_COPY) : DROPEFFECT_NONE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override {
@@ -226,7 +227,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Drop(IDataObject*, DWORD, POINTL, DWORD* effect) override {
-        const bool open = app_->dragKind_ == DragKind::Video;
+        const bool open = app_->DragOpens();
         DragLeave();
         *effect = open ? DROPEFFECT_COPY : DROPEFFECT_NONE;
         // After DoDragDrop returns in the program the file came from: Explorer stays usable while it opens.
@@ -800,6 +801,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     micLevelAt_ = now;
                     Invalidate();
                 }
+            } else if (w == kTimerAnimLoad) {
+                if (animLoad_ && !animLoad_->done) ShowAnimProgress();
             } else if (w == kTimerUpdate) {
                 SetTimer(hwnd_, kTimerUpdate, 3600 * 1000, nullptr);  // from now on hourly: a check is due daily
                 CheckForUpdate();
@@ -860,6 +863,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_APP_EXPORT_DONE:
             OnExportDone();
+            return 0;
+        case WM_APP_ANIM_LOADED:
+            OnAnimLoaded();
             return 0;
         case WM_APP_ESTIMATE:
             OnEstimate();
@@ -929,6 +935,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             RememberPlacement();
             overlay_.Hide();
             exporter_.Cancel();
+            animLoad_.reset();  // stops and waits for it
             StopThumbnails();
             audioPreview_.Stop();
             fetcher_.Stop();
@@ -1663,8 +1670,8 @@ std::wstring App::VideoSummary(bool hevc, bool bigHevc) const {
     } else {
         s += tr(L" · CPU 인코딩");
     }
-    int mbps = kVideoBitrateOptions[settings_.vBitrateIdx];
-    s += mbps ? util::Format(L" · %d Mbps", mbps) : tr(L" · 자동 화질");
+    const UINT32 bps = settings_.VideoBitrate();
+    s += bps ? L" · " + MbpsText((int)(bps / 1000)) + L" Mbps" : std::wstring(tr(L" · 자동 화질"));
     return s;
 }
 
@@ -1685,34 +1692,21 @@ std::wstring App::MicDeviceName() const {
     return settings_.micDevice.empty() ? tr(L"기본 장치") : tr(L"연결되지 않은 장치");
 }
 
-// The input devices as a native menu under `anchor` (DIPs): Windows' default, then each by name.
-bool App::MicMenu(const Rect& anchor) {
-    if (!testWindowsOnly_) micDevices_ = AudioCapture::InputDevices();
-    auto escape = [](std::wstring s) {
-        for (size_t i = 0; (i = s.find(L'&', i)) != std::wstring::npos; i += 2) s.insert(i, 1, L'&');
-        return s;
-    };
-    HMENU menu = CreatePopupMenu();
+// The input devices for the 마이크 장치 list: Windows' default, then each by name.
+std::vector<MenuItem> App::MicItems() {
+    std::vector<MenuItem> items;
     std::wstring def = tr(L"Windows 기본 장치");
     for (const auto& d : micDevices_)
         if (d.isDefault) def += L" (" + d.name + L")";
-    AppendMenuW(menu, MF_STRING | (settings_.micDevice.empty() ? MF_CHECKED : 0), 1, escape(def).c_str());
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    for (size_t i = 0; i < micDevices_.size(); ++i)
-        AppendMenuW(menu, MF_STRING | (micDevices_[i].id == settings_.micDevice ? MF_CHECKED : 0), 100 + (UINT)i,
-                    escape(micDevices_[i].name).c_str());
-    if (micDevices_.empty()) AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, tr(L"연결된 마이크가 없습니다"));
-    POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
-    ClientToScreen(hwnd_, &pt);
-    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
-                              nullptr);
-    DestroyMenu(menu);
-    std::wstring pick = settings_.micDevice;
-    if (cmd == 1) pick.clear();
-    if (cmd >= 100 && cmd - 100 < micDevices_.size()) pick = micDevices_[cmd - 100].id;
-    if (pick == settings_.micDevice) return false;
-    settings_.micDevice = pick;
-    return true;
+    items.push_back({def, 0});
+    for (size_t i = 0; i < micDevices_.size(); ++i) items.push_back({micDevices_[i].name, (int)i + 1, i == 0});
+    if (micDevices_.empty()) items.push_back({tr(L"연결된 마이크가 없습니다"), -2, true, false});
+    return items;
+}
+
+std::wstring App::MbpsText(int kbps) {
+    kbps = (kbps + 50) / 100 * 100;
+    return kbps % 1000 ? util::Format(L"%d.%d", kbps / 1000, kbps % 1000 / 100) : std::to_wstring(kbps / 1000);
 }
 
 // Each language by its own name; "System" says which one Windows gives.
@@ -1724,23 +1718,6 @@ std::wstring App::LanguageName(int choice) const {
             return util::Format(tr(L"시스템 (%s)"),
                                 LanguageName(SystemLanguage() == Lang::Korean ? kLangKorean : kLangEnglish).c_str());
     }
-}
-
-// The languages as a native menu under `anchor` (DIPs), like MicMenu.
-bool App::LanguageMenu(const Rect& anchor) {
-    HMENU menu = CreatePopupMenu();
-    for (int i : {kLangSystem, kLangKorean, kLangEnglish}) {
-        AppendMenuW(menu, MF_STRING | (settings_.language == i ? MF_CHECKED : 0), 1 + i, LanguageName(i).c_str());
-        if (i == kLangSystem) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    }
-    POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
-    ClientToScreen(hwnd_, &pt);
-    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
-                              nullptr);
-    DestroyMenu(menu);
-    if (!cmd || (int)cmd - 1 == settings_.language) return false;
-    settings_.language = (int)cmd - 1;
-    return true;
 }
 
 // ---------------------------------------------------------------- editor
@@ -1770,13 +1747,19 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     estValid_ = fitting_ = fitMissed_ = false;
     fitBitrate_ = 0;
     fitCorrection_ = 1;
-    // A video stays a video by default; a clip starts with the last 움짤 format.
-    bool video = !clip_->SourcePath().empty();
+    // A video stays a video by default, an opened 움짤 starts in its own format and at 고화질 (#41), a recording
+    // starts with the last 움짤 format.
+    const bool video = clip_->IsVideo();
+    auto* anim = dynamic_cast<const AnimClip*>(clip_.get());
     cutSource_ = video ? mp4::CutSource::Open(clip_->SourcePath()) : nullptr;
     if (cutSource_ && cutSource_->Frames() != clip_->Count()) cutSource_.reset();  // numbered differently: don't
-    fmt_ = video && FormatAvailable(Format::Mp4) ? (int)Format::Mp4 : settings_.format;
-    settings_.UseExportKind(fmt_ == (int)Format::Mp4);
-    if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
+    fmt_ = video && FormatAvailable(Format::Mp4)            ? (int)Format::Mp4
+           : anim && FormatAvailable(anim->FileFormat()) ? (int)anim->FileFormat()
+                                                           : settings_.format;
+    settings_.UseRecordingKnobs();  // a 움짤 file open before this one had its own
+    if (anim) settings_.UseFileKnobs();
+    settings_.UseExportKind(IsVideoFormat(fmt_));
+    if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, IsVideoFormat(fmt_));
     exportAudio_ = true;
     AttachReaders();
     screen_ = Screen::Editor;
@@ -1804,14 +1787,58 @@ void App::OpenMediaFile(const std::wstring& path) {
         Toast(tr(L"파일을 찾을 수 없습니다: ") + util::FileNameOf(path), true);
         return;
     }
-    if (util::IsAnimPath(path)) {
-        Toast(tr(L"움짤은 아직 열 수 없습니다. 동영상을 열어 주세요."), true);
+    animLoad_.reset();  // a file opened after it wins
+    KillTimer(hwnd_, kTimerAnimLoad);
+    if (util::IsAnimPath(path) || AnimClip::Sniff(path) != Format::Count) {
+        OpenAnimFile(path);
         return;
     }
     if (OpenVideo(path)) {
         AddRecent(path);
         Toast(tr(L"편집 탭에서 열었습니다: ") + util::FileNameOf(path));
     }
+}
+
+// A 움짤 decodes on a worker; the toast says how far it got, and the editor opens it once it is done.
+void App::OpenAnimFile(const std::wstring& path) {
+    animLoad_ = std::make_unique<AnimLoad>();
+    AnimLoad* l = animLoad_.get();
+    l->path = path;
+    l->thread = std::thread([l, hwnd = hwnd_] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // WIC
+        l->clip = AnimClip::Open(l->path, l->cancel, l->progress, l->err);
+        if (SUCCEEDED(co)) CoUninitialize();
+        l->done = true;
+        PostMessageW(hwnd, WM_APP_ANIM_LOADED, 0, 0);
+    });
+    SetTimer(hwnd_, kTimerAnimLoad, 150, nullptr);
+    ShowAnimProgress();
+}
+
+void App::ShowAnimProgress() {
+    Toast(util::Format(tr(L"여는 중… %d%% · %s"), (int)(animLoad_->progress * 100),
+                       util::FileNameOf(animLoad_->path).c_str()));
+}
+
+void App::OnAnimLoaded() {
+    if (!animLoad_ || !animLoad_->done) return;
+    KillTimer(hwnd_, kTimerAnimLoad);
+    auto l = std::move(animLoad_);
+    l->thread.join();
+    if (!l->clip) {
+        Toast(l->err, true);
+        return;
+    }
+    if (rec_ != RecState::Idle || exporter_.Busy()) {  // started while it decoded
+        Toast(tr(L"녹화나 내보내기가 끝난 뒤에 다시 열어 주세요: ") + util::FileNameOf(l->path), true);
+        return;
+    }
+    ShowMain(true);
+    filesOpen_ = false;
+    OpenEditor(l->clip);
+    AddRecent(l->path);
+    Toast(tr(L"편집 탭에서 열었습니다: ") + util::FileNameOf(l->path));
 }
 
 void App::BrowseForVideo() {
@@ -2005,6 +2032,7 @@ void App::CloseClip() {
     cutSource_.reset();
     frameBmp_.Reset();
     hasResult_ = resultOriginal_ = false;
+    settings_.UseRecordingKnobs();
     RefreshRecent();
     Invalidate();
 }
@@ -2212,18 +2240,18 @@ void App::RestartClock() {
     Invalidate();
 }
 
-bool App::PreviewBackwards() const { return fmt_ != (int)Format::Mp4 && settings_.directionIdx == 1; }
+bool App::PreviewBackwards() const { return !IsVideoFormat(fmt_) && settings_.directionIdx == 1; }
 
 void App::FollowDirection() {
     if (!clip_ || shuttle_) return;
-    const bool boomerang = fmt_ != (int)Format::Mp4 && settings_.directionIdx == 2;
+    const bool boomerang = !IsVideoFormat(fmt_) && settings_.directionIdx == 2;
     if (!boomerang) playBack_ = PreviewBackwards();
     RestartClock();
 }
 
 size_t App::PlayheadFromClock() {
     const double rate = PreviewRate();
-    const bool boomerang = !shuttle_ && fmt_ != (int)Format::Mp4 && settings_.directionIdx == 2;
+    const bool boomerang = !shuttle_ && !IsVideoFormat(fmt_) && settings_.directionIdx == 2;
     const bool once = kLoopOptions[settings_.loopIdx] == 1;
     int64_t start = clip_->Ts(inF_), end = RangeEndTs();
     int64_t len = std::max<int64_t>(1, end - start);
@@ -2309,7 +2337,7 @@ void App::OutputSize(int& w, int& h, int scaleIdx) const {
 
 double App::EffectiveOutFps(int outFpsIdx) const {
     double limit = kOutFpsOptions[outFpsIdx < 0 ? settings_.outFpsIdx : outFpsIdx];
-    if (fmt_ == (int)Format::Mp4) {
+    if (IsVideoFormat(fmt_)) {
         // Constant rate: the chosen one, or the source's own rounded up to a usual rate (29.4 -> 30).
         if (limit > 0) return limit;
         double avg = !clip_ ? 30.0 : clip_->NominalFps() > 0 ? clip_->NominalFps() : clip_->AverageFps();
@@ -2322,11 +2350,16 @@ double App::EffectiveOutFps(int outFpsIdx) const {
     return limit == 0 || limit > maxF ? maxF : limit;
 }
 
-// MP4 keeps the video's sound unless the speed changes (no time-stretching).
+// MP4 and WebM keep the video's sound unless the speed changes (no time-stretching).
 bool App::ExportAudio() const {
     auto* video = dynamic_cast<const VideoClip*>(clip_.get());
-    return fmt_ == (int)Format::Mp4 && exportAudio_ && video && video->HasAudio() && video->AudioExportable() &&
+    return IsVideoFormat(fmt_) && exportAudio_ && video && video->HasAudio() && video->AudioExportable() &&
            kSpeedOptions[settings_.speedIdx] == 1.0;
+}
+
+int App::ExportQuality() const {
+    if (fmt_ == (int)Format::WebM) return settings_.webmQuality;
+    return fmt_ < (int)Format::Mp4 ? settings_.quality[fmt_] : 0;
 }
 
 const wchar_t* App::CopyBlocker() const {
@@ -2345,7 +2378,7 @@ VideoConfig App::VideoSettings(int fps) const {
     v.fps = fps;
     v.hevc = UseHevc(0);  // HEVC when picked; 자동 goes by the size (PlannedSize, MakeJob)
     v.hardware = settings_.vHardware;
-    v.bitrate = (UINT32)kVideoBitrateOptions[settings_.vBitrateIdx] * 1'000'000u;
+    v.bitrate = settings_.VideoBitrate();
     v.cbr = settings_.vRateCtrl == 1;
     v.gopFrames = fps * kKeyframeOptions[settings_.vKeyIdx];
     v.qualityVsSpeed = kPresetOptions[settings_.vPresetIdx];
@@ -2406,8 +2439,11 @@ std::wstring App::ExportName(Format f) const {
     std::wstring stem = FileStem(clipName_);
     if (!src.empty()) {
         stem = util::FileNameOf(src);
-        if (size_t dot = stem.rfind(L'.'); dot != std::wstring::npos) stem.resize(dot);
-        if (f == Format::Mp4) stem += L"_trim";
+        const size_t dot = stem.rfind(L'.');
+        // A video saved as a video, or a 움짤 file in its own format: the same kind of file again, cut.
+        const bool same = dot != std::wstring::npos && _wcsicmp(stem.c_str() + dot + 1, ext.c_str()) == 0;
+        if (dot != std::wstring::npos) stem.resize(dot);
+        if (same || (clip_->IsVideo() && IsVideoFormat(f))) stem += L"_trim";
     }
     std::wstring name = stem + L"." + ext;
     for (int i = 2; GetFileAttributesW((settings_.outDir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
@@ -2437,12 +2473,13 @@ void App::StartExport(bool saveAs) {
         Toast(tr(L"편집 중인 원본 파일에는 덮어쓸 수 없습니다. 다른 이름을 고르세요."), true);
         return;
     }
-    ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, f == Format::Mp4 ? 0 : settings_.quality[fmt_]);
+    ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, ExportQuality());
     job.path = path;
     if (const wchar_t* why = CopyBlocker(); why && !*why) job.cut = cutSource_;
     settings_.Save();
     hasResult_ = resultOriginal_ = false;
     exportEstimate_ = estValid_ && estKey_ == EstimateKey() ? estBytes_ : 0;
+    exportStarted_ = util::NowSeconds();
     exporter_.Start(std::move(job), hwnd_, WM_APP_EXPORT_DONE);
     Invalidate();
 }
@@ -2485,7 +2522,7 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
     job.format = (Format)fmt_;
     job.plays = kLoopOptions[settings_.loopIdx];
     job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
-    job.direction = job.format == Format::Mp4 ? 0 : settings_.directionIdx;
+    job.direction = IsVideoFormat(job.format) ? 0 : settings_.directionIdx;
     job.caption = caption_;
     job.captionPos = captionPos_;
     if (job.format == Format::Mp4) {
@@ -2497,6 +2534,10 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
             job.outW = std::max(2, (int)std::lround(job.outW * fit) & ~1);
             job.outH = std::max(2, (int)std::lround(job.outH * fit) & ~1);
         }
+    } else if (job.format == Format::WebM) {
+        job.quality = quality;  // VP9 by quality (#40); a bitrate only to fit a size
+    }
+    if (IsVideoFormat(job.format)) {
         if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
         job.audio.enabled = ExportAudio();
         job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
@@ -2515,9 +2556,9 @@ std::wstring App::ContentKey() const {
 }
 
 std::wstring App::EstimateKey() const {
-    return ContentKey() + util::Format(L" %d %d %d %d %d %d %d %u %d %d", settings_.scaleIdx, settings_.outFpsIdx,
-                                       fmt_ < 3 ? settings_.quality[fmt_] : 0, settings_.holdLast, ExportAudio(),
-                                       settings_.vCodec, settings_.vBitrateIdx, fitBitrate_, settings_.aBitrateIdx,
+    return ContentKey() + util::Format(L" %d %d %d %d %d %d %u %u %d %d", settings_.scaleIdx, settings_.outFpsIdx,
+                                       ExportQuality(), settings_.holdLast, ExportAudio(),
+                                       settings_.vCodec, settings_.VideoBitrate(), fitBitrate_, settings_.aBitrateIdx,
                                        settings_.vFpsIdx);
 }
 
@@ -2539,14 +2580,14 @@ void App::UpdateEstimate() {
     }
     if (estDue_ > 0 && now >= estDue_) {
         estDue_ = 0;
-        estimator_.Start({MakeJob(settings_.scaleIdx, settings_.outFpsIdx, fmt_ < 3 ? settings_.quality[fmt_] : 0)}, 0,
+        estimator_.Start({MakeJob(settings_.scaleIdx, settings_.outFpsIdx, ExportQuality())}, 0,
                          ++estSerial_, hwnd_, WM_APP_ESTIMATE);
     } else if (estDue_ > 0) {
         RequestWake(estDue_);
     }
 }
 
-// Picks size, frame rate and quality (움짤) or the bitrate (MP4) so the export lands under the target. Starts from
+// Picks size, frame rate and quality (움짤) or the bitrate (MP4, WebM) so the export lands under the target. Starts from
 // the best and steps the three down in turns, so none of them drops all the way first.
 void App::StartFit() {
     fitContent_ = ContentKey();
@@ -2575,7 +2616,7 @@ void App::StartFit() {
     // What each frame-rate choice really gives (a cap above the clip's own rate changes nothing).
     const double speed = kSpeedOptions[settings_.speedIdx];
     auto outRate = [&](int i) {
-        if (f == Format::Mp4) return EffectiveOutFps(i);
+        if (IsVideoFormat(f)) return EffectiveOutFps(i);
         auto plan = PlanFrames(*clip_, inF_, outF_, EffectiveOutFps(i), speed);
         double ms = 0;
         for (auto& p : plan) ms += p.durationMs;
@@ -2590,7 +2631,7 @@ void App::StartFit() {
     }
     std::stable_sort(rates.begin(), rates.end(), [&](int a, int b) { return rateOf[a] > rateOf[b]; });
 
-    if (f == Format::Mp4) {
+    if (IsVideoFormat(f)) {
         // The bitrate decides the size; shrink the picture only when that bitrate would starve it.
         fitting_ = false;
         const double sec = std::max(0.1, PlanVideoFrames(*clip_, inF_, outF_, EffectiveOutFps(), speed).size() /
@@ -2606,7 +2647,7 @@ void App::StartFit() {
         }
         settings_.scaleIdx = pick;
         fitBitrate_ = (UINT32)std::min(video, 80e6);
-        estBytes_ = EstimateBytes(MakeJob(pick, settings_.outFpsIdx, 0), std::atomic<bool>{false});
+        estBytes_ = EstimateBytes(MakeJob(pick, settings_.outFpsIdx, ExportQuality()), std::atomic<bool>{false});
         estValid_ = true;
         estKey_ = EstimateKey();
         fitMissed_ = video <= 2e5 + 1;

@@ -1,13 +1,17 @@
 #pragma once
 
-// Mp4 has no IEncoder: the exporter drives Mp4Writer directly.
-enum class Format { Gif = 0, WebP, Avif, Mp4, Count };
+// The video formats have no IEncoder: the exporter drives Mp4Writer and WebmWriter directly.
+enum class Format { Gif = 0, WebP, Avif, Mp4, WebM, Count };
+// MP4 and WebM (#40): a constant frame rate, sound, always forward, no loop count.
+inline bool IsVideoFormat(Format f) { return f == Format::Mp4 || f == Format::WebM; }
+inline bool IsVideoFormat(int f) { return IsVideoFormat((Format)f); }
 
 struct EncoderParams {
     int width = 0, height = 0;
     int quality = 80;  // 1..100
     int plays = 0;     // times the animation plays, 0 = forever
     int lossy = 0;     // GIF: 0 off, 1 light, 2 strong (lossy LZW, as gifsicle --lossy)
+    bool alpha = false;  // keep transparency (an opened 움짤, #41); GIF: below half opaque is transparent
     std::wstring path;
 };
 
@@ -15,7 +19,8 @@ class IEncoder {
 public:
     virtual ~IEncoder() = default;
     virtual bool Begin(const EncoderParams& p, std::wstring& err) = 0;
-    // Tightly packed BGRA (alpha ignored); durationMs = how long this frame stays on screen.
+    // Tightly packed BGRA, straight alpha (ignored unless EncoderParams::alpha); durationMs = how long this frame
+    // stays on screen.
     virtual bool Add(const uint8_t* bgra, double durationMs, std::wstring& err) = 0;
     virtual bool End(std::wstring& err) = 0;
 };

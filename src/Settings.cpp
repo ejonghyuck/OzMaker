@@ -57,6 +57,23 @@ void Settings::UseExportKind(bool video) {
     exportVideo = video;
 }
 
+void Settings::UseFileKnobs() {
+    UseExportKind(false);
+    if (!recordingAnim) recordingAnim = AnimKnobs{{exportPreset, scaleIdx, outFpsIdx}, gifLossy};
+    exportPreset = 0;
+    ApplyPreset(0, false);
+}
+
+void Settings::UseRecordingKnobs() {
+    if (!recordingAnim) return;
+    UseExportKind(false);
+    exportPreset = recordingAnim->knobs.preset;
+    scaleIdx = recordingAnim->knobs.scaleIdx;
+    outFpsIdx = recordingAnim->knobs.outFpsIdx;
+    gifLossy = recordingAnim->gifLossy;
+    recordingAnim.reset();
+}
+
 int Settings::MatchPreset(bool video, bool gif) const {
     for (int i = 0; i < (int)_countof(kExportPresets); ++i) {
         const ExportPreset& p = kExportPresets[i];
@@ -84,6 +101,7 @@ void Settings::Load() {
     vFpsIdx = ReadInt(ini, L"VideoFps", vFpsIdx, 0, _countof(kVideoFpsOptions) - 1);
     vResIdx = ReadInt(ini, L"VideoRes", vResIdx, 0, _countof(kVideoResOptions) - 1);
     vBitrateIdx = ReadInt(ini, L"VideoBitrate", vBitrateIdx, 0, _countof(kVideoBitrateOptions) - 1);
+    vBitrateKbps = ReadInt(ini, L"VideoBitrateKbps", vBitrateKbps, kVideoBitrateMinKbps, kVideoBitrateMaxKbps);
     vRateCtrl = ReadInt(ini, L"VideoRateControl", vRateCtrl, 0, 1);
     vKeyIdx = ReadInt(ini, L"VideoKeyframe", vKeyIdx, 0, _countof(kKeyframeOptions) - 1);
     vPresetIdx = ReadInt(ini, L"VideoPreset", vPresetIdx, 0, _countof(kPresetOptions) - 1);
@@ -134,6 +152,7 @@ void Settings::Load() {
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
+    webmQuality = ReadInt(ini, L"WebmQuality", webmQuality, 1, 100);
     gifLossy = ReadInt(ini, L"GifLossy", gifLossy, 0, 2);
     // Older versions kept the scale (100/75/50/33/25 %) under "Scale" and a loop switch under "Loop".
     int oldScale = ReadInt(ini, L"Scale", 0, 0, 4);
@@ -204,6 +223,7 @@ void Settings::Save() const {
     num(L"VideoFps", vFpsIdx);
     num(L"VideoRes", vResIdx);
     num(L"VideoBitrate", vBitrateIdx);
+    num(L"VideoBitrateKbps", vBitrateKbps);
     num(L"VideoRateControl", vRateCtrl);
     num(L"VideoKeyframe", vKeyIdx);
     num(L"VideoPreset", vPresetIdx);
@@ -245,9 +265,10 @@ void Settings::Save() const {
     num(L"TimerStop", timerStop);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
-    num(L"GifLossy", gifLossy);
+    num(L"WebmQuality", webmQuality);
+    num(L"GifLossy", recordingAnim ? recordingAnim->gifLossy : gifLossy);
     const ExportKnobs shown{exportPreset, scaleIdx, outFpsIdx};
-    const ExportKnobs& anim = exportVideo ? stashed : shown;
+    const ExportKnobs& anim = recordingAnim ? recordingAnim->knobs : exportVideo ? stashed : shown;
     const ExportKnobs& mp4 = exportVideo ? shown : stashed;
     num(L"ExportSize", anim.scaleIdx);
     num(L"OutFps", anim.outFpsIdx);
