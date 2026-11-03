@@ -1891,6 +1891,66 @@ int App::RunSelfTest(const std::wstring& dir) {
         back.UseExportKind(true);
         check(anim && back.exportPreset == 2 && back.scaleIdx == 4 && back.outFpsIdx == 1,
               L"움짤 and MP4 values are saved apart");
+
+        // 0.6.5: 최대 녹화 길이 becomes a record timer that stops (#47), H.264 becomes 자동 and HEVC stays (#42),
+        // and a file written since keeps its own over the old keys.
+        Settings ten = load(L"timer_old10.ini", "[OzMaker]\r\nMaxLength=1\r\nVideoCodec=1\r\n");
+        check(ten.timerIdx == kTimerCustom && ten.TimerMinutes() == 10 && ten.timerStop && ten.vCodec == kCodecHevc,
+              L"최대 녹화 길이 10분: a 10-minute timer that stops; HEVC stays");
+        Settings hour = load(L"timer_old60.ini", "[OzMaker]\r\nMaxLength=3\r\nVideoCodec=0\r\n");
+        check(hour.timerIdx == 2 && hour.TimerMinutes() == 60 && hour.timerStop && hour.vCodec == kCodecAuto,
+              L"최대 녹화 길이 1시간: the 1시간 timer that stops; H.264 becomes 자동");
+        check(fresh.TimerMinutes() == 0 && !fresh.timerStop && fresh.vCodec == kCodecAuto &&
+                  fresh.startHide == kHideToTray && !fresh.hkHook && !fresh.hkPauseHook,
+              L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over");
+        Settings kept = load(L"timer_kept.ini", "[OzMaker]\r\nTimer=4\r\nTimerMinutes=200\r\nTimerStop=0\r\nMaxLength=2\r\n"
+                                                "Codec=1\r\nVideoCodec=1\r\nHotkeyHook=1\r\nStartHide=1\r\n");
+        check(kept.timerIdx == kTimerCustom && kept.TimerMinutes() == 200 && !kept.timerStop &&
+                  kept.vCodec == kCodecH264 && kept.hkHook && kept.startHide == kHideMinimize,
+              L"a 0.6.5 file keeps its timer, codec, taken-over hotkey and start over the old keys");
+
+        // 설정 초기화 (#49) keeps the save folder, the window's place, the 녹화 tab's pick and the files lists, and
+        // puts back the rest, hotkeys taken over or not; the editor's kind of 화질 stays the one it shows.
+        Settings r = load(L"reset.ini", "");
+        r.outDir = L"X:\\Clips";
+        r.window = {10, 20, 810, 620};
+        r.windowMax = true;
+        r.source = kSourceRegion;
+        r.region = {0, 0, 640, 480};
+        r.monitor = L"\\\\.\\DISPLAY2";
+        r.recent = {L"X:\\Clips\\a.gif"};
+        r.crashSeen = L"crash_x";
+        r.trayHintShown = true;
+        r.hkMods = MOD_ALT;
+        r.hkVk = VK_F9;
+        r.hkHook = r.hkPauseHook = true;
+        r.timerIdx = 2;
+        r.timerStop = true;
+        r.theme = kThemeLight;
+        r.language = kLangEnglish;
+        r.vCodec = kCodecHevc;
+        r.startHide = kHideMinimize;
+        r.nameTemplate = L"{날짜}";
+        r.output = kOutputVideo;
+        r.fpsIdx = 0;
+        r.UseExportKind(true);
+        r.exportPreset = 2;
+        r.ApplyPreset(2, true);
+        r.Reset();
+        const Settings d;
+        check(r.outDir == L"X:\\Clips" && r.window.right == 810 && r.windowMax && r.source == kSourceRegion &&
+                  r.region.right == 640 && r.monitor == L"\\\\.\\DISPLAY2" && r.recent.size() == 1 &&
+                  r.crashSeen == L"crash_x" && r.trayHintShown,
+              L"설정 초기화 keeps the save folder, the window's place, the 녹화 tab's pick and the files lists");
+        check(r.hkMods == d.hkMods && r.hkVk == d.hkVk && !r.hkHook && !r.hkPauseHook && r.TimerMinutes() == 0 &&
+                  !r.timerStop && r.theme == d.theme && r.language == d.language && r.vCodec == kCodecAuto &&
+                  r.startHide == kHideToTray && r.nameTemplate == d.nameTemplate && r.output == d.output &&
+                  r.fpsIdx == d.fpsIdx,
+              L"and puts back the rest: hotkeys (taken over or not), timer, theme, language, codec, start");
+        const bool mp4First = r.exportVideo && r.exportPreset == 0 && r.scaleIdx == 0 && r.outFpsIdx == 0;
+        r.UseExportKind(false);
+        check(mp4First && r.exportPreset == 1 && r.scaleIdx == 4 && r.outFpsIdx == 3,
+              L"with MP4 and 움짤 at their first 화질, the editor's kind as it was");
     }
     // Crash reports (#24): a child run that crashes on purpose leaves a dump and a log and ends without the Windows
     // error dialog. It shares this run's OZMAKER_SETTINGS, so the report lands in this test's folder.
@@ -2217,6 +2277,125 @@ int App::RunSelfTest(const std::wstring& dir) {
         }
     }
 
+    // 코덱 자동 (#42): H.264 takes a longest edge up to 4096; past that, 자동 records and exports HEVC where this PC
+    // writes and plays it, and otherwise makes the picture smaller. On made-up encoders (hevcForTest_).
+    {
+        const Settings was = settings_;
+        settings_.output = kOutputVideo;
+        struct Case {
+            int codec, hevcHere, w, h, res, ow, oh;
+            bool hevc;
+            const wchar_t* what;
+        };
+        const Case cases[] = {
+            {kCodecAuto, 1, 3840, 2160, 0, 3840, 2160, false, L"자동, 4K: H.264"},
+            {kCodecAuto, 1, 5120, 2160, 0, 5120, 2160, true, L"자동, 5K: HEVC at full size"},
+            {kCodecAuto, 2, 5120, 2160, 0, 4096, 1728, false, L"자동, 5K, an HEVC encoder but nothing to play it: H.264, smaller"},
+            {kCodecAuto, 0, 5120, 2160, 0, 4096, 1728, false, L"자동, 5K, no HEVC: H.264, smaller"},
+            {kCodecAuto, 1, 7680, 4320, 1, 3840, 2160, false, L"자동, 8K in the 2160p box: H.264"},
+            {kCodecH264, 1, 5120, 2160, 0, 4096, 1728, false, L"H.264, 5K: smaller"},
+            {kCodecHevc, 1, 1920, 1080, 0, 1920, 1080, true, L"HEVC: HEVC"},
+            {kCodecHevc, 0, 1920, 1080, 0, 1920, 1080, false, L"HEVC with no HEVC encoder: H.264"},
+        };
+        for (const Case& c : cases) {
+            settings_.vCodec = c.codec;
+            settings_.vResIdx = c.res;
+            hevcForTest_ = c.hevcHere;
+            int ow = 0, oh = 0;
+            bool hevc = false;
+            PlannedSize(c.w, c.h, ow, oh, &hevc);
+            const bool ok = ow == c.ow && oh == c.oh && hevc == c.hevc;
+            log(util::Format(L"codec: %s %s -> %dx%d %s", ok ? L"ok  " : L"FAIL", c.what, ow, oh, hevc ? L"HEVC" : L"H.264"));
+            if (!ok) ++failures;
+        }
+        // An export to MP4 goes by the same rule: a 4800×200 strip, wider than H.264 takes and light to make.
+        OpenEditor(MakeSyntheticClip(4800, 200, 4, 30));
+        playing_ = false;
+        fmt_ = (int)Format::Mp4;
+        settings_.vCodec = kCodecAuto;
+        hevcForTest_ = 0;
+        const ExportJob smaller = MakeJob(0, 0, 0);
+        hevcForTest_ = 1;
+        const ExportJob full = MakeJob(0, 0, 0);
+        const bool ok = smaller.outW == 4096 && smaller.outH == 170 && !smaller.video.hevc && full.outW == 4800 &&
+                        full.outH == 200 && full.video.hevc;
+        log(util::Format(L"codec: %s export of 4800x200 to MP4: %dx%d %s without HEVC, %dx%d %s with it",
+                         ok ? L"ok  " : L"FAIL", smaller.outW, smaller.outH, smaller.video.hevc ? L"HEVC" : L"H.264",
+                         full.outW, full.outH, full.video.hevc ? L"HEVC" : L"H.264"));
+        if (!ok) ++failures;
+        CloseEditor();
+        StopThumbnails();
+        clip_.reset();
+        fmt_ = (int)Format::Gif;
+        hevcForTest_ = -1;
+        settings_ = was;
+    }
+    // The record timer (#47): its length in words, and 직접 입력 kept between a minute and 24 hours.
+    {
+        Settings t;
+        t.timerIdx = kTimerCustom;
+        t.timerMinutes = 0;
+        const int lo = t.TimerMinutes();
+        t.timerMinutes = 5000;
+        const int hi = t.TimerMinutes();
+        t.timerIdx = 3;
+        const bool ok = lo == 1 && hi == kTimerMaxMinutes && t.TimerMinutes() == 120 && TimerWords(200) == L"3시간 20분" &&
+                        TimerWords(30) == L"30분" && TimerWords(120) == L"2시간";
+        log(util::Format(L"timer: %s 1 min – 24 h, \"%s\"", ok ? L"ok" : L"FAIL", TimerWords(200).c_str()));
+        if (!ok) ++failures;
+    }
+    // Taking over a hotkey (#50): a combination another window registered reaches OzMaker through the keyboard hook,
+    // and that window no longer gets it. F23, which keyboards don't have, pressed with SendInput: first without the
+    // hook (the other window gets it, so input reaches this desktop), then with it. Skipped where input can't be sent.
+    {
+        HWND other = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+        HWND mine = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+        const bool registered = other && mine && RegisterHotKey(other, 7, MOD_NOREPEAT, VK_F23);
+        auto press = [] {
+            INPUT in[2] = {};
+            for (INPUT& i : in) {
+                i.type = INPUT_KEYBOARD;
+                i.ki.wVk = VK_F23;
+            }
+            in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            return SendInput(2, in, sizeof(INPUT)) == 2;
+        };
+        int toOther = 0, toMine = 0;
+        auto pump = [&](double seconds) {
+            toOther = toMine = 0;
+            for (double until = util::NowSeconds() + seconds; util::NowSeconds() < until;) {
+                MSG msg;
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_HOTKEY && msg.hwnd == other) ++toOther;
+                    if (msg.message == WM_HOTKEY && msg.hwnd == mine && msg.wParam == 9) ++toMine;
+                    DispatchMessageW(&msg);
+                }
+                Sleep(10);
+            }
+        };
+        bool reaches = false;
+        if (registered && press()) {
+            pump(0.5);
+            reaches = toOther == 1;
+        }
+        if (!reaches) {
+            log(L"hotkey takeover: skipped, no keyboard input reaches this desktop");
+        } else {
+            KeyHook hook;
+            const bool set = hook.Set(mine, WM_APP + 77, {{0, VK_F23, 9}}, false);
+            press();
+            pump(0.5);
+            hook.Stop();
+            const bool ok = set && toMine == 1 && toOther == 0;
+            log(util::Format(L"hotkey takeover: %s hook %d, OzMaker got it %d time(s), the other window %d",
+                             ok ? L"ok" : L"FAIL", set, toMine, toOther));
+            if (!ok) ++failures;
+        }
+        if (registered) UnregisterHotKey(other, 7);
+        if (other) DestroyWindow(other);
+        if (mine) DestroyWindow(mine);
+    }
+
     // English (#26): each format string keeps its fields in the same order, and a lookup finds the text.
     {
         auto bad = MismatchedTranslations();
@@ -2334,6 +2513,33 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     shot(L"home_selected_150.png", 144);
     settings_.output = kOutputVideo;
     shot(L"home_video.png", 96);
+    // The record timer's popover (#47), on 직접 입력 at 3시간 20분, stopping.
+    settings_.timerIdx = kTimerCustom;
+    settings_.timerMinutes = 200;
+    settings_.timerStop = true;
+    timerOpen_ = true;
+    shot(L"home_timer.png", 96);
+    timerOpen_ = false;
+    // While recording: the time the timer is set to after the time, and once it is up, in amber.
+    rec_ = RecState::Recording;
+    recElapsedForTest_ = 12034.5;
+    timerFiredFor_ = 200 * 60;
+    shot(L"home_recording_timer.png", 96);
+    rec_ = RecState::Idle;
+    recElapsedForTest_ = -1;
+    timerFiredFor_ = 0;
+    settings_.timerIdx = 0;
+    settings_.timerStop = false;
+    // 코덱 자동 on a 5K screen (#42): HEVC at full size where this PC plays it; else H.264, made smaller.
+    settings_.source = kSourceDisplay;
+    sourceForTest_ = {5120, 2160};
+    hevcForTest_ = 1;
+    shot(L"home_hevc.png", 96);
+    hevcForTest_ = 2;
+    shot(L"home_hevc_noext.png", 96);
+    hevcForTest_ = -1;
+    sourceForTest_ = {};
+    settings_.source = kSourceWindow;
     lastVideo_ = {};
     lastVideo_.video = lastVideo_.ok = lastVideo_.audio = true;
     lastVideo_.path = settings_.outDir + L"\\OzMaker_20261102_142311.mp4";
@@ -2376,15 +2582,20 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             POINT a{mr.left + mw * 26 / 100, mr.top + mh * 27 / 100}, c{mr.left + mw * 60 / 100, mr.top + mh * 66 / 100};
             regionPicker_.PaintTest(p, mr, a, c);
         });
-        // The recording pill: recording (stop hovered) and paused (resume hovered), at 150 %.
-        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 360, 150, 144, [&](ID2D1DeviceContext* dc) {
+        // The recording pill: recording (stop hovered) and paused (resume hovered), then with the record timer
+        // (#47) and with its time up, at 150 %.
+        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 510, 276, 144, [&](ID2D1DeviceContext* dc) {
             Painter p;
             p.Bind(dc);
-            p.Fill(Rect(0, 0, 240, 100), theme::Hex(0x2B4C7E));
+            p.Fill(Rect(0, 0, 340, 184), theme::Hex(0x2B4C7E));
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 6));
             overlay_.PaintTest(p, 73.4, false, 2);
-            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 54));
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 50));
             overlay_.PaintTest(p, 73.4, true, 1);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 94));
+            overlay_.PaintTest(p, 4271.2, false, 0, 200 * 60);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 138));
+            overlay_.PaintTest(p, 12034.5, false, 0, 200 * 60, true);
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
         });
         gfx_.RenderToPng((dir + L"\\region_adjust.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
@@ -2455,13 +2666,43 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         settings_.nameTemplate = nameWas;
     }
     {
-        // 동영상 › 코덱 on HEVC: its line says a crash leaves no recording (H.264 on a PC without HEVC).
+        // 동영상 › 코덱 on HEVC: its line says a crash leaves no recording. On made-up encoders, so it shows the same
+        // on a PC without HEVC.
         const int codecWas = settings_.vCodec;
         settings_.settingsTab = kTabVideo;
         settingsScroll_ = 0;
-        settings_.vCodec = 1;
+        settings_.vCodec = kCodecHevc;
+        hevcForTest_ = 1;
         shot(L"settings_video_hevc.png", 96);
+        hevcForTest_ = -1;
         settings_.vCodec = codecWas;
+    }
+    {
+        // 설정 › 녹화 with 0.6.5's rows: the record timer on 직접 입력 (3시간 20분, stopping), 작업 표시줄로 최소화
+        // and a pause hotkey taken over (가져옴); then the panel a held combination opens (#46 #47 #50).
+        settings_.settingsTab = kTabRecord;
+        settingsScroll_ = 0;
+        settings_.timerIdx = kTimerCustom;
+        settings_.timerMinutes = 200;
+        settings_.timerStop = true;
+        settings_.startHide = kHideMinimize;
+        settings_.hkPauseHook = true;
+        shot(L"settings_record_timer.png", 96);
+        hkConflict_ = {kHotkeyRecord, MOD_ALT, VK_F9};
+        shot(L"settings_record_conflict.png", 96);
+        hkConflict_ = {};
+        settings_.timerIdx = 0;
+        settings_.timerStop = false;
+        settings_.startHide = kHideToTray;
+        settings_.hkPauseHook = false;
+        // 설정 › 일반 › 설정 초기화, and what it asks (#49).
+        settings_.settingsTab = kTabGeneral;
+        settingsScroll_ = 10000;
+        shot(L"settings_reset_row.png", 96);
+        AskReset();
+        shot(L"settings_reset.png", 96);
+        question_.reset();
+        settingsScroll_ = 0;
     }
     settings_.settingsTab = kTabAudio;  // the mic rows at the bottom, testing, with the playback switch
     settingsScroll_ = 10000;

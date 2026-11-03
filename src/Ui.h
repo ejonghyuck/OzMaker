@@ -199,6 +199,7 @@ public:
     // field the focus back: for a button beside it, whose press took the focus away. False when it doesn't fit.
     bool InsertText(UiId id, std::wstring& text, std::wstring_view s, size_t maxLen);
     bool TextFocused() const { return focus_ != 0; }
+    UiId FocusedField() const { return focus_; }
     const Rect& CaretRect() const { return caretRect_; }  // for the IME's windows
     // True once after a field let go of the focus with IME text in it: that text went into the field, so the IME
     // should drop it.

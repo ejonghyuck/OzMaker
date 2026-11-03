@@ -6,7 +6,7 @@
 
 <p align="center"><a href="https://github.com/ejonghyuck/OzMaker/releases/latest"><b>⬇ 최신 버전 내려받기</b></a><br>Windows 10 · 11 (64비트) · 설치 없음 · 무료</p>
 
-<p align="center"><img src="docs/images/hero.gif" alt="녹화 탭의 목록에서 데모 게임 창을 고르고 녹화한 뒤 멈추면 편집 탭이 열립니다. 구간 끝을 끌어 줄이고 자막 '보스 처치!'를 넣은 다음, 용량 맞추기 10MB를 골라 GIF로 저장하고 복사합니다."><br><sub>이 움짤도 OzMaker가 저장했습니다 · GIF · 1120×780 · 737 KB</sub></p>
+<p align="center"><img src="docs/images/hero.gif" alt="녹화 탭의 목록에서 데모 게임 창을 고르고 녹화한 뒤 멈추면 편집 탭이 열립니다. 구간 끝을 끌어 줄이고 자막 '보스 처치!'를 넣은 다음, 용량 맞추기 10MB를 골라 GIF로 저장하고 복사합니다."><br><sub>이 움짤도 OzMaker가 저장했습니다 · GIF · 1120×780 · 739 KB</sub></p>
 
 > 처음 실행할 때 **“Windows의 PC 보호”** 창이 뜨면 **추가 정보 → 실행**을 누르세요. 코드 서명이 없는 프로그램이라 뜨는 창입니다.
 

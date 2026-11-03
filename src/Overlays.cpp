@@ -215,8 +215,10 @@ void RecOverlay::ShowCountdown(const RECT& target, int value) {
 }
 
 namespace {
-constexpr float kPillW = 228, kPillH = 40;
+constexpr float kPillW = 228, kPillH = 40, kTimerW = 92;
 }
+
+float RecOverlay::PillWidth(int timer) { return kPillW + (timer > 0 ? kTimerW : 0); }
 
 void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop,
                           std::function<void()> onPause) {
@@ -228,6 +230,8 @@ void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()
     frames_ = 0;
     hover_ = 0;
     paused_ = false;
+    timer_ = 0;
+    timerUp_ = false;
     Place(target, (int)kPillW, (int)kPillH, false, outside);
     Redraw(true);
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
@@ -277,6 +281,23 @@ void RecOverlay::SetPaused(bool paused) {
     Redraw(false);
 }
 
+void RecOverlay::SetTimer(int seconds, bool up) {
+    if (mode_ != Mode::Pill || (timer_ == seconds && timerUp_ == up)) return;
+    const bool resize = (timer_ > 0) != (seconds > 0);
+    timer_ = seconds;
+    timerUp_ = up;
+    if (!resize) {
+        Redraw(false);
+        return;
+    }
+    // Wider or narrower about its middle, where the user may have dragged it.
+    RECT r{};
+    GetWindowRect(win_.Hwnd(), &r);
+    const int w = (int)std::lround(PillWidth(timer_) * scale_);
+    rect_ = {(r.left + r.right - w) / 2, r.top, (r.left + r.right + w) / 2, r.bottom};
+    win_.Render(rect_, scale_, true, [&](Painter& p) { Paint(p); });
+}
+
 void RecOverlay::Hide() {
     mode_ = Mode::None;
     onStop_ = nullptr;
@@ -288,8 +309,8 @@ void RecOverlay::Hide() {
     }
 }
 
-Rect RecOverlay::StopRect() const { return Rect::Centered(kPillW - 21, kPillH / 2, 28, 28); }
-Rect RecOverlay::PauseRect() const { return Rect::Centered(kPillW - 53, kPillH / 2, 28, 28); }
+Rect RecOverlay::StopRect() const { return Rect::Centered(PillWidth(timer_) - 21, kPillH / 2, 28, 28); }
+Rect RecOverlay::PauseRect() const { return Rect::Centered(PillWidth(timer_) - 53, kPillH / 2, 28, 28); }
 
 int RecOverlay::ButtonAt(float x, float y) const {
     if (PauseRect().Inset(-2).Contains(x, y) && onPause_) return 1;
@@ -304,15 +325,19 @@ void RecOverlay::Redraw(bool move) {
     win_.Render(rect_, scale_, move, [&](Painter& p) { Paint(p); });
 }
 
-void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover) {
+void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer, bool timerUp) {
     mode_ = Mode::Pill;
     elapsed_ = elapsed;
     paused_ = paused;
     hover_ = hover;
+    timer_ = timer;
+    timerUp_ = timerUp;
     onPause_ = [] {};
     Paint(p);
     mode_ = Mode::None;
     onPause_ = nullptr;
+    timer_ = 0;
+    timerUp_ = false;
 }
 
 void RecOverlay::Paint(Painter& p) {
@@ -330,9 +355,13 @@ void RecOverlay::Paint(Painter& p) {
             p.Text(Rect(0, 86, 132, 112), tr(L"녹화 준비"), 12.f, TextDim, sub);
             return;
         }
-        Rect r(0.5f, 0.5f, kPillW - 0.5f, kPillH - 0.5f);
+        const float pillW = PillWidth(timer_);
+        Rect r(0.5f, 0.5f, pillW - 0.5f, kPillH - 0.5f);
         p.Fill(r, Panel(0.92f), 20);
-        p.Stroke(r, paused_ ? WithAlpha(Warning, Contrast() ? 1.f : 0.35f) : Edge(0.09f), 20);
+        if (timerUp_)
+            p.Stroke(r, WithAlpha(Warning, Contrast() ? 1.f : 0.8f), 20, 1.5f);
+        else
+            p.Stroke(r, paused_ ? WithAlpha(Warning, Contrast() ? 1.f : 0.35f) : Edge(0.09f), 20);
         TextStyle label;
         label.weight = kBold;
         if (paused_) {
@@ -349,8 +378,26 @@ void RecOverlay::Paint(Painter& p) {
         TextStyle tm;
         tm.weight = kSemibold;
         tm.tabular = true;
-        p.Text(Rect(paused_ ? 88.f : 66.f, 0, kPillW - 68, 40), util::FormatClock(elapsed_, true), 15.f,
-               paused_ ? TextDim : Ink(), tm);
+        const float tx = paused_ ? 88.f : 66.f;
+        const std::wstring now = util::FormatClock(elapsed_, true);
+        p.Text(Rect(tx, 0, pillW - 68, 40), now, 15.f, paused_ ? TextDim : Ink(), tm);
+        if (timer_ > 0) {
+            // "/ 3:20:00" after the time (measured as zeros: its digits are drawn all as wide); a bell before it once
+            // the time is up.
+            std::wstring zeros = now;
+            std::replace_if(zeros.begin(), zeros.end(), iswdigit, L'0');
+            float x = tx + p.Measure(zeros, 15.f, kSemibold) + 6;
+            if (timerUp_) {
+                p.Icon(Rect::XYWH(x, 0, 14, 40), 0xEA8F /*Ringer*/, 11.f, Warning);
+                x += 16;
+            }
+            TextStyle of;
+            of.weight = kSemibold;
+            of.tabular = true;
+            p.Text(Rect(x, 0, pillW - 68, 40),
+                   util::Format(L"/ %d:%02d:%02d", timer_ / 3600, timer_ / 60 % 60, timer_ % 60), 12.f,
+                   timerUp_ ? Warning : TextDim, of);
+        }
         // Pause / resume, then stop.
         Rect pr = PauseRect();
         if (Contrast())

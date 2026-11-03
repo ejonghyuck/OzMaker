@@ -113,6 +113,7 @@
     <ClCompile Include="src\Mp4Cut.cpp" />
     <ClCompile Include="src\Mp4Unfragment.cpp" />
     <ClCompile Include="src\Gfx.cpp" />
+    <ClCompile Include="src\KeyHook.cpp" />
     <ClCompile Include="src\Lang.cpp" />
     <ClCompile Include="src\Overlays.cpp" />
     <ClCompile Include="src\Resize.cpp" />
@@ -147,6 +148,7 @@
     <ClInclude Include="src\Mp4Cut.h" />
     <ClInclude Include="src\Mp4Unfragment.h" />
     <ClInclude Include="src\Gfx.h" />
+    <ClInclude Include="src\KeyHook.h" />
     <ClInclude Include="src\Overlays.h" />
     <ClInclude Include="src\Resize.h" />
     <ClInclude Include="src\Settings.h" />

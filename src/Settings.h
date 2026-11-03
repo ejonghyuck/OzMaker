@@ -47,8 +47,10 @@ inline constexpr int kPresetOptions[] = {0, 50, 100};                       // q
 inline constexpr int kAudioBitrateOptions[] = {96, 128, 160, 192};          // kbps (AAC)
 inline constexpr int kAudioRateOptions[] = {44100, 48000};
 
-// Recording limits (#17)
-inline constexpr int kMaxLengthOptions[] = {0, 10, 30, 60};  // minutes, 0 = no limit
+// Recording limits (#17). The record timer (#47): 끔, 30분, 1시간, 2시간, 직접 입력 (Settings::timerMinutes).
+inline constexpr int kTimerOptions[] = {0, 30, 60, 120, -1};  // minutes, 0 = off, -1 = timerMinutes
+inline constexpr int kTimerCustom = 4;                         // 직접 입력
+inline constexpr int kTimerMaxMinutes = 24 * 60;
 inline constexpr uint64_t kLowDiskWarn = 1ull << 30;        // warn before recording below this much free space
 inline constexpr uint64_t kLowDiskStop = 300ull << 20;      // and stop (saving what there is) below this
 
@@ -59,6 +61,9 @@ enum OverlayMode { kOverlayAlways = 0, kOverlayExceptFullscreen = 1, kOverlayNev
 enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout, kTabCount };
 enum ThemeChoice { kThemeSystem = 0, kThemeDark, kThemeLight };
 enum LanguageChoice { kLangSystem = 0, kLangKorean, kLangEnglish };
+enum StartHide { kHideToTray = 0, kHideMinimize };  // 설정 › 녹화 "녹화를 시작하면" (#46)
+// 자동 is H.264, and HEVC only for a picture longer than H.264 encoders take (4096) on a PC that plays HEVC (#42).
+enum CodecChoice { kCodecAuto = 0, kCodecH264, kCodecHevc };
 
 struct Settings {
     // what and how
@@ -89,11 +94,17 @@ struct Settings {
     UINT hkVk = 'R';
     UINT hkPauseMods = MOD_CONTROL | MOD_ALT;  // pause / resume, registered only while recording
     UINT hkPauseVk = 'P';
-    int maxLengthIdx = 0;  // kMaxLengthOptions
+    // Taken over from another program by the user (#50): when RegisterHotKey refuses the key, a keyboard hook gets it.
+    bool hkHook = false, hkPauseHook = false;
+    int startHide = kHideToTray;  // where the window goes when a recording starts from it
+    // The record timer (#47): kTimerOptions, the length 직접 입력 holds, and what happens when the time is up.
+    int timerIdx = 0;
+    int timerMinutes = 90;   // 1 – kTimerMaxMinutes
+    bool timerStop = false;  // false: a notification, the recording goes on; true: it stops and is saved
     std::wstring outDir;
 
     // video (MP4)
-    int vCodec = 0;  // 0 = H.264, 1 = HEVC
+    int vCodec = kCodecAuto;  // CodecChoice
     bool vHardware = true;
     int vFpsIdx = 2;
     int vResIdx = 0;
@@ -138,6 +149,9 @@ struct Settings {
     void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
+    // 설정 › 일반 › 설정 초기화 (#49): every setting as a new settings file has it, except the save folder, the
+    // window's place, what the 녹화 tab has picked, the files lists and what the app noted for itself.
+    void Reset();
     // Sets the size, frame rate and (움짤) GIF lossy level to kExportPresets[i] (exportPreset itself stays).
     void ApplyPreset(int i, bool video);
     // Makes exportPreset, scaleIdx and outFpsIdx those of 움짤 or of MP4.
@@ -154,4 +168,7 @@ struct Settings {
 
     bool HasRegion() const { return region.right - region.left >= 16 && region.bottom - region.top >= 16; }
     int CountdownSeconds() const { return countdown == 1 ? 3 : countdown == 2 ? 5 : 0; }
+    int TimerMinutes() const {  // 0 = off
+        return timerIdx == kTimerCustom ? std::clamp(timerMinutes, 1, kTimerMaxMinutes) : kTimerOptions[timerIdx];
+    }
 };

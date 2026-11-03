@@ -63,6 +63,19 @@ std::wstring Mp4Writer::FindEncoder(bool hevc, bool hardware) {
     return name;
 }
 
+bool Mp4Writer::HevcDecoderAvailable() {
+    EnsureMediaFoundation();
+    MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_HEVC};
+    const UINT32 flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_HARDWARE |
+                         MFT_ENUM_FLAG_SORTANDFILTER;
+    IMFActivate** acts = nullptr;
+    UINT32 count = 0;
+    if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags, &in, nullptr, &acts, &count))) return false;
+    for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
+    CoTaskMemFree(acts);
+    return count > 0;
+}
+
 std::wstring Mp4Writer::Vendor(const std::wstring& name) {
     std::wstring v = name;
     for (const wchar_t* cut : {L" H.264", L" H264", L" HEVC", L" H.265", L" H265", L" Encoder", L"h264", L"hevc"}) {

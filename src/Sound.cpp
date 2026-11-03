@@ -48,7 +48,12 @@ void Play(Cue cue) {
     static const std::vector<uint8_t> stop = MakeWav({{1318.5f, 70}, {880, 120}}, 0.35f);
     static const std::vector<uint8_t> saved = MakeWav({{1046.5f, 60}, {1568, 140}}, 0.3f);
     static const std::vector<uint8_t> tick = MakeWav({{1174.7f, 45}}, 0.25f);
-    const std::vector<uint8_t>* w = cue == Cue::Start ? &start : cue == Cue::Stop ? &stop : cue == Cue::Saved ? &saved : &tick;
+    static const std::vector<uint8_t> alarm = MakeWav({{1568, 90}, {1318.5f, 90}, {1568, 90}, {1318.5f, 180}}, 0.35f);
+    const std::vector<uint8_t>* w = cue == Cue::Start   ? &start
+                                    : cue == Cue::Stop  ? &stop
+                                    : cue == Cue::Saved ? &saved
+                                    : cue == Cue::Alarm ? &alarm
+                                                        : &tick;
     PlaySoundW(reinterpret_cast<LPCWSTR>(w->data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 

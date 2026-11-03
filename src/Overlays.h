@@ -40,10 +40,14 @@ public:
     // outside: place the pill just outside the area (regions) instead of inside its top edge.
     void ShowPill(const RECT& target, bool outside, std::function<void()> onStop, std::function<void()> onPause);
     void SetPaused(bool paused);
+    // The record timer (#47): the pill shows "/ 3:20:00" after the time (0: none), and once it is up, a bell and
+    // an amber edge.
+    void SetTimer(int seconds, bool up);
     void ShowFrame(const RECT& area);
     void Update(double elapsed, size_t frames);
     // Screenshot tests: the pill drawn at the origin without a window.
-    void PaintTest(Painter& p, double elapsed, bool paused, int hover);
+    void PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer = 0, bool timerUp = false);
+    static float PillWidth(int timer);  // DIPs
     void Hide();
     bool Visible() const { return mode_ != Mode::None; }
     void SetMotion(bool on) { motion_ = on; }  // Windows' animations: off, the REC dot stays still
@@ -69,6 +73,8 @@ private:
     double elapsed_ = 0;
     size_t frames_ = 0;
     int countdown_ = 0;
+    int timer_ = 0;  // seconds, 0 = none
+    bool timerUp_ = false;
     int hover_ = 0;  // ButtonAt under the mouse
     bool tracking_ = false, paused_ = false, motion_ = true;
     std::function<void()> onStop_, onPause_;

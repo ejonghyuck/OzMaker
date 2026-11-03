@@ -30,6 +30,8 @@ public:
 
     // Encoder that would be used, e.g. "NVIDIA H.264 Encoder MFT"; empty if the codec isn't available.
     static std::wstring FindEncoder(bool hevc, bool hardware);
+    // Whether Windows can play HEVC here (the HEVC Video Extensions, or a decoder that came with the graphics driver).
+    static bool HevcDecoderAvailable();
     // "NVIDIA H.264 Encoder MFT" -> "NVIDIA".
     static std::wstring Vendor(const std::wstring& encoderName);
     // Reasonable bitrate for the size and frame rate when the user leaves it on automatic.
