@@ -1,6 +1,14 @@
 # OzMaker
 
-Win32 + Direct2D, immediate-mode UI (`src/Ui.*`). Views are in `src/AppViews.cpp`; test modes are in `src/SelfTest.cpp`. The README's "테스트용 명령줄" section lists them.
+Win32 + Direct2D, immediate-mode UI (`src/Ui.*`). Views are in `src/AppViews.cpp`; test modes are in `src/SelfTest.cpp`. The "테스트용 명령줄" section of `docs/development.md` lists them.
+
+## Docs
+
+- `README.md` is the landing page for users: what it does, download, highlights, FAQ. Keep it short and free of build or implementation detail.
+- `docs/guide.md` is the manual. Describe new features and settings there; add a line to the README only for a headline feature.
+- `docs/development.md` holds how it works, building, packaging and test commands.
+- The zip carries `README.txt`, made from `tools/zip-readme.txt`, not the README.
+- README images in `docs/images` come from `--readme-media docs\images` (made-up windows and a drawn game, no screen capture). After a UI change that shows in them, run it again, look at the files, and update the GIF size in the README caption.
 
 ## Build and test
 

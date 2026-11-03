@@ -146,6 +146,30 @@ ComPtr<ID2D1Bitmap1> Gfx::CreateBitmapFromWic(IWICBitmapSource* src) {
 
 bool Gfx::RenderToPng(const wchar_t* path, UINT w, UINT h, float dpi,
                       const std::function<void(ID2D1DeviceContext*)>& draw) {
+    std::vector<uint8_t> px;
+    if (!RenderToPixels(w, h, dpi, draw, px)) return false;
+    ComPtr<IWICBitmap> wb;
+    if (FAILED(wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppPBGRA, w * 4, w * h * 4, px.data(), &wb)))
+        return false;
+
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> enc;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    if (FAILED(wic_->CreateStream(&stream)) || FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE)) ||
+        FAILED(wic_->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) ||
+        FAILED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
+        FAILED(enc->CreateNewFrame(&frame, nullptr)) || FAILED(frame->Initialize(nullptr)))
+        return false;
+    frame->SetSize(w, h);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    frame->SetPixelFormat(&fmt);
+    if (FAILED(frame->WriteSource(wb.Get(), nullptr)) || FAILED(frame->Commit()) || FAILED(enc->Commit()))
+        return false;
+    return true;
+}
+
+bool Gfx::RenderToPixels(UINT w, UINT h, float dpi, const std::function<void(ID2D1DeviceContext*)>& draw,
+                         std::vector<uint8_t>& bgra) {
     D2D1_BITMAP_PROPERTIES1 tp = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
         96.f, 96.f);
@@ -170,23 +194,8 @@ bool Gfx::RenderToPng(const wchar_t* path, UINT w, UINT h, float dpi,
 
     D2D1_MAPPED_RECT m;
     if (FAILED(cpu->Map(D2D1_MAP_OPTIONS_READ, &m))) return false;
-    ComPtr<IWICBitmap> wb;
-    HRESULT hr = wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppPBGRA, m.pitch, m.pitch * h, m.bits, &wb);
+    bgra.resize((size_t)w * h * 4);
+    for (UINT y = 0; y < h; ++y) memcpy(bgra.data() + (size_t)y * w * 4, m.bits + (size_t)y * m.pitch, (size_t)w * 4);
     cpu->Unmap();
-    if (FAILED(hr)) return false;
-
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> enc;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    if (FAILED(wic_->CreateStream(&stream)) || FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE)) ||
-        FAILED(wic_->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) ||
-        FAILED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
-        FAILED(enc->CreateNewFrame(&frame, nullptr)) || FAILED(frame->Initialize(nullptr)))
-        return false;
-    frame->SetSize(w, h);
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    frame->SetPixelFormat(&fmt);
-    if (FAILED(frame->WriteSource(wb.Get(), nullptr)) || FAILED(frame->Commit()) || FAILED(enc->Commit()))
-        return false;
     return true;
 }

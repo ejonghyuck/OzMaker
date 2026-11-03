@@ -474,6 +474,130 @@ void DrawSynthetic(uint8_t* p, int w, int h, double t) {
         }
 }
 
+// The made-up game in the README pictures (--readme-media), drawn at 320×180 and scaled up by whole pixels. Flat
+// colours and a still background, with only the hero, the stars and the counter moving, keep GIF frames small. The
+// hero runs on the spot and jumps once a second for the star coming at it.
+constexpr int kDemoW = 320, kDemoH = 180;
+
+struct DemoCanvas {
+    int w, h;
+    std::vector<uint32_t> px;  // BGRA
+    DemoCanvas(int w, int h, uint32_t fill) : w(w), h(h), px((size_t)w * h, fill) {}
+    void Box(int x0, int y0, int x1, int y1, uint32_t c) {
+        x0 = std::max(x0, 0), y0 = std::max(y0, 0), x1 = std::min(x1, w), y1 = std::min(y1, h);
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) px[(size_t)y * w + x] = c;
+    }
+    // The top half of an ellipse standing on `base`: a hill.
+    void Hill(int cx, int base, int rx, int ry, uint32_t c) {
+        for (int y = base - ry; y < base; ++y) {
+            double dy = (base - y) / (double)ry;
+            int hw = (int)(rx * std::sqrt(std::max(0.0, 1 - dy * dy)));
+            Box(cx - hw, y, cx + hw, y + 1, c);
+        }
+    }
+    void Diamond(int cx, int cy, int r, uint32_t c) {
+        for (int dy = -r; dy <= r; ++dy) {
+            int hw = r - std::abs(dy);
+            Box(cx - hw, cy + dy, cx + hw + 1, cy + dy + 1, c);
+        }
+    }
+    // A 3×5 digit, s pixels to a dot.
+    void Digit(int x, int y, int d, int s, uint32_t c) {
+        static const uint16_t font[10] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7292, 0x7BEF, 0x7BCF};
+        for (int i = 0; i < 15; ++i)
+            if (font[d] >> (14 - i) & 1) Box(x + i % 3 * s, y + i / 3 * s, x + i % 3 * s + s, y + i / 3 * s + s, c);
+    }
+    // The hero: an orange block with one eye, 16×16 from its top left.
+    void Hero(int x, int y) {
+        const uint32_t body = 0xFFFF8A3D, shade = 0xFFE06A20, ink = 0xFF1D2433;
+        Box(x + 1, y, x + 15, y + 16, body);
+        Box(x, y + 1, x + 16, y + 15, body);
+        Box(x + 13, y + 2, x + 15, y + 15, shade);
+        Box(x + 2, y + 13, x + 15, y + 15, shade);
+        Box(x + 10, y + 4, x + 13, y + 9, ink);
+    }
+};
+
+std::vector<uint32_t> DemoFrame(double t) {
+    const uint32_t ink = 0xFF1D2433;
+    const int ground = 150;
+    DemoCanvas c(kDemoW, kDemoH, 0xFF4FB3E8);   // sky
+    c.Box(280, 14, 298, 32, 0xFFFFE27A);         // sun
+    const int clouds[2][2] = {{58, 36}, {196, 26}};
+    for (const auto& cl : clouds) {
+        c.Box(cl[0] - 22, cl[1] - 4, cl[0] + 22, cl[1] + 4, 0xFFF4FBFF);
+        c.Box(cl[0] - 12, cl[1] - 9, cl[0] + 10, cl[1] - 3, 0xFFF4FBFF);
+    }
+    c.Hill(250, ground, 86, 48, 0xFF5DB45C);
+    c.Hill(64, ground, 104, 38, 0xFF6CC36A);
+    c.Box(0, ground, kDemoW, ground + 5, 0xFF4FA54A);  // grass
+    c.Box(0, ground + 5, kDemoW, kDemoH, 0xFF8A5A3B);  // earth
+    for (int y = ground + 11; y < kDemoH; y += 10)
+        for (int x = y * 7 % 23; x < kDemoW; x += 23) c.Box(x, y, x + 4, y + 2, 0xFF7A4E33);
+
+    // A jump takes 0.6 s of every second; the star of jump k meets the hero at its top, at k + kMeet.
+    const int hx = 72, rise = 46, speed = 110;
+    const double kUp = 0.15, kLen = 0.6, kMeet = kUp + kLen / 2;
+    double v = (t - std::floor(t) - kUp) / kLen;
+    int lift = v > 0 && v < 1 ? (int)std::lround(rise * 4 * v * (1 - v)) : 0;
+    int hy = ground - 18 - lift;
+    const int starY = ground - 10 - rise;
+    int caught = t >= kMeet ? (int)std::floor(t - kMeet) + 1 : 0;
+    for (int k = caught; k < caught + 4; ++k) {
+        int sx = hx + 8 + (int)std::lround(speed * (k + kMeet - t));
+        c.Diamond(sx, starY, 5, 0xFFE0A800);
+        c.Diamond(sx, starY, 3, 0xFFFFD23F);
+    }
+    if (double since = t - (caught - 1 + kMeet); caught > 0 && since < 0.25) {
+        int d = 7 + (int)(since * 40);  // a sparkle where it was caught
+        const int dirs[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+        for (const auto& s : dirs) {
+            int x = hx + 8 + s[0] * d, y = starY + s[1] * d;
+            c.Box(x - 1, y - 1, x + 1, y + 1, 0xFFFFFFFF);
+        }
+    }
+    c.Hero(hx, hy);
+    if (!lift) {  // running: the feet take turns
+        bool step = (int)(t * 8) % 2;
+        c.Box(hx + (step ? 2 : 4), hy + 16, hx + (step ? 6 : 8), hy + 18, ink);
+        c.Box(hx + (step ? 10 : 8), hy + 16, hx + (step ? 14 : 12), hy + 18, ink);
+    } else {
+        c.Box(hx + 3, hy + 16, hx + 7, hy + 18, ink);
+        c.Box(hx + 9, hy + 16, hx + 13, hy + 18, ink);
+    }
+    // The star counter, top left.
+    c.Diamond(14, 14, 5, 0xFFE0A800);
+    c.Diamond(14, 14, 3, 0xFFFFD23F);
+    int n = 12 + caught;
+    for (int i = 0; i < 3; ++i) {
+        int d = n / (i == 0 ? 100 : i == 1 ? 10 : 1) % 10;
+        c.Digit(25 + i * 8 + 1, 9 + 1, d, 2, ink);
+        c.Digit(25 + i * 8, 9, d, 2, 0xFFFFFFFF);
+    }
+    return std::move(c.px);
+}
+
+// The scene scaled to w×h, nearest pixel.
+void DrawDemoScene(uint8_t* p, int w, int h, double t) {
+    auto src = DemoFrame(t);
+    auto* d = reinterpret_cast<uint32_t*>(p);
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* row = src.data() + (size_t)(y * kDemoH / h) * kDemoW;
+        for (int x = 0; x < w; ++x) d[(size_t)y * w + x] = row[x * kDemoW / w];
+    }
+}
+
+// The game's icon in the window list: the hero, 32×32, clear around it.
+std::vector<uint32_t> DemoIcon() {
+    DemoCanvas c(16, 16, 0);
+    c.Hero(0, 0);
+    std::vector<uint32_t> out(32 * 32);
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x) out[y * 32 + x] = c.px[y / 2 * 16 + x / 2];
+    return out;
+}
+
 bool SavePng(IWICImagingFactory* wic, const std::wstring& path, const uint8_t* bgra, int w, int h) {
     ComPtr<IWICBitmap> bmp;
     if (FAILED(wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGRA, w * 4, w * h * 4,
@@ -2013,6 +2137,406 @@ int App::RunScreenshots(const std::wstring& dir) {
     if (standIn) DestroyWindow(standIn);
     log(layerErrors ? util::Format(L"RESULT: %d screen(s) with layering errors", layerErrors) : L"RESULT: all passed");
     return layerErrors ? 2 : 0;
+}
+
+// README pictures (--readme-media <dir>): the 녹화 tab, the area picker, the editor and the export panel as PNGs at
+// twice the pixels, and hero.gif, a pointer going from picking a window to copying the saved 움짤. All drawn offscreen
+// like --screenshot, over made-up windows (the game above): nothing is captured from the screen. OzMaker's own
+// encoder saves the GIF.
+int App::RunReadmeMedia(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\readme-media.log");
+    int failures = 0;
+    bool layerFailed = false;
+    const float W = 1120, H = 780;
+    double clock = util::NowSeconds();
+    double scene = 0;  // the game's clock
+    UiInput mouse;
+    ui_.KeepRects(true);
+    settings_.source = kSourceWindow;
+    settings_.output = kOutputClip;
+
+    // Made-up windows; hidden stand-ins give them handles (the preview takes its shape, 16:9, from the first).
+    std::vector<WinInfo> wins;
+    const wchar_t* titles[] = {L"데모 게임", L"여행 계획 - 메모", L"사진 보기"};
+    const wchar_t* exes[] = {L"DemoGame.exe", L"Memo.exe", L"Viewer.exe"};
+    const SIZE sizes[] = {{1280, 720}, {960, 720}, {1200, 800}};
+    for (int i = 0; i < 3; ++i) {
+        WinInfo w;
+        w.hwnd = MakeStandInWindow(inst_);
+        w.title = titles[i];
+        w.exeName = exes[i];
+        w.frame = {0, 0, sizes[i].cx, sizes[i].cy};
+        SetWindowPos(w.hwnd, nullptr, 0, 0, sizes[i].cx, sizes[i].cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        icons_[w.hwnd] = nullptr;
+        wins.push_back(w);
+    }
+    const HWND game = wins[0].hwnd;
+    std::vector<uint32_t> icon = DemoIcon();
+    icons_[game] = gfx_.CreateBitmap(32, 32, icon.data(), 32 * 4);
+
+    // The pointer (hero.gif only): an arrow, and an amber ripple where it clicks, as 클릭 강조 draws it.
+    struct Ripple {
+        float x, y;
+        double at;
+    };
+    std::vector<Ripple> ripples;
+    D2D1_POINT_2F ptr{-100, -100};
+    bool showPointer = false;
+    ComPtr<ID2D1PathGeometry> arrow;
+    {
+        ComPtr<ID2D1GeometrySink> sink;
+        gfx_.D2D()->CreatePathGeometry(&arrow);
+        arrow->Open(&sink);
+        const D2D1_POINT_2F pts[] = {{0, 16.5f}, {4, 12.6f}, {6.8f, 18.8f}, {9.4f, 17.7f}, {6.7f, 11.7f}, {11.8f, 11.7f}};
+        sink->BeginFigure({0, 0}, D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLines(pts, 6);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink->Close();
+    }
+
+    std::vector<uint8_t> px;
+    auto render = [&](float dpi) {
+        dpi_ = (UINT)dpi;
+        UINT pw = (UINT)(W * dpi / 96), ph = (UINT)(H * dpi / 96);
+        return gfx_.RenderToPixels(pw, ph, dpi, [&](ID2D1DeviceContext* dc) {
+            windows_ = wins;  // nothing here lists the real ones
+            ui_.Begin(dc, mouse, clock);
+            thumbWanted_ = false;
+            DrawFrame(Rect(0, 0, W, H));
+            ui_.End();
+            if (ui_.LayerErrors() && !layerFailed) {
+                layerFailed = true;
+                ++failures;
+                const Rect& e = ui_.FirstLayerError();
+                log(util::Format(L"FAIL layering error at %.0f,%.0f-%.0f,%.0f", e.l, e.t, e.r, e.b));
+            }
+            // The game where the live preview goes (on screen DWM draws that).
+            if (thumbWanted_ && target_) {
+                RECT dest, src;
+                PreviewLayout(dest, src);
+                std::vector<uint32_t> frame = DemoFrame(scene);
+                auto bmp = gfx_.CreateBitmap(kDemoW, kDemoH, frame.data(), kDemoW * 4);
+                const float s = Scale();
+                D2D1_RECT_F d{dest.left / s, dest.top / s, dest.right / s, dest.bottom / s};
+                for (const RECT& p : PreviewParts(dest)) {
+                    dc->PushAxisAlignedClip({p.left / s, p.top / s, p.right / s, p.bottom / s}, D2D1_ANTIALIAS_MODE_ALIASED);
+                    dc->DrawBitmap(bmp.Get(), d, 1.f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+                    dc->PopAxisAlignedClip();
+                }
+            }
+            if (showPointer) {
+                ComPtr<ID2D1SolidColorBrush> b;
+                dc->CreateSolidColorBrush(D2D1::ColorF(0xFBBF24), &b);
+                for (const Ripple& r : ripples) {
+                    float a = (float)((clock - r.at) / 0.5);
+                    if (a < 0 || a >= 1) continue;
+                    float e = 1 - (1 - a) * (1 - a) * (1 - a), rad = 12 + 22 * e;
+                    D2D1_ELLIPSE el{{r.x, r.y}, rad, rad};
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.32f * (1 - a)));
+                    dc->FillEllipse(el, b.Get());
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.95f * (1 - a * a)));
+                    dc->DrawEllipse(el, b.Get(), 3.5f);
+                }
+                if (mouse.down) {  // held: a dot under the pointer
+                    D2D1_ELLIPSE el{ptr, 9, 9};
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.45f));
+                    dc->FillEllipse(el, b.Get());
+                }
+                dc->SetTransform(D2D1::Matrix3x2F::Scale(1.4f, 1.4f) * D2D1::Matrix3x2F::Translation(ptr.x, ptr.y));
+                b->SetColor(D2D1::ColorF(D2D1::ColorF::White));
+                dc->FillGeometry(arrow.Get(), b.Get());
+                b->SetColor(D2D1::ColorF(0x111111));
+                dc->DrawGeometry(arrow.Get(), b.Get(), 0.8f);
+                dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            }
+        }, px);
+    };
+    // A PNG of part of the window (DIPs) at twice the pixels, after a few passes so animated values settle. No
+    // pointer, nothing hovered.
+    auto still = [&](const wchar_t* name, Rect part) {
+        UiInput keep = std::exchange(mouse, {});
+        bool pointer = std::exchange(showPointer, false);
+        for (int pass = 0; pass < 10; ++pass) {
+            clock += 0.05;
+            render(192);
+        }
+        mouse = keep;
+        showPointer = pointer;
+        const int sw = (int)(W * 2);
+        RECT r{(LONG)(part.l * 2), (LONG)(part.t * 2), (LONG)(part.r * 2), (LONG)(part.b * 2)};
+        int w = r.right - r.left, h = r.bottom - r.top;
+        std::vector<uint8_t> out((size_t)w * h * 4);
+        for (int y = 0; y < h; ++y)
+            memcpy(out.data() + (size_t)y * w * 4, px.data() + ((size_t)(r.top + y) * sw + r.left) * 4, (size_t)w * 4);
+        bool ok = SavePng(gfx_.Wic(), dir + L"\\" + name, out.data(), w, h);
+        if (!ok) ++failures;
+        log(util::Format(L"%s: %s %dx%d", name, ok ? L"ok" : L"FAIL", w, h));
+    };
+    // The size estimate (and what 용량 맞추기 picks) is worked out on a thread: wait for it, so frames show it.
+    auto settle = [&] {
+        for (double until = util::NowSeconds() + 30; util::NowSeconds() < until;) {
+            UpdateEstimate();
+            Sleep(5);
+            OnEstimate();  // no window to notify here: poll for the result
+            if (!fitting_ && !estimator_.Busy() && estValid_ && estKey_ == EstimateKey()) break;
+        }
+    };
+    // What the game window showed from `from` for `seconds`, as a recording of it (30 fps, 960×540).
+    auto recordGame = [&](double from, double seconds) {
+        auto s = std::make_shared<FrameStore>();
+        std::wstring err;
+        if (!s->Open(960, 540, err)) return s;
+        int n = (int)std::lround(seconds * 30);
+        for (int i = 0; i < n; ++i) {
+            auto buf = s->Acquire();
+            DrawDemoScene(buf->data(), 960, 540, from + i / 30.0);
+            while (!s->Submit(buf, (int64_t)(i * 1e7 / 30))) Sleep(1);
+        }
+        s->Finish((int64_t)(n * 1e7 / 30));
+        return s;
+    };
+    auto openRecording = [&](std::shared_ptr<Clip> clip) {
+        OpenEditor(std::move(clip));
+        if (thumbThread_.joinable()) thumbThread_.join();  // let it finish (StopThumbnails would cancel)
+        thumbs_.clear();
+        for (auto& p : thumbPixels_) thumbs_.push_back(gfx_.CreateBitmap(thumbW_, thumbH_, p.data(), thumbW_ * 4));
+        clipName_ = L"데모 게임";
+        held_ = {{clip_, clock, clipName_}};
+        settle();
+    };
+
+    // ---- 녹화 tab: the game picked, mid-jump.
+    screen_ = Screen::Home;
+    target_ = game;
+    scene = 1.33;
+    still(L"record.png", Rect(0, 0, W, H));
+
+    // ---- The area picker over a made-up desktop with the game's window on it, 16:9 fixed.
+    monitors_ = EnumerateMonitors();
+    for (auto& m : monitors_) {
+        if (!m.primary) continue;
+        const RECT& mr = m.rect;
+        const int mw = mr.right - mr.left, mh = mr.bottom - mr.top;
+        const int gw = std::min(960, mw * 6 / 10), gh = gw * 9 / 16, gx = (mw - gw) / 2, gy = (mh - gh) / 2 - 40;
+        // The area over the right of the game, clear of its counter (the size label goes above the area).
+        const int ax = gx + 200, ay = gy + 32 + 70, aw = gw - 240;
+        POINT a{mr.left + ax, mr.top + ay}, c{mr.left + ax + aw, mr.top + ay + aw * 9 / 16};
+        // The game's window and a margin; the bar under the area stays inside it.
+        const int cx = std::max(0, gx - 40), cy = std::max(0, gy - 40);
+        const int cw = std::min(mw - cx, gw + 80), ch = std::min(mh - cy, gh + 32 + 80);
+        bool ok = gfx_.RenderToPixels(cw * 2, ch * 2, 192, [&](ID2D1DeviceContext* dc) {
+            dc->SetTransform(D2D1::Matrix3x2F::Translation((float)-cx, (float)-cy));
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH((float)gx, (float)gy, (float)gw, 32.f + gh), theme::Hex(0xE6E8EC), 8);
+            p.Text(Rect::XYWH(gx + 14.f, (float)gy, 300.f, 32.f), L"데모 게임", 13.f, theme::Hex(0x1D2433));
+            std::vector<uint32_t> frame = DemoFrame(2.4);
+            auto bmp = gfx_.CreateBitmap(kDemoW, kDemoH, frame.data(), kDemoW * 4);
+            dc->DrawBitmap(bmp.Get(), D2D1::RectF((float)gx, gy + 32.f, (float)(gx + gw), (float)(gy + 32 + gh)), 1.f,
+                           D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Adjust);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        }, px);
+        ok = ok && SavePng(gfx_.Wic(), dir + L"\\region.png", px.data(), cw * 2, ch * 2);
+        if (!ok) ++failures;
+        log(util::Format(L"region.png: %s %dx%d", ok ? L"ok" : L"FAIL", cw * 2, ch * 2));
+        break;
+    }
+
+    // ---- hero.gif, 15 frames a second. The pointer moves onto controls where the last frame laid them out. Clicks
+    // that only change what is on screen go to the app as they are; record, stop, save and copy are acted out
+    // instead, so no capture starts, nothing is written and the clipboard is left alone.
+    const double kFps = 15;
+    auto store = std::make_shared<FrameStore>();
+    std::wstring err;
+    if (!store->Open((int)W, (int)H, err)) {
+        log(L"hero.gif: FAIL " + err);
+        return 1;
+    }
+    int frames = 0;
+    double heroT = 0;
+    std::function<void()> each;  // per frame: the recording time, the playhead
+    auto frame = [&] {
+        mouse.mx = ptr.x;
+        mouse.my = ptr.y;
+        if (each) each();
+        render(96);
+        mouse.ClearEdges();
+        mouse.composing.clear();
+        auto buf = store->Acquire();
+        auto* d = reinterpret_cast<uint32_t*>(buf->data());
+        auto* s = reinterpret_cast<const uint32_t*>(px.data());
+        for (size_t i = 0; i < (size_t)(W * H); ++i) d[i] = s[i] | 0xFF000000u;
+        while (!store->Submit(buf, (int64_t)std::llround(frames * 1e7 / kFps))) Sleep(1);
+        ++frames;
+        heroT += 1 / kFps;
+        clock += 1 / kFps;
+        scene += 1 / kFps;
+    };
+    auto wait = [&](double seconds) {
+        for (double end = heroT + seconds - 1e-6; heroT < end;) frame();
+    };
+    auto moveTo = [&](float x, float y, double seconds) {
+        D2D1_POINT_2F from = ptr;
+        int n = std::max(1, (int)std::lround(seconds * kFps));
+        for (int i = 1; i <= n; ++i) {
+            float u = i / (float)n, e = u * u * (3 - 2 * u);
+            ptr = {from.x + (x - from.x) * e, from.y + (y - from.y) * e};
+            frame();
+        }
+    };
+    auto moveOnto = [&](UiId id, double seconds) {
+        if (const Rect* r = ui_.LastRect(id)) return moveTo(r->CX(), r->CY(), seconds);
+        log(util::Format(L"hero.gif: FAIL no control %08X on screen at %.1fs", id, heroT));
+        ++failures;
+    };
+    auto click = [&](bool real) {
+        ripples.push_back({ptr.x, ptr.y, clock});
+        if (!real) return frame();
+        mouse.pressed = mouse.down = true;
+        frame();
+        mouse.down = false;
+        mouse.released = true;
+        frame();
+    };
+    double playFrom = 0;
+    auto play = [&] {  // the playhead where playback would have it on this clock
+        playing_ = true;
+        playBack_ = false;
+        shuttle_ = 0;
+        const int64_t start = clip_->Ts(inF_), len = std::max<int64_t>(1, RangeEndTs() - start);
+        playTs_ = start + (int64_t)std::fmod((heroT - playFrom) * 1e7, (double)len);
+        playWall_ = util::NowSeconds();
+    };
+
+    screen_ = Screen::Home;
+    target_ = nullptr;
+    showPointer = true;
+    ptr = {600, 470};
+    scene = 0.2;
+    wait(0.3);
+    moveOnto(HashId("win", (uint32_t)(uintptr_t)game), 0.6);
+    click(true);  // picks the game: the preview comes up
+    wait(0.5);
+    moveOnto(HashId("home.rec"), 0.6);
+    wait(0.15);
+    click(false);
+    const double recFrom = scene;
+    rec_ = RecState::Recording;
+    each = [&] { recElapsedForTest_ = scene - recFrom; };
+    wait(2.0);
+    click(false);  // stop: the editor opens on the recording, playing
+    each = nullptr;
+    rec_ = RecState::Idle;
+    recElapsedForTest_ = -1;
+    openRecording(recordGame(recFrom, scene - recFrom));
+    playFrom = heroT;
+    each = play;
+    wait(0.6);
+    // The end of the range dragged in.
+    moveOnto(HashId("tl.out"), 0.5);
+    each = nullptr;
+    playing_ = false;
+    ripples.push_back({ptr.x, ptr.y, clock});
+    mouse.pressed = mouse.down = true;
+    if (const Rect* track = ui_.LastRect(HashId("tl.scrub")))
+        moveTo(track->l + track->W() * 0.7f, ptr.y, 0.7);
+    mouse.down = false;
+    mouse.released = true;
+    frame();
+    settle();
+    playFrom = heroT;
+    each = play;
+    wait(0.3);
+    // 자막, typed through the IME (each syllable shows being composed first).
+    moveOnto(HashId("tr.caption"), 0.5);
+    click(true);
+    for (wchar_t ch : std::wstring(L"보스 처치!")) {
+        if (ch >= 0xAC00 && ch <= 0xD7A3) {
+            mouse.composing = std::wstring(1, ch);
+            frame();
+        }
+        mouse.chars = std::wstring(1, ch);
+        frame();
+    }
+    mouse.keys.push_back(VK_RETURN);
+    frame();
+    settle();
+    wait(0.3);
+    moveOnto(Ui::CellId(HashId("ex.target"), 2), 0.6);
+    click(true);  // 10MB
+    settle();
+    wait(0.4);
+    // export.png now, while the panel shows the estimate (the saved file's card takes its place). The still moves the
+    // clock on half a second; nothing on screen is moving then.
+    const Rect* save = ui_.LastRect(HashId("ex.save"));
+    const float split = save ? save->l - 18 : 784;
+    still(L"export.png", Rect(split - 16, 60, W, H));
+    moveOnto(HashId("ex.save"), 0.5);
+    click(false);
+    {
+        // The real export of this range, for the size on the card; the file goes away again.
+        ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[fmt_]);
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        job.path = std::wstring(tmp) + L"OzMaker_readme_result.gif";
+        Exporter ex;
+        ExportResult r = ExportSync(ex, job);
+        DeleteFileW(job.path.c_str());
+        if (!r.ok) ++failures;
+        log(util::Format(L"saved range: %s %s, %d frames", r.ok ? L"ok" : L"FAIL", util::FormatBytes(r.bytes).c_str(),
+                         r.frames));
+        lastResult_ = r;
+        lastResult_.path = settings_.outDir + L"\\OzMaker_20261103_142311.gif";
+        hasResult_ = true;
+        resultOriginal_ = false;
+        DropHeld(clip_.get());
+    }
+    wait(0.6);
+    moveOnto(HashId("res.copy"), 0.5);
+    click(false);
+    toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
+    toastError_ = false;
+    toastUntil_ = clock + 30;
+    wait(1.2);
+    each = nullptr;
+    showPointer = false;
+    store->Finish((int64_t)std::llround(frames * 1e7 / kFps));
+    {
+        ExportJob job;
+        job.clip = store;
+        job.first = 0;
+        job.last = store->Count() - 1;
+        job.crop = {0, 0, (LONG)W, (LONG)H};
+        job.outW = (int)W;
+        job.outH = (int)H;
+        job.format = Format::Gif;
+        job.quality = 90;
+        job.holdLastMs = 1000;
+        job.path = dir + L"\\hero.gif";
+        Exporter ex;
+        ExportResult r = ExportSync(ex, job);
+        if (!r.ok) ++failures;
+        log(util::Format(L"hero.gif: %s %s, %d frames, %.1fs", r.ok ? L"ok" : L"FAIL",
+                         util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds));
+    }
+
+    // ---- The editor as the GIF ends: the range dragged in, the caption.
+    toastUntil_ = 0;
+    playing_ = false;
+    Seek(inF_ + (outF_ - inF_) * 2 / 5);
+    still(L"edit.png", Rect(0, 60, split, H));
+
+    held_.clear();
+    CloseClip();
+    target_ = nullptr;
+    windows_.clear();
+    for (const WinInfo& w : wins) DestroyWindow(w.hwnd);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 1 : 0;
 }
 
 namespace {

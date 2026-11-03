@@ -245,6 +245,7 @@ private:
     int RunPreviewTest(const std::wstring& dir);
     int RunTestWindow(double seconds);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
+    int RunReadmeMedia(const std::wstring& dir);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
     std::shared_ptr<FrameStore> MakeSyntheticClip(int w, int h, int frames, double fps, bool finish = true);
 
@@ -383,6 +384,8 @@ private:
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
     bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
     bool portableForTest_ = false;   // screenshots: the settings as a portable copy shows them
+    double recElapsedForTest_ = -1;  // README pictures: the time a made-up recording shows (-1: the real one)
+    double RecElapsed() const { return recElapsedForTest_ >= 0 ? recElapsedForTest_ : capture_.Elapsed(); }
 
     Updater updater_;
     bool updateOpen_ = false;  // the popover under the update button

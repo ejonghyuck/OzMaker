@@ -255,6 +255,7 @@ bool Ui::Hover(const Rect& r) const {
 }
 
 bool Ui::Click(UiId id, const Rect& r, bool enabled) {
+    if (keepRects_) rects_[id] = r;
     bool h = enabled && Hover(r);
     if (h) cursor_ = IDC_HAND;
     if (h && in_.pressed && !pressTaken_) {
@@ -347,7 +348,7 @@ bool Ui::Segmented(UiId id, const Rect& r, std::initializer_list<std::wstring_vi
     int i = 0;
     for (auto& s : items) {
         Rect cell = Rect::XYWH(r.l + pad + i * iw, r.t + pad, iw, r.H() - pad * 2);
-        UiId cid = (id ^ (uint32_t)(i + 1) * 2654435761u) | 1;
+        UiId cid = CellId(id, i);
         bool en = !(disabledMask & (1u << i));
         if (Click(cid, cell, en) && sel != i) {
             sel = i;

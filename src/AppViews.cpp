@@ -167,7 +167,7 @@ void App::DrawHeader(Rect r) {
     if (rec_ != RecState::Recording) {
         if (screen_ != Screen::Settings) DrawTabs(r);
     } else {
-        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(capture_.Elapsed(), true);
+        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(RecElapsed(), true);
         const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
         Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
         ui_.Fill(pill, WithAlpha(tint, 0.16f), 15);
@@ -1015,7 +1015,7 @@ void App::DrawCapturePanel(Rect r) {
     } else {
         ui_.Fill(Rect::Centered(btn.CX() - 70, btn.CY(), 14, 14), Rec, 3);
         std::wstring t2 = rec_ == RecState::Countdown ? L"카운트다운 취소"
-                                                 : L"녹화 중지  " + util::FormatClock(capture_.Elapsed(), true);
+                                                 : L"녹화 중지  " + util::FormatClock(RecElapsed(), true);
         TextStyle st = Bold();
         st.tabular = true;
         ui_.Text(Rect(btn.CX() - 52, btn.t, btn.r, btn.b), t2, 16.f, White, st);

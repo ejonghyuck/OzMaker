@@ -89,6 +89,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     auto args = SplitArgs(cmdLine);
     if (args.size() >= 2 && args[0] == L"--crash-test") return RunCrashTest(args);
     if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
+    if (args.size() >= 2 && args[0] == L"--readme-media") return RunReadmeMedia(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
     if (args.size() >= 2 && args[0] == L"--analyze") return RunAnalyzeTest(cmdLine);

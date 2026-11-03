@@ -191,6 +191,15 @@ public:
     const Rect& FirstLayerError() const { return layerError_; }
     void Painted(const Rect& r) override;
 
+    // Tests (--readme-media): where each clickable was laid out last, for a scripted pointer to go to.
+    void KeepRects(bool on) { keepRects_ = on; }
+    const Rect* LastRect(UiId id) const {
+        auto it = rects_.find(id);
+        return it == rects_.end() ? nullptr : &it->second;
+    }
+    // The id of a Segmented control's cell i.
+    static UiId CellId(UiId id, int i) { return (id ^ (uint32_t)(i + 1) * 2654435761u) | 1; }
+
 private:
     UiInput in_, none_;
     double now_ = 0, last_ = 0;
@@ -219,4 +228,6 @@ private:
     double caretMoved_ = 0;  // the caret blinks from here
     Rect caretRect_;
     bool imeReset_ = false;
+    bool keepRects_ = false;
+    std::unordered_map<UiId, Rect> rects_;
 };

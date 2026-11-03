@@ -24,6 +24,9 @@ public:
     // Offscreen render to PNG (used by --screenshot for visual checks).
     bool RenderToPng(const wchar_t* path, UINT w, UINT h, float dpi,
                      const std::function<void(ID2D1DeviceContext*)>& draw);
+    // The same into memory: tightly packed premultiplied BGRA (--readme-media).
+    bool RenderToPixels(UINT w, UINT h, float dpi, const std::function<void(ID2D1DeviceContext*)>& draw,
+                        std::vector<uint8_t>& bgra);
 
 private:
     bool CreateDevice();
