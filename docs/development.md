@@ -15,6 +15,8 @@
 | 소리 | 프로세스 루프백: 창은 그 프로세스 트리만(`INCLUDE_TARGET_PROCESS_TREE`), 전체 화면 · 영역은 OzMaker의 프로세스 트리만 빼고(`EXCLUDE_TARGET_PROCESS_TREE`, 알림음이 녹음되지 않음. Windows 10 2004 전에는 WASAPI 시스템 루프백). OzMaker에서 여는 플레이어 · 브라우저는 탐색기를 통해 열어 OzMaker의 자식이 되지 않으므로 녹음에서 빠지지 않음. QPC 타임스탬프로 영상과 맞추고, 아무 소리도 없는 구간은 무음으로 채움. 마이크는 같은 시간축의 WASAPI 캡처를 표본 단위로 더해 한 트랙으로 |
 | 동영상 편집 | MP4의 샘플 테이블(stts/ctts/stss)에서 프레임 시각과 키프레임을 바로 읽어 디코딩 없이 색인(5분 영상 7 ms). 미리보기는 별도 스레드에서 GPU 디코딩(소스 리더 + D3D11)하며 가장 최근에 요청한 프레임만, 가능하면 앞으로 이어서, 아니면 직전 키프레임부터 디코딩. 내보내기는 고정 프레임 레이트로 다시 인코딩하고 소리는 같은 구간을 잘라 AAC로. 인코딩 없이 자르기는 구간 앞 키프레임부터의 샘플만 새 moov(파일 앞쪽)와 mdat 하나로 복사(영상·소리를 약 0.5초씩 번갈아). Media Foundation은 편집 목록(elst)의 media_time을 건너뛰지 않고 그만큼 뒤로 미루므로 media_time은 쓰지 않음: 영상은 합성 시각 차이(ctts)를 키프레임 기준으로 옮기고, 소리는 잘린 자리에서 가장 가까운 AAC 프레임 경계부터 시작(11 ms 안) |
 | 자막 | 미리보기는 DirectWrite로 화면에 바로 그리고, 내보낼 때는 같은 글자를 출력 크기의 WIC 비트맵에 한 번 그려 각 프레임의 글자가 있는 줄에만 섞음. 짧은 변의 7.5% 크기 굵은 글꼴, 그림자 + 검은 테두리 + 흰 글자, 너비의 92%를 넘으면 줄임 |
+| 코덱 자동 | H.264 인코더는 긴 변 4096, HEVC는 8192까지 받음. 자동은 해상도 상자를 적용한 크기가 4096을 넘고 HEVC 인코더(`MFTEnumEx` 인코더 분류)와 HEVC 디코더(디코더 분류, 보통 HEVC 비디오 확장)가 둘 다 있을 때만 HEVC, 아니면 H.264로 4096에 맞춰 줄임. 녹화(`App::PlannedSize` → `BeginCapture`의 `maxEdge`)와 MP4 내보내기(`App::MakeJob`)가 같은 규칙 |
+| 단축키 | 평소에는 `RegisterHotKey`. 다른 프로그램이 가진 조합은 사용자가 ‘그래도 OzMaker가 쓰기’를 누른 것만, 그리고 `RegisterHotKey`가 거절하는 동안만 저수준 키보드 후크(`src/KeyHook.cpp`, 전용 스레드의 `WH_KEYBOARD_LL`)로 받음. 후크는 그 조합의 누름을 `WM_HOTKEY`로 창에 보내고 그 누름 · 반복 · 뗌을 삼킴(수식 키가 정확히 같을 때만). Win · Alt가 든 조합은 시작 메뉴 · 메뉴 막대가 열리지 않도록 뜻 없는 키(vkE8)를 한 번 눌러 둠. 단축키를 지정하는 동안에도 켜서, OzMaker 창이 앞에 있을 때 단축키가 될 만한 조합을 칸으로 넘김(Alt+Tab · Ctrl+Esc 등은 그대로 둠). 키를 기록하지 않음 |
 | UI | Direct2D/DirectWrite로 직접 그린 즉시 모드 UI. 입력·애니메이션이 있을 때만 그려서 대기 중 CPU 0% |
 | 테마 | 색은 모두 `theme::P`(`src/Theme.h`)에서 가져옴. 다크 · 라이트 · 대비 테마(`GetSysColor`로 만듦) 중 하나로, `WM_SETTINGCHANGE` · `WM_SYSCOLORCHANGE` · `WM_THEMECHANGED`가 오면 다시 고름. 녹화할 화면 위에 뜨는 것(`src/Overlays.cpp`)은 대비 테마가 아니면 늘 다크. Windows의 애니메이션 효과가 꺼져 있으면 `Ui::AnimFrom`이 바로 목표값으로 감 |
 | 화면 낭독기 | UI Automation(`src/Access.cpp`): 창이 루트이고, 지난 프레임에 그린 노드(`Ui::Nodes`)가 그 아래 요소. 낭독기가 누르거나 바꾼 것은 다음 프레임의 입력으로 들어감 |
@@ -78,6 +80,8 @@ OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```
 
 테스트 명령은 Windows 설정과 관계없이 한국어 · 다크 테마로 그립니다(CI는 영어 Windows에서 돌아감). `--selftest`는 세 테마의 글씨 · 바탕 대비(4.5:1 이상)와 영어 표의 서식 필드도 검사합니다. 화면의 글을 바꾸면 `src/Lang.cpp`의 영어도 고치고 `--screenshot <dir> en`으로 확인하세요.
+
+`--selftest`는 0.6.4까지의 설정(최대 녹화 길이 → 녹화 타이머, H.264 → 코덱 자동)을 읽는 것, 설정 초기화가 남기는 것과 되돌리는 것, 코덱 자동이 고르는 코덱과 크기(가짜 인코더로)도 봅니다. 단축키 가져오기는 메시지 전용 창이 등록한 F23을 `SendInput`으로 눌러, 후크가 없을 때는 그 창이, 후크가 있을 때는 OzMaker만 받는지 확인합니다. 키 입력이 닿지 않는 데스크톱(잠긴 화면 등)에서는 건너뜁니다.
 
 환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini`(포터블이면 exe 옆의 `settings.ini`) 대신 그 파일을 씁니다(테스트용). `OZMAKER_UPDATE_URL`은 업데이트를 확인할 곳(주소 또는 폴더)을 바꿉니다.
 

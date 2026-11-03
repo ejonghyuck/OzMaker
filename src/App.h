@@ -4,6 +4,7 @@
 #include "Capture.h"
 #include "Exporter.h"
 #include "Gfx.h"
+#include "KeyHook.h"
 #include "Overlays.h"
 #include "Settings.h"
 #include "Ui.h"
@@ -37,6 +38,7 @@ private:
         WM_APP_ESTIMATE,
         WM_APP_UPDATE,
         WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
+        WM_APP_HOOKED_KEY,  // the keyboard hook took a combination while a hotkey is being chosen (#50)
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
@@ -55,6 +57,9 @@ private:
     float Scale() const { return dpi_ / 96.f; }
     void ShowMain(bool activate);
     void HideMain();
+    void MinimizeMain();  // a recording started: to the taskbar (설정 › 녹화 › 녹화를 시작하면, #46)
+    // While recording: the window stays out of the recording, and its taskbar button wears a red dot.
+    void SetRecordingLook(bool on);
     void RememberPlacement();  // into settings_, for the next start
     void Toast(std::wstring text, bool error = false);
     // A failure the user may not have seen happen (recording, saving, exporting): it stays until closed, and can
@@ -78,6 +83,10 @@ private:
     void DrawMonitorList(Rect r);
     void DrawRegionPanel(Rect r);
     void DrawCapturePanel(Rect r);
+    void DrawTimerChip(Rect& line);  // the record timer's button on the 녹화 tab, at the line's right (#47)
+    void AskReset();
+    void DrawTimerPopover(Rect client);
+    bool TimerFields(Rect r);    // 직접 입력's hours and minutes; true when they changed
     void DrawCapturePreview(Rect r);
     void DrawMonitorLayout(Rect r, const RECT* region, bool pickable);
     void DrawVideoResult(Rect r);
@@ -121,7 +130,8 @@ private:
     RecTarget MonitorTarget(HMONITOR m) const;
     bool CurrentTarget(RecTarget& t, std::wstring* why) const;
     void SourceSize(const RecTarget& t, int& w, int& h) const;
-    void PlannedSize(int sw, int sh, int& ow, int& oh) const;
+    // What a recording of sw×sh comes out at, and (MP4) whether it is HEVC.
+    void PlannedSize(int sw, int sh, int& ow, int& oh, bool* hevc = nullptr) const;
 
     // ---- recording
     void StartRecording(const RecTarget& target, bool fromHotkey);
@@ -132,14 +142,21 @@ private:
     void EditLastVideo();  // the video card's 편집
     void OnHotkey();
     void TogglePause();
-    // Every recording tick: the length limit and the free space (#17). Stops with a reason when one is reached.
+    // Every recording tick: the record timer (#47) and the free space (#17). Stops with a reason when one says so.
     void CheckLimits();
+    std::wstring TimerWords(int minutes) const;  // "3시간 20분"
     std::wstring RecordingDir() const;  // where the recording grows: the MP4's folder, or the clip's temp file
     bool NotifyQuietly() const;  // a fullscreen app is in front of a hotkey recording
     void ReportError(const std::wstring& title, const std::wstring& text, int settingsTab = -1);
     bool UseMonitorCapture(HWND target) const;
-    void ProbeEncoders();
-    std::wstring VideoSummary() const;
+    void ProbeEncoders() const;
+    bool HevcEncoder() const;   // this PC has an HEVC encoder
+    bool HevcPlayable() const;  // and plays HEVC (the HEVC Video Extensions)
+    // The codec of an MP4 whose longest edge is `edge` before the encoder's limit: 자동 takes HEVC only past what
+    // H.264 encoders take (#42).
+    bool UseHevc(int edge) const;
+    // The 녹화 tab's (or the export's) encoding in one line. bigHevc: 자동 picked HEVC for the size.
+    std::wstring VideoSummary(bool hevc, bool bigHevc = false) const;
     std::wstring AudioSummary(int source) const;
     std::wstring MicDeviceName() const;
     bool MicMenu(const Rect& anchor);
@@ -169,6 +186,9 @@ private:
         std::wstring title, body, yes;
         bool danger = false;  // yes destroys something: a red button
         std::function<void()> onYes;
+        wchar_t glyph = 0;  // the mark beside the title, if not the usual
+        // Lists under the title in place of the body: a heading and its lines each.
+        std::vector<std::pair<std::wstring, std::vector<std::wstring>>> lists;
     };
     void Ask(Question q);
     void DrawQuestion(Rect client);
@@ -230,6 +250,10 @@ private:
     void RegisterRecordHotkey();
     void RegisterPauseHotkey();  // only while recording, so the keys stay free for other programs otherwise
     void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause, 0 = none
+    void CaptureHotkey(UINT mods, UINT vk);  // a combination pressed while choosing one
+    void TakeHotkey();  // the conflict panel's 그래도 OzMaker가 쓰기 (#50)
+    void SyncKeyHook();  // the keyboard hook on for what needs it, off otherwise
+    void ResetSettings();  // 설정 › 일반 › 설정 초기화, once asked (#49)
     std::wstring HotkeyLabel() const;  // the record hotkey, or a note that there is none
     void TrayAdd();
     void TrayUpdate();
@@ -310,8 +334,13 @@ private:
     std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
     bool showVideo_ = false;
-    bool encProbed_ = false;
-    std::wstring encName_[2][2];  // [hevc][hardware]
+    mutable bool encProbed_ = false;
+    mutable std::wstring encName_[2][2];  // [hevc][hardware]
+    mutable int hevcPlayable_ = -1;       // probed once; -1 = not yet
+    int timerFiredFor_ = 0;  // the timer length (s) whose time came in this recording: once per length
+    bool timerOpen_ = false;  // the timer's popover on the 녹화 tab
+    Rect timerChip_;
+    std::wstring timerText_[2];  // 직접 입력's hours and minutes as typed
     int countdownLeft_ = 0;
     RecOverlay overlay_;
     PickerOverlay picker_;
@@ -403,6 +432,8 @@ private:
     bool portableForTest_ = false;   // screenshots: the settings as a portable copy shows them
     bool contrastForTest_ = false;   // screenshots: as in Windows' "High Contrast Black"
     double recElapsedForTest_ = -1;  // README pictures: the time a made-up recording shows (-1: the real one)
+    int hevcForTest_ = -1;  // screenshots: 0 no HEVC, 1 HEVC that plays, 2 an encoder without the extension
+    SIZE sourceForTest_{};  // screenshots: the size the target has (a 5K screen), zero: its own
     double RecElapsed() const { return recElapsedForTest_ >= 0 ? recElapsedForTest_ : capture_.Elapsed(); }
 
     Updater updater_;
@@ -422,7 +453,15 @@ private:
     Rect toastRect_;  // where the toast was drawn last frame: the page takes no input under an Alert
 
     int capturingHotkey_ = 0;  // the hotkey being chosen in the settings
-    bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
+    bool hotkeyOk_ = true, pauseHotkeyOk_ = true;  // it works: registered, or (taken over) through the hook
+    // A combination another program holds, pressed while choosing: the panel under the row offers to take it (#50).
+    struct HotkeyConflict {
+        int which = 0;  // kHotkeyRecord / kHotkeyPause, 0 = none
+        UINT mods = 0, vk = 0;
+    } hkConflict_;
+    KeyHook keyHook_;
+    bool hookRecord_ = false, hookPause_ = false;  // taken over and refused by RegisterHotKey: the hook has them
+    ComPtr<ITaskbarList3> taskbar_;
     std::vector<HWINEVENTHOOK> winHooks_;
     bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst
     std::vector<AudioCapture::Device> micDevices_;  // 설정 › 소리, listed when the tab is opened

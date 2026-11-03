@@ -531,6 +531,7 @@ void App::ShowMain(bool activate) {
     if (IsIconic(hwnd_)) ShowWindow(hwnd_, activate ? SW_RESTORE : SW_SHOWNOACTIVATE);
     ShowWindow(hwnd_, activate ? SW_SHOW : SW_SHOWNA);
     if (activate) SetForegroundWindow(hwnd_);
+    if (rec_ == RecState::Recording) SetRecordingLook(true);  // a taskbar button that only now exists
     if (screen_ == Screen::Home) RefreshWindows();
     Invalidate();
 }
@@ -538,6 +539,22 @@ void App::ShowMain(bool activate) {
 void App::HideMain() {
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
     SyncAudioPreview();
+}
+
+void App::MinimizeMain() {
+    if (hwnd_ && IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_MINIMIZE);  // hidden in the tray, it stays there
+    SyncAudioPreview();
+}
+
+void App::SetRecordingLook(bool on) {
+    if (!hwnd_) return;
+    // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later).
+    SetWindowDisplayAffinity(hwnd_, on ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    if (!taskbar_ &&
+        SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&taskbar_))) &&
+        FAILED(taskbar_->HrInit()))
+        taskbar_.Reset();
+    if (taskbar_) taskbar_->SetOverlayIcon(hwnd_, on ? iconRec_ : nullptr, on ? tr(L"녹화 중") : L"");
 }
 
 void App::RememberPlacement() {
@@ -638,6 +655,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (capturingHotkey_) {
+                // The keyboard hook takes the combinations first (KeyHook): this is what it let by, or all of it
+                // when the hook couldn't start.
                 UINT vk = (UINT)w;
                 if (vk == VK_ESCAPE) {
                     SetCapturingHotkey(0);
@@ -647,35 +666,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     if (GetKeyState(VK_MENU) < 0) mods |= MOD_ALT;
                     if (GetKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
                     if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
-                    bool fkey = vk >= VK_F1 && vk <= VK_F24;
-                    const bool record = capturingHotkey_ == kHotkeyRecord;
-                    UINT& hm = record ? settings_.hkMods : settings_.hkPauseMods;
-                    UINT& hv = record ? settings_.hkVk : settings_.hkPauseVk;
-                    const UINT otherMods = record ? settings_.hkPauseMods : settings_.hkMods;
-                    const UINT otherVk = record ? settings_.hkPauseVk : settings_.hkVk;
-                    if ((fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) && mods == otherMods &&
-                        vk == otherVk) {
-                        Toast(record ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
-                                     : tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요."),
-                              true);
-                    } else if (fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) {
-                        // Try it first; the keys are registered for real once capturing ends.
-                        if (RegisterHotKey(hwnd_, capturingHotkey_, mods | MOD_NOREPEAT, vk)) {
-                            UnregisterHotKey(hwnd_, capturingHotkey_);
-                            hm = mods;
-                            hv = vk;
-                            SetCapturingHotkey(0);
-                            settings_.Save();
-                            TrayUpdate();
-                        } else {
-                            // Keep the previous key and let them try another.
-                            Toast(util::HotkeyToString(mods, vk) + tr(L"은(는) 다른 프로그램이 쓰고 있습니다. 다른 조합을 눌러 주세요."),
-                                  true);
-                        }
-                    } else if (mods == MOD_SHIFT) {
-                        // Shift + a letter would swallow capital letters in every other program.
-                        Toast(tr(L"Ctrl, Alt, Win 중 하나와 함께 누르세요. (F1~F12는 단독으로도 됩니다)"), true);
-                    }
+                    CaptureHotkey(mods, vk);
                 }
                 Invalidate();
                 return 0;
@@ -861,6 +852,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_ANSWER:
             if (auto f = std::exchange(answer_, nullptr)) f();
             return 0;
+        case WM_APP_HOOKED_KEY:
+            if (capturingHotkey_) CaptureHotkey((UINT)l, (UINT)w);
+            return 0;
         case WM_APP_CAPTURE_CLOSED:
             if (rec_ == RecState::Recording) StopRecording();
             return 0;
@@ -930,6 +924,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             break;
         case WM_DESTROY:
             access_.Detach();
+            keyHook_.Stop();
             if (rec_ == RecState::Recording) capture_.Stop();
             RememberPlacement();
             overlay_.Hide();
@@ -1161,23 +1156,28 @@ void App::SourceSize(const RecTarget& t, int& w, int& h) const {
             h = wi.rcClient.bottom - wi.rcClient.top;
         }
     }
+    if (sourceForTest_.cx > 0) w = sourceForTest_.cx, h = sourceForTest_.cy;
 }
 
-void App::PlannedSize(int sw, int sh, int& ow, int& oh) const {
-    // Mirrors Capture::Setup.
+void App::PlannedSize(int sw, int sh, int& ow, int& oh, bool* hevc) const {
+    // Mirrors Capture::Setup, with the encoder's limit (BeginCapture's maxEdge) last: the codec goes by the size the
+    // 해상도 box leaves.
     double f = 1.0;
     int longE = std::max(1, std::max(sw, sh)), shortE = std::max(1, std::min(sw, sh));
+    bool useHevc = false;
     if (settings_.output == kOutputVideo) {
-        f = std::min(f, (settings_.vCodec == 1 ? 8192.0 : 4096.0) / longE);
         if (int res = kVideoResOptions[settings_.vResIdx]) {
             f = std::min(f, res * 16.0 / 9.0 / longE);
             f = std::min(f, (double)res / shortE);
         }
+        useHevc = UseHevc((int)std::lround(longE * f));
+        f = std::min(f, (useHevc ? 8192.0 : 4096.0) / longE);
     } else if (int maxE = kSizeOptions[settings_.sizeIdx]) {
         f = std::min(f, (double)maxE / longE);
     }
     ow = std::max(2, (int)std::lround(sw * f) & ~1);
     oh = std::max(2, (int)std::lround(sh * f) & ~1);
+    if (hevc) *hevc = useHevc;
 }
 
 // ---------------------------------------------------------------- recording
@@ -1289,7 +1289,10 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
         recFullscreen_ = fg && fg != hwnd_ && IsFullscreenWindow(fg);
     }
     if (!fromHotkey) {
-        HideMain();
+        if (settings_.startHide == kHideMinimize)
+            MinimizeMain();
+        else
+            HideMain();
         if (target.source == kSourceWindow) SetForegroundWindow(target.hwnd);
     }
     int cd = fromHotkey ? 0 : settings_.CountdownSeconds();
@@ -1337,6 +1340,9 @@ void App::BeginCapture() {
             v.path = base + util::Format(L"_%d.mp4", i);
         o.fps = kVideoFpsOptions[settings_.vFpsIdx];
         v.video = VideoSettings(o.fps);
+        int sw = 0, sh = 0, ow = 0, oh = 0;
+        SourceSize(recTarget_, sw, sh);
+        PlannedSize(sw, sh, ow, oh, &v.video.hevc);  // 자동: HEVC past 4096 (#42)
         v.sound = settings_.audio;
         v.mic = settings_.mic;
         v.micDevice = settings_.micDevice;
@@ -1392,7 +1398,9 @@ void App::BeginCapture() {
     rec_ = RecState::Recording;
     recPaused_ = false;
     stopReason_.clear();
+    timerFiredFor_ = 0;
     nextDiskCheck_ = util::NowSeconds() + 2;
+    SetRecordingLook(true);
     if (freeBytes < kLowDiskWarn)
         TrayBalloon(tr(L"남은 공간이 적습니다"), tr(L"저장할 드라이브에 ") + util::FormatBytes(freeBytes) +
                                                 tr(L" 남았습니다. 300MB까지 줄면 녹화를 멈추고 저장합니다."));
@@ -1405,6 +1413,7 @@ void App::BeginCapture() {
                           [this] { PostMessageW(hwnd_, WM_HOTKEY, kHotkeyPause, 0); });
     else
         overlay_.Hide();
+    overlay_.SetTimer(settings_.TimerMinutes() * 60, false);
     if (recTarget_.source == kSourceRegion && settings_.overlayMode != kOverlayNever) overlay_.ShowFrame(recTarget_.rect);
     if (settings_.sounds) sound::Play(sound::Cue::Start);
     SetTimer(hwnd_, kTimerRec, 100, nullptr);
@@ -1426,6 +1435,7 @@ void App::StopRecording() {
     CaptureResult res = capture_.Stop();
     rec_ = RecState::Idle;
     recPaused_ = false;
+    SetRecordingLook(false);
     RegisterPauseHotkey();  // releases it
     overlay_.Hide();
     TrayUpdate();
@@ -1534,16 +1544,35 @@ std::wstring App::RecordingDir() const {
     return FrameStore::Dir();
 }
 
+std::wstring App::TimerWords(int minutes) const {
+    const int h = minutes / 60, m = minutes % 60;
+    std::wstring s = h ? util::Format(tr(L"%d시간"), h) : L"";
+    if (m || !h) s += (s.empty() ? L"" : L" ") + util::Format(tr(L"%d분"), m);
+    return s;
+}
+
 void App::CheckLimits() {
     if (rec_ != RecState::Recording) return;
-    int minutes = kMaxLengthOptions[settings_.maxLengthIdx];
-    if (minutes > 0 && capture_.Elapsed() >= minutes * 60.0) {
-        const std::wstring limit =
-            minutes % 60 ? util::Format(tr(L"%d분"), minutes) : util::Format(tr(L"%d시간"), minutes / 60);
-        stopReason_ = util::Format(tr(L"%s이 되어 녹화를 멈췄습니다."), limit.c_str());
-        StopRecording();
-        return;
+    // The record timer (#47), on the recorded time (pauses left out): once for each length it is set to.
+    const int timer = settings_.TimerMinutes() * 60;
+    if (timer > 0 && timerFiredFor_ != timer && capture_.Elapsed() >= timer) {
+        timerFiredFor_ = timer;
+        const std::wstring words = TimerWords(timer / 60);
+        if (settings_.timerStop) {
+            stopReason_ = util::Format(tr(L"%s이 되어 녹화를 멈췄습니다."), words.c_str());
+            StopRecording();
+            return;
+        }
+        if (settings_.sounds) sound::Play(sound::Cue::Alarm);
+        if (GetForegroundWindow() == hwnd_)
+            Toast(util::Format(tr(L"녹화 타이머: %s이 지났습니다. 녹화는 계속됩니다."), words.c_str()));
+        else
+            TrayBalloon(util::Format(tr(L"녹화 타이머: %s이 지났습니다"), words.c_str()),
+                        util::Format(overlay_.Visible() ? tr(L"녹화는 계속됩니다. 멈추려면 녹화 중 표시의 ■ 또는 %s")
+                                                        : tr(L"녹화는 계속됩니다. 멈추려면 %s"),
+                                     HotkeyLabel().c_str()));
     }
+    overlay_.SetTimer(timer, timer > 0 && timerFiredFor_ == timer);
     double now = util::NowSeconds();
     if (now < nextDiskCheck_) return;
     nextDiskCheck_ = now + 2;
@@ -1600,16 +1629,34 @@ void App::OnHotkey() {
     }
 }
 
-void App::ProbeEncoders() {
+void App::ProbeEncoders() const {
     if (encProbed_) return;
     encProbed_ = true;
     for (int hevc = 0; hevc < 2; ++hevc)
         for (int hw = 0; hw < 2; ++hw) encName_[hevc][hw] = Mp4Writer::FindEncoder(hevc != 0, hw != 0);
 }
 
-std::wstring App::VideoSummary() const {
-    int hevc = settings_.vCodec;
-    std::wstring s = hevc ? L"HEVC" : L"H.264";
+bool App::HevcEncoder() const {
+    if (hevcForTest_ >= 0) return hevcForTest_ > 0;
+    ProbeEncoders();
+    return !encName_[1][0].empty() || !encName_[1][1].empty();
+}
+
+bool App::HevcPlayable() const {
+    if (hevcForTest_ >= 0) return hevcForTest_ == 1;
+    if (hevcPlayable_ < 0) hevcPlayable_ = Mp4Writer::HevcDecoderAvailable() ? 1 : 0;
+    return hevcPlayable_ == 1;
+}
+
+bool App::UseHevc(int edge) const {
+    if (settings_.vCodec == kCodecH264 || !HevcEncoder()) return false;
+    // 자동 past 4096: what H.264 would make smaller keeps its size, if Windows here can play it back.
+    return settings_.vCodec == kCodecHevc || (edge > 4096 && HevcPlayable());
+}
+
+std::wstring App::VideoSummary(bool hevc, bool bigHevc) const {
+    ProbeEncoders();
+    std::wstring s = !hevc ? L"H.264" : bigHevc ? tr(L"HEVC (4096보다 커서)") : L"HEVC";
     const std::wstring& hw = encName_[hevc][1];
     if (settings_.vHardware && !hw.empty()) {
         s += L" · " + Mp4Writer::Vendor(hw) + tr(L" 가속");
@@ -2296,7 +2343,7 @@ const wchar_t* App::CopyBlocker() const {
 VideoConfig App::VideoSettings(int fps) const {
     VideoConfig v;
     v.fps = fps;
-    v.hevc = settings_.vCodec == 1;
+    v.hevc = UseHevc(0);  // HEVC when picked; 자동 goes by the size (PlannedSize, MakeJob)
     v.hardware = settings_.vHardware;
     v.bitrate = (UINT32)kVideoBitrateOptions[settings_.vBitrateIdx] * 1'000'000u;
     v.cbr = settings_.vRateCtrl == 1;
@@ -2443,6 +2490,13 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
     job.captionPos = captionPos_;
     if (job.format == Format::Mp4) {
         job.video = VideoSettings((int)std::lround(job.fpsLimit));
+        // As the encoder takes it (#42): 자동 keeps a size past 4096 in HEVC; otherwise it is made smaller.
+        const int edge = std::max(job.outW, job.outH);
+        job.video.hevc = UseHevc(edge);
+        if (double fit = (job.video.hevc ? 8192.0 : 4096.0) / edge; fit < 1) {
+            job.outW = std::max(2, (int)std::lround(job.outW * fit) & ~1);
+            job.outH = std::max(2, (int)std::lround(job.outH * fit) & ~1);
+        }
         if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
         job.audio.enabled = ExportAudio();
         job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
@@ -2660,31 +2714,119 @@ void App::StopThumbnails() {
 
 // ---------------------------------------------------------------- system
 
+// A combination taken over from another program (#50) is registered like any other while that program leaves it
+// free; only while it holds it does the keyboard hook take it.
 void App::RegisterRecordHotkey() {
     UnregisterHotKey(hwnd_, kHotkeyRecord);
-    hotkeyOk_ = RegisterHotKey(hwnd_, kHotkeyRecord, settings_.hkMods | MOD_NOREPEAT, settings_.hkVk) != FALSE;
+    hookRecord_ = false;
+    if (!capturingHotkey_) {
+        hotkeyOk_ = RegisterHotKey(hwnd_, kHotkeyRecord, settings_.hkMods | MOD_NOREPEAT, settings_.hkVk) != FALSE;
+        hookRecord_ = !hotkeyOk_ && settings_.hkHook;
+    }
+    SyncKeyHook();
 }
 
 void App::RegisterPauseHotkey() {
     UnregisterHotKey(hwnd_, kHotkeyPause);
-    if (rec_ == RecState::Recording && !capturingHotkey_)
+    hookPause_ = false;
+    if (rec_ == RecState::Recording && !capturingHotkey_) {
         pauseHotkeyOk_ =
             RegisterHotKey(hwnd_, kHotkeyPause, settings_.hkPauseMods | MOD_NOREPEAT, settings_.hkPauseVk) != FALSE;
+        hookPause_ = !pauseHotkeyOk_ && settings_.hkPauseHook;
+    }
+    SyncKeyHook();
+}
+
+void App::SyncKeyHook() {
+    std::vector<KeyHook::Combo> combos;
+    if (hookRecord_) combos.push_back({settings_.hkMods, settings_.hkVk, kHotkeyRecord});
+    if (hookPause_) combos.push_back({settings_.hkPauseMods, settings_.hkPauseVk, kHotkeyPause});
+    if (combos.empty() && !capturingHotkey_) {
+        keyHook_.Stop();
+        return;
+    }
+    const bool ok = keyHook_.Set(hwnd_, WM_APP_HOOKED_KEY, std::move(combos), capturingHotkey_ != 0);
+    if (hookRecord_) hotkeyOk_ = ok;
+    if (hookPause_) pauseHotkeyOk_ = ok;
 }
 
 // While a new key is being chosen the current ones are released, so pressing them again reaches the window (and
-// doesn't start a recording).
+// doesn't start a recording), and the keyboard hook passes on what another program holds (SyncKeyHook).
 void App::SetCapturingHotkey(int which) {
     if (which == capturingHotkey_) return;
     capturingHotkey_ = which;
-    if (which) {
-        UnregisterHotKey(hwnd_, kHotkeyRecord);
-        UnregisterHotKey(hwnd_, kHotkeyPause);
-    } else {
-        RegisterRecordHotkey();
-        RegisterPauseHotkey();
+    if (which) hkConflict_ = {};
+    RegisterRecordHotkey();
+    RegisterPauseHotkey();
+    Invalidate();
+}
+
+void App::CaptureHotkey(UINT mods, UINT vk) {
+    const bool record = capturingHotkey_ == kHotkeyRecord;
+    UINT& hm = record ? settings_.hkMods : settings_.hkPauseMods;
+    UINT& hv = record ? settings_.hkVk : settings_.hkPauseVk;
+    bool& hook = record ? settings_.hkHook : settings_.hkPauseHook;
+    const UINT otherMods = record ? settings_.hkPauseMods : settings_.hkMods;
+    const UINT otherVk = record ? settings_.hkPauseVk : settings_.hkVk;
+    if (KeyHook::Usable(mods, vk) && mods == otherMods && vk == otherVk) {
+        Toast(record ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
+                     : tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요."),
+              true);
+    } else if (KeyHook::Usable(mods, vk)) {
+        // Try it first; the keys are registered for real once capturing ends.
+        if (RegisterHotKey(hwnd_, capturingHotkey_, mods | MOD_NOREPEAT, vk)) {
+            UnregisterHotKey(hwnd_, capturingHotkey_);
+            hm = mods;
+            hv = vk;
+            hook = false;
+            SetCapturingHotkey(0);
+            settings_.Save();
+            TrayUpdate();
+        } else if (hook && mods == hm && vk == hv) {
+            SetCapturingHotkey(0);  // the one already taken over
+        } else {
+            // Another program holds it. The panel under the row offers to take it over, and only its button does.
+            const HotkeyConflict c{capturingHotkey_, mods, vk};
+            SetCapturingHotkey(0);
+            hkConflict_ = c;
+        }
+    } else if (mods == MOD_SHIFT) {
+        // Shift + a letter would swallow capital letters in every other program.
+        Toast(tr(L"Ctrl, Alt, Win 중 하나와 함께 누르세요. (F1~F12는 단독으로도 됩니다)"), true);
     }
     Invalidate();
+}
+
+void App::TakeHotkey() {
+    const HotkeyConflict c = std::exchange(hkConflict_, {});
+    if (!c.which) return;
+    const bool record = c.which == kHotkeyRecord;
+    (record ? settings_.hkMods : settings_.hkPauseMods) = c.mods;
+    (record ? settings_.hkVk : settings_.hkPauseVk) = c.vk;
+    (record ? settings_.hkHook : settings_.hkPauseHook) = true;
+    RegisterRecordHotkey();
+    RegisterPauseHotkey();
+    settings_.Save();
+    TrayUpdate();
+    if (record && !hotkeyOk_)
+        Toast(tr(L"키보드 후크를 시작하지 못해 이 조합을 쓸 수 없습니다."), true);
+    else
+        Toast(util::Format(tr(L"이제 OzMaker가 %s을(를) 먼저 받습니다"), util::HotkeyToString(c.mods, c.vk).c_str()));
+}
+
+void App::ResetSettings() {
+    settings_.Reset();
+    nameCustom_ = false;
+    timerOpen_ = false;
+    SetCapturingHotkey(0);
+    hkConflict_ = {};
+    RegisterRecordHotkey();
+    RegisterPauseHotkey();
+    ApplyTheme();
+    ApplyLanguage();
+    settings_.Save();
+    settingsDirty_ = false;
+    Toast(tr(L"설정을 처음으로 되돌렸습니다"));
 }
 
 std::wstring App::HotkeyLabel() const {

@@ -75,8 +75,9 @@ void App::DrawFrame(Rect client) {
     // The files list takes all input while it is open; a click anywhere else closes it.
     if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
     if (rec_ != RecState::Idle) updateOpen_ = false;
+    if (screen_ != Screen::Home) timerOpen_ = false;
     const bool modal = question_.has_value();
-    const bool popover = !modal && (filesOpen_ || updateOpen_);
+    const bool popover = !modal && (filesOpen_ || updateOpen_ || timerOpen_);
     // An Alert's buttons lie over the page (the record button is under it on Home): while the pointer is on the
     // alert, where it was drawn last frame, the page under it takes no input.
     const bool onAlert = toastSticky_ && ui_.Now() < toastUntil_ && toastRect_.Contains(ui_.In().mx, ui_.In().my);
@@ -97,8 +98,10 @@ void App::DrawFrame(Rect client) {
         ui_.BeginFloat();
         if (filesOpen_)
             DrawFilesPopover(client);
-        else
+        else if (updateOpen_)
             DrawUpdatePopover(client);
+        else
+            DrawTimerPopover(client);
         ui_.EndFloat();
     }
     if (modal) {
@@ -123,28 +126,49 @@ void App::DrawQuestion(Rect client) {
     const Question& q = *question_;
     const float a = ui_.AnimFrom(HashId("ask", questionSeq_), 1.f, 0.f, 18.f);
     ui_.Fill(client, WithAlpha(P.Scrim, 0.55f * a));
-    const float W = std::min(440.f, client.W() - 40), pad = 22, iconW = 40;
+    const float W = std::min(q.lists.empty() ? 440.f : 520.f, client.W() - 40), pad = 22, iconW = 40;
     TextStyle body;
     body.wrap = true;
     body.v = AlignStart;
-    float bodyH = 20;
-    DWRITE_TEXT_METRICS m{};
-    if (auto lay = Fonts::Layout(q.body, 13.f, body, W - pad * 2 - iconW, 1000); lay && SUCCEEDED(lay->GetMetrics(&m)))
-        bodyH = std::ceil(m.height);
+    auto height = [&](std::wstring_view s, float w) {
+        DWRITE_TEXT_METRICS m{};
+        auto lay = Fonts::Layout(s, 13.f, body, w, 1000);
+        return lay && SUCCEEDED(lay->GetMetrics(&m)) ? std::ceil(m.height) : 20.f;
+    };
+    const float textW = W - pad * 2 - iconW, bullet = 14;
+    float bodyH = 0;
+    if (q.lists.empty()) bodyH = height(q.body, textW);
+    for (const auto& [head, lines] : q.lists) {
+        bodyH += 24;
+        for (const std::wstring& line : lines) bodyH += height(line, textW - bullet) + 4;
+        bodyH += 8;
+    }
     const float H = pad + 26 + 6 + bodyH + 24 + 38 + pad;
     Rect box = Rect::Centered(client.CX(), client.CY() - 24 + (1 - a) * 10, W, H);
     ui_.Fill(box.Offset(0, 8), WithAlpha(Shadow, 0.45f * a), 16);
     ui_.Fill(box, WithAlpha(Surface2, a), 14);
     ui_.Stroke(box.Inset(0.5f), WithAlpha(BorderStrong, a), 14);
     Rect c = box.Inset(pad);
-    const D2D1_COLOR_F tint = q.danger ? RecHi : Accent;
+    const D2D1_COLOR_F tint = q.danger && !q.glyph ? RecHi : Accent;
     Rect mark = Rect::XYWH(c.l, c.t - 2, 30, 30);
     ui_.Circle(mark.CX(), mark.CY(), 15, WithAlpha(tint, 0.18f * a));
-    ui_.Icon(mark, q.danger ? icon::Warning : icon::Check, 14.f, WithAlpha(tint, a));
+    ui_.Icon(mark, q.glyph ? q.glyph : q.danger ? icon::Warning : icon::Check, 14.f, WithAlpha(tint, a));
     Rect text(c.l + iconW, c.t, c.r, c.b);
     ui_.Text(text.CutTop(26), q.title, 15.f, WithAlpha(TextColor, a), Bold());
     text.CutTop(6);
-    ui_.Text(text.CutTop(bodyH), q.body, 13.f, WithAlpha(TextDim, a), body);
+    if (q.lists.empty()) ui_.Text(text.CutTop(bodyH), q.body, 13.f, WithAlpha(TextDim, a), body);
+    for (const auto& [head, lines] : q.lists) {
+        TextStyle h = Bold();
+        h.v = AlignStart;
+        ui_.Text(text.CutTop(24), head, 13.f, WithAlpha(TextColor, a), h);
+        for (const std::wstring& line : lines) {
+            Rect l = text.CutTop(height(line, textW - bullet));
+            ui_.Text(Rect(l.l, l.t, l.l + bullet, l.t + 18), L"•", 13.f, WithAlpha(TextFaint, a), Align(AlignStart, AlignStart));
+            ui_.Text(Rect(l.l + bullet, l.t, l.r, l.b), line, 13.f, WithAlpha(TextDim, a), body);
+            text.CutTop(4);
+        }
+        text.CutTop(8);
+    }
 
     Rect btns = c.CutBottom(38);
     const float yesW = std::max(96.f, ui_.Measure(q.yes, 13.f, kSemibold) + 40);
@@ -181,8 +205,10 @@ void App::DrawHeader(Rect r) {
         if (screen_ != Screen::Settings) DrawTabs(r);
     } else {
         std::wstring t = (recPaused_ ? tr(L"일시정지  ") : L"REC  ") + util::FormatClock(RecElapsed(), true);
+        const int timer = settings_.TimerMinutes() * 60;
+        if (timer > 0) t += util::Format(L"  / %d:%02d:%02d", timer / 3600, timer / 60 % 60, timer % 60);
         const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
-        Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
+        Rect pill = Rect::Centered(r.CX(), r.CY(), (recPaused_ ? 148.f : 120.f) + (timer > 0 ? 76.f : 0.f), 30);
         ui_.Fill(pill, WithAlpha(tint, 0.16f), 15);
         if (recPaused_) {
             ui_.Fill(Rect::XYWH(pill.l + 12, pill.CY() - 5, 3, 10), tint, 1);
@@ -210,6 +236,7 @@ void App::DrawHeader(Rect r) {
                           BtnStyle::Ghost, icon::Back) ||
                ui_.In().Key(VK_ESCAPE)) {
         SetCapturingHotkey(0);
+        hkConflict_ = {};
         if (settingsReturn_ == Screen::Editor) {
             ResumeEditor();
         } else {
@@ -956,13 +983,16 @@ void App::DrawCapturePanel(Rect r) {
     RecTarget t;
     bool ready = CurrentTarget(t, nullptr);
     const int src = settings_.source;
+    int sw = 0, sh = 0, ow = 0, oh = 0;
+    bool hevc = false;
+    if (ready) {
+        SourceSize(t, sw, sh);
+        PlannedSize(sw, sh, ow, oh, &hevc);
+    }
 
     // Info row: what + resulting size.
     Rect row = controls.CutTop(24);
     if (ready) {
-        int sw = 0, sh = 0, ow = 0, oh = 0;
-        SourceSize(t, sw, sh);
-        PlannedSize(sw, sh, ow, oh);
         std::wstring title;
         std::wstring badge = tr(L"창 캡처");
         D2D1_COLOR_F badgeColor = AccentHi;
@@ -982,7 +1012,7 @@ void App::DrawCapturePanel(Rect r) {
             if (src == kSourceRegion) title = tr(L"영역 · ") + title;
             badge = src == kSourceRegion ? tr(L"영역") : tr(L"전체 화면");
         }
-        std::wstring dims = sw > 0 ? util::Format(L"%d×%d  →  %d×%d", sw, sh, ow, oh) : L"";
+        std::wstring dims = sw > 0 ? util::Format(L"%d×%d  →  %d×%d", sw, sh, ow, oh) + (video && hevc ? L" · HEVC" : L"") : L"";
         float dw = ui_.Measure(dims, 12.5f) + 4;
         float bw = ui_.Measure(badge, 11.5f) + 16;
         Rect b = Rect::XYWH(row.r - bw, row.CY() - 11, bw, 22);
@@ -1069,10 +1099,25 @@ void App::DrawCapturePanel(Rect r) {
         ui_.Icon(Rect::XYWH(ar.l, ar.t, 14, ar.H()), warn ? icon::Warning : icon::Info, 11.f,
                  warn ? Warning : TextFaint);
         ui_.Text(Rect(ar.l + 16, ar.t, ar.r, ar.b), audio, 12.f, warn ? Warning : TextDim);
-        ui_.Text(cap, VideoSummary(), 12.f, TextFaint);
-        ui_.Text(then, tr(L"녹화를 멈추면 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다."), 12.5f, TextFaint);
+        const bool autoCodec = settings_.vCodec == kCodecAuto;
+        ui_.Text(cap, VideoSummary(hevc, hevc && autoCodec), 12.f, TextFaint);
+        DrawTimerChip(then);
+        then.CutRight(10);
+        // HEVC is written as a plain MP4 (no fragments): a crash leaves nothing of it. 자동 without it shrinks.
+        std::wstring warnLine;
+        if (ready && hevc)
+            warnLine = tr(L"HEVC 녹화는 OzMaker가 비정상 종료되면 남지 않습니다.");
+        else if (ready && autoCodec && std::max(sw, sh) > 4096 && std::max(ow, oh) == 4096)
+            warnLine = util::Format(tr(L"HEVC 비디오 확장이 없어 %d×%d로 줄여 녹화합니다."), ow, oh);
+        if (!warnLine.empty()) {
+            ui_.Icon(Rect::XYWH(then.l, then.t, 14, then.H()), icon::Warning, 11.f, Warning);
+            ui_.Text(Rect(then.l + 18, then.t, then.r, then.b), warnLine, 12.5f, Warning);
+        } else {
+            ui_.Text(then, tr(L"녹화를 멈추면 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다."), 12.5f, TextFaint);
+        }
     } else {
         ui_.Text(cap, tr(L"녹화를 멈추면 편집 탭이 열립니다."), 12.5f, TextFaint);
+        DrawTimerChip(then);
         ui_.Text(then, tr(L"거기서 자르고 저장하세요."), 12.5f, TextFaint);
     }
     controls.CutTop(14);
@@ -1112,6 +1157,14 @@ void App::DrawCapturePanel(Rect r) {
         TextStyle st = Bold();
         st.tabular = true;
         ui_.Text(Rect(btn.CX() - 52, btn.t, btn.r, btn.b), t2, 16.f, ink, st);
+        if (const int timer = settings_.TimerMinutes() * 60; timer > 0 && rec_ == RecState::Recording) {
+            std::wstring zeros = t2;  // tabular digits are all as wide as 0
+            std::replace_if(zeros.begin(), zeros.end(), iswdigit, L'0');
+            const float x = btn.CX() - 52 + ui_.Measure(zeros, 16.f, kSemibold) + 6;
+            const bool up = timerFiredFor_ == timer;
+            ui_.Text(Rect(x, btn.t, btn.r, btn.b), util::Format(L"/ %d:%02d:%02d", timer / 3600, timer / 60 % 60, timer % 60),
+                     14.f, up ? Warning : WithAlpha(ink, 0.6f), st);
+        }
     }
     float kw = ui_.Measure(hk, 11.5f) + 18;
     Rect kb = Rect::XYWH(btn.r - kw - 14, btn.CY() - 12, kw, 24);
@@ -1125,6 +1178,145 @@ void App::DrawCapturePanel(Rect r) {
             StartRecording(t, false);
         else
             StopRecording();
+    }
+}
+
+// The record timer (#47): a button at the right of the line under the options, and the popover it opens.
+void App::DrawTimerChip(Rect& line) {
+    const int minutes = settings_.TimerMinutes();
+    const std::wstring label =
+        !minutes ? std::wstring(tr(L"타이머 끔"))
+                 : util::Format(settings_.timerStop ? tr(L"타이머 %s · 멈춤") : tr(L"타이머 %s · 알림"),
+                                TimerWords(minutes).c_str());
+    const float w = ui_.Measure(label, 12.f, kSemibold) + 40;
+    Rect slot = line.CutRight(w);
+    timerChip_ = Rect::Centered(slot.CX(), slot.CY(), w, 26);
+    const UiId id = HashId("home.timer");
+    if (ui_.Click(id, timerChip_)) {
+        timerOpen_ = true;
+        filesOpen_ = updateOpen_ = false;
+    }
+    ui_.Describe(id, tr(L"녹화 타이머, ") + label);
+    const float h = ui_.Anim(id, ui_.Hover(timerChip_) || timerOpen_ ? 1.f : 0.f);
+    const bool set = minutes > 0;
+    ui_.Fill(timerChip_, set ? WithAlpha(Accent, Contrast() ? 0.f : 0.16f) : Surface2, 8);
+    ui_.Stroke(timerChip_.Inset(0.5f), set ? Accent : Mix(Border, BorderStrong, h), 8);
+    const D2D1_COLOR_F ink = set || h > 0.5f ? TextColor : TextDim;
+    ui_.Icon(Rect::XYWH(timerChip_.l + 9, timerChip_.t, 14, timerChip_.H()), icon::Timer, 12.f, ink);
+    TextStyle st = Bold();
+    st.tabular = true;
+    ui_.Text(Rect(timerChip_.l + 28, timerChip_.t, timerChip_.r - 6, timerChip_.b), label, 12.f, ink, st);
+}
+
+bool App::TimerFields(Rect r) {
+    const int total = std::clamp(settings_.timerMinutes, 1, kTimerMaxMinutes);
+    const int values[2] = {total / 60, total % 60};
+    const wchar_t* units[2] = {tr(L"시간"), tr(L"분")};
+    const wchar_t* names[2] = {tr(L"타이머 시간"), tr(L"타이머 분")};
+    bool changed = false;
+    for (int i = 0; i < 2; ++i) {
+        const UiId id = HashId("timer.field", i);
+        if (ui_.FocusedField() != id) timerText_[i] = std::to_wstring(values[i]);  // as typed only while typing
+        if (ui_.TextField(id, r.CutLeft(56), timerText_[i], L"0", 2)) {
+            std::erase_if(timerText_[i], [](wchar_t c) { return c < L'0' || c > L'9'; });
+            changed = true;
+        }
+        ui_.Describe(id, names[i], Role::Edit);
+        r.CutLeft(8);
+        ui_.Text(r.CutLeft(ui_.Measure(units[i], 13.f) + 4), units[i], 13.f, TextDim);
+        r.CutLeft(14);
+    }
+    if (changed) {
+        const int m = _wtoi(timerText_[0].c_str()) * 60 + _wtoi(timerText_[1].c_str());
+        settings_.timerMinutes = std::clamp(m, 1, kTimerMaxMinutes);
+        settingsDirty_ = true;
+    }
+    return changed;
+}
+
+void App::DrawTimerPopover(Rect client) {
+    const auto& in = ui_.In();
+    const bool custom = settings_.timerIdx == kTimerCustom;
+    const float W = std::min(352.f, client.W() - 40), pad = 16, w = W - pad * 2;
+    // What the length does, and (MP4) the space it takes against what the drive has.
+    auto noteFor = [&](int minutes) {
+        if (!minutes) return std::wstring(tr(L"끄면 녹화 중지를 누를 때까지 녹화합니다."));
+        const std::wstring words = TimerWords(minutes);
+        return util::Format(settings_.timerStop
+                                ? tr(L"%s이 되면 녹화를 멈추고 저장합니다. 일시정지한 시간은 세지 않습니다.")
+                                : tr(L"%s이 되면 알림과 효과음으로 알립니다. 녹화는 계속됩니다. 일시정지한 시간은 세지 않습니다."),
+                            words.c_str());
+    };
+    const int minutes = settings_.TimerMinutes();
+    const std::wstring note = noteFor(minutes);
+    std::wstring space;
+    bool spaceWarn = false;
+    RecTarget t;
+    if (minutes && settings_.output == kOutputVideo && CurrentTarget(t, nullptr)) {
+        int sw, sh, ow, oh;
+        bool hevc = false;
+        SourceSize(t, sw, sh);
+        PlannedSize(sw, sh, ow, oh, &hevc);
+        const double video = settings_.vBitrateIdx ? kVideoBitrateOptions[settings_.vBitrateIdx] * 1e6
+                                                   : Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], hevc);
+        const double audio = settings_.audio || settings_.mic ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000.0 : 0;
+        const uint64_t bytes = (uint64_t)((video + audio) / 8 * minutes * 60), free = util::FreeBytes(settings_.outDir);
+        space = util::Format(tr(L"이 길이면 약 %s · 남은 공간 %s"), util::FormatBytes(bytes).c_str(),
+                             util::FormatBytes(free).c_str());
+        spaceWarn = bytes > free;
+    }
+    TextStyle wrap;
+    wrap.wrap = true;
+    wrap.v = AlignStart;
+    DWRITE_TEXT_METRICS m{};
+    float noteH = 34;
+    if (auto lay = Fonts::Layout(note, 12.f, wrap, w, 200); lay && SUCCEEDED(lay->GetMetrics(&m))) noteH = std::ceil(m.height);
+    const float H = pad + 24 + 8 + 36 + (custom ? 8 + 32 : 0) + 14 + 18 + 6 + 36 + 12 + noteH + (space.empty() ? 0 : 6 + 18) + pad;
+    // Above the button (the record button is under it), or under it when there is no room.
+    float top = timerChip_.t - 8 - H;
+    if (top < client.t + 68) top = timerChip_.b + 8;
+    Rect box = Rect::XYWH(std::clamp(timerChip_.r - W, client.l + 20, client.r - 20 - W), top, W, H);
+    if ((in.pressed && !box.Contains(in.mx, in.my)) || (in.Key(VK_ESCAPE) && !ui_.TextFocused())) {
+        timerOpen_ = false;
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Shadow, 0.45f), 14);
+    ui_.Fill(box, Surface2, 12);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 12);
+    ui_.Declare(HashId("timer.box"), box, Role::Group, tr(L"녹화 타이머"));
+    Rect c = box.Inset(pad);
+    ui_.Text(c.CutTop(24), tr(L"녹화 타이머"), 14.f, TextColor, Bold());
+    c.CutTop(8);
+    bool changed = false;
+    ui_.Name(tr(L"녹화 타이머"));
+    if (ui_.Segmented(HashId("timer.pick"), c.CutTop(36), {tr(L"끔"), tr(L"30분"), tr(L"1시간"), tr(L"2시간"), tr(L"직접 입력")},
+                      settings_.timerIdx)) {
+        changed = true;
+        if (settings_.timerIdx == kTimerCustom) ui_.Focus(HashId("timer.field", 0));
+    }
+    if (custom) {
+        c.CutTop(8);
+        changed |= TimerFields(c.CutTop(32));
+    }
+    c.CutTop(14);
+    ui_.Text(c.CutTop(18), tr(L"시간이 되면"), 12.5f, TextDim);
+    c.CutTop(6);
+    int end = settings_.timerStop ? 1 : 0;
+    ui_.Name(tr(L"시간이 되면"));
+    if (ui_.Segmented(HashId("timer.end"), c.CutTop(36), {tr(L"알림만"), tr(L"멈추고 저장")}, end, minutes ? 0 : 0b11)) {
+        settings_.timerStop = end == 1;
+        changed = true;
+    }
+    c.CutTop(12);
+    // Drawn as it is after this frame's changes (the box was sized for the text before them).
+    ui_.Text(c.CutTop(noteH), noteFor(settings_.TimerMinutes()), 12.f, TextDim, wrap);
+    if (!space.empty()) {
+        c.CutTop(6);
+        ui_.Text(c.CutTop(18), space, 12.f, spaceWarn ? Warning : TextFaint);
+    }
+    if (changed) {
+        settingsDirty_ = true;
+        Invalidate();
     }
 }
 
@@ -1958,7 +2150,10 @@ void App::DrawExportPanel(Rect r) {
             ui_.Describe(HashId("ex.vsettings"), tr(L"동영상 세부 설정"));
             ui_.Text(link, tr(L"세부 설정 ›"), 12.f, lh ? LinkHi : Link, Align(AlignEnd));
             in.CutTop(4);
-            ui_.Text(in.CutTop(22), VideoSummary(), 12.5f, TextColor);
+            int ow = 0, oh = 0;
+            OutputSize(ow, oh);
+            const bool hevc = UseHevc(std::max(ow, oh));
+            ui_.Text(in.CutTop(22), VideoSummary(hevc, hevc && settings_.vCodec == kCodecAuto), 12.5f, TextColor);
         } else {
             int& q = settings_.quality[fmt_];
             label(tr(L"품질"), q >= 100 && fmt == Format::WebP ? tr(L"무손실") : std::to_wstring(q));
@@ -2146,6 +2341,7 @@ void App::OpenSettings(int tab) {
     if (screen_ != Screen::Settings) settingsReturn_ = screen_;
     screen_ = Screen::Settings;
     SetCapturingHotkey(0);
+    hkConflict_ = {};
     micListed_ = false;
     if (tab >= 0 && tab != settings_.settingsTab) {
         settings_.settingsTab = tab;
@@ -2203,6 +2399,7 @@ void App::DrawSettings(Rect r) {
         settingsScroll_ = 0;
         settingsDirty_ = true;
         SetCapturingHotkey(0);
+        hkConflict_ = {};
     }
 
     // Scroll view, one per tab
@@ -2391,35 +2588,156 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
                        CheckForUpdate();
                    }
                });
+
+    // #49: asks first, with what goes back and what stays.
+    SettingRow(area, tr(L"설정 초기화"), tr(L"설정을 처음 값으로 되돌립니다 · 녹화한 파일과 최근 파일 목록은 그대로입니다"), 120,
+               [&](Rect c) {
+                   if (ui_.Button(HashId("set.reset"), c, tr(L"초기화…"), BtnStyle::Secondary, icon::Refresh, true, 13.f))
+                       AskReset();
+               });
+}
+
+void App::AskReset() {
+    const Settings d;
+    Question q;
+    q.title = tr(L"설정을 처음으로 되돌릴까요?");
+    q.yes = tr(L"되돌리기");
+    q.danger = true;
+    q.glyph = icon::Refresh;
+    std::vector<std::wstring> back{tr(L"녹화 · 동영상 · 소리 · 내보내기 설정"),
+                                   tr(L"파일 이름 · 테마 · 언어 · 닫기 버튼 · 효과음 · 새 버전 확인"),
+                                   tr(L"단축키") + std::wstring(L"  → ") + util::HotkeyToString(d.hkMods, d.hkVk) + L" · " +
+                                       util::HotkeyToString(d.hkPauseMods, d.hkPauseVk)};
+    std::vector<std::wstring> keep{tr(L"녹화한 파일 · 최근 파일 · 저장하지 않은 녹화"),
+                                   tr(L"저장 폴더") + std::wstring(L"  (") + settings_.outDir + L")"};
+    if (!Settings::Portable()) keep.push_back(tr(L"Windows 시작 시 실행") + std::wstring(L"  (") + (autostart_ ? tr(L"켬") : tr(L"끔")) + L")");
+    keep.push_back(tr(L"창 위치와 크기 · 녹화 탭에서 고른 창 · 모니터 · 영역"));
+    q.lists = {{tr(L"되돌리는 것"), std::move(back)}, {tr(L"그대로 두는 것"), std::move(keep)}};
+    q.onYes = [this] { ResetSettings(); };
+    Ask(std::move(q));
 }
 
 void App::SettingsRecord(Rect& area, bool& changed) {
-    std::wstring hkDesc = hotkeyOk_ ? tr(L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)")
-                                    : tr(L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요");
-    auto hotkeyButton = [&](Rect c, int which, UINT mods, UINT vk) {
-        bool on = capturingHotkey_ == which;
-        std::wstring label = on ? tr(L"키 조합을 누르세요…") : util::HotkeyToString(mods, vk);
-        if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
-                       icon::Keyboard, true, 13.f))
-            SetCapturingHotkey(on ? 0 : which);
+    // A hotkey row, and under it, when the combination pressed is another program's, the offer to take it over (#50).
+    const std::wstring caveat = tr(L"OzMaker가 쓰면 그 프로그램에서는 이 조합이 듣지 않습니다. 관리자 권한으로 실행한 게임 안에서는 OzMaker도 받지 못할 수 있습니다.");
+    TextStyle wrap;
+    wrap.wrap = true;
+    wrap.v = AlignStart;
+    DWRITE_TEXT_METRICS m{};
+    float caveatH = 34;
+    if (auto lay = Fonts::Layout(caveat, 12.f, wrap, area.W() - 32 - 28, 200); lay && SUCCEEDED(lay->GetMetrics(&m)))
+        caveatH = std::ceil(m.height);
+    const float panelH = 14 + 22 + 10 + 32 + 10 + caveatH + 14;
+    auto hotkeyRow = [&](int which, const wchar_t* title, std::wstring_view desc, UINT mods, UINT vk, bool taken) {
+        const float top = area.t;
+        const bool conflict = hkConflict_.which == which;
+        Rect more = SettingRow(
+            area, title, desc, 230,
+            [&](Rect c) {
+                bool on = capturingHotkey_ == which;
+                std::wstring label = on ? tr(L"키 조합을 누르세요…") : util::HotkeyToString(mods, vk);
+                if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
+                               icon::Keyboard, true, 13.f))
+                    SetCapturingHotkey(on ? 0 : which);
+            },
+            conflict ? panelH + 14 : 0);
+        if (taken) {  // 가져옴: received ahead of the program that has it
+            const std::wstring tag = tr(L"가져옴");
+            const float x = area.l + ui_.Measure(title, 14.f, kSemibold) + 10, tw = ui_.Measure(tag, 11.f, kSemibold) + 14;
+            Rect chip = Rect::XYWH(x, top + 14, tw, 18);
+            ui_.Fill(chip, WithAlpha(Accent, Contrast() ? 0.f : 0.18f), 9);
+            if (Contrast()) ui_.Stroke(chip.Inset(0.5f), AccentHi, 9);
+            ui_.Text(chip, tag, 11.f, AccentHi, Bold(AlignCenter));
+        }
+        if (!conflict) return;
+        Rect box = more.CutTop(panelH);
+        ui_.Fill(box, WithAlpha(Warning, Contrast() ? 0.f : 0.08f), 10);
+        ui_.Stroke(box.Inset(0.5f), WithAlpha(Warning, 0.5f), 10);
+        const std::wstring combo = util::HotkeyToString(hkConflict_.mods, hkConflict_.vk);
+        const std::wstring head = tr(L"다른 프로그램이 이미 쓰고 있는 조합입니다:");
+        ui_.Declare(HashId("set.hkConflict"), box, Role::Group, head + L" " + combo);
+        Rect c = box.Inset(16, 14);
+        ui_.Icon(Rect::XYWH(c.l, c.t, 18, 22), icon::Warning, 14.f, Warning);
+        c.CutLeft(28);
+        Rect line = c.CutTop(22);
+        const float hw = ui_.Measure(head, 13.f, kSemibold) + 4;
+        ui_.Text(line.CutLeft(hw), head, 13.f, TextColor, Bold());
+        line.CutLeft(8);
+        Rect key = line.CutLeft(ui_.Measure(combo, 12.f, kSemibold) + 16);
+        ui_.Fill(key.Inset(0, 1), Surface3, 6);
+        ui_.Stroke(key.Inset(0.5f, 1.5f), BorderStrong, 6);
+        ui_.Text(key, combo, 12.f, TextColor, Bold(AlignCenter));
+        c.CutTop(10);
+        Rect btns = c.CutTop(32);
+        const std::wstring take = tr(L"그래도 OzMaker가 쓰기"), again = tr(L"다른 조합 누르기"), cancel = tr(L"취소");
+        if (ui_.Button(HashId("set.hkTake"), btns.CutLeft(ui_.Measure(take, 13.f, kSemibold) + 32), take, BtnStyle::Primary,
+                       0, true, 13.f))
+            TakeHotkey();
+        btns.CutLeft(8);
+        if (ui_.Button(HashId("set.hkAgain"), btns.CutLeft(ui_.Measure(again, 13.f, kSemibold) + 32), again,
+                       BtnStyle::Secondary, 0, true, 13.f))
+            SetCapturingHotkey(which);
+        btns.CutLeft(8);
+        if (ui_.Button(HashId("set.hkCancel"), btns.CutLeft(ui_.Measure(cancel, 13.f, kSemibold) + 32), cancel,
+                       BtnStyle::Ghost, 0, true, 13.f))
+            hkConflict_ = {};
+        c.CutTop(10);
+        ui_.Text(c.CutTop(caveatH), caveat, 12.f, TextFaint, wrap);
     };
-    SettingRow(area, tr(L"녹화 단축키"), hkDesc, 230,
-               [&](Rect c) { hotkeyButton(c, kHotkeyRecord, settings_.hkMods, settings_.hkVk); });
+    const wchar_t* takenDesc = tr(L"다른 프로그램보다 먼저 받습니다 · 그 프로그램에서는 이 조합이 듣지 않습니다");
+    hotkeyRow(kHotkeyRecord, tr(L"녹화 단축키"),
+              !hotkeyOk_          ? tr(L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요")
+              : settings_.hkHook ? takenDesc
+                                 : tr(L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"),
+              settings_.hkMods, settings_.hkVk, settings_.hkHook);
+    hotkeyRow(kHotkeyPause, tr(L"일시정지 단축키"),
+              !pauseHotkeyOk_         ? tr(L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요")
+              : settings_.hkPauseHook ? takenDesc
+                                      : tr(L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"),
+              settings_.hkPauseMods, settings_.hkPauseVk, settings_.hkPauseHook);
 
-    SettingRow(area, tr(L"일시정지 단축키"),
-               pauseHotkeyOk_ ? tr(L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다")
-                              : tr(L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요"),
-               230, [&](Rect c) { hotkeyButton(c, kHotkeyPause, settings_.hkPauseMods, settings_.hkPauseVk); });
-
-    SettingRow(area, tr(L"최대 녹화 길이"), tr(L"이 길이가 되면 녹화를 멈춥니다. 움짤과 동영상 모두 해당합니다."), 300,
-               [&](Rect c) {
-                   changed |= ui_.Segmented(HashId("set.maxlen"), c, {tr(L"끔"), tr(L"10분"), tr(L"30분"), tr(L"1시간")},
-                                            settings_.maxLengthIdx);
+    // 녹화 타이머 (#47): the same one as the 녹화 tab's button.
+    const bool custom = settings_.timerIdx == kTimerCustom;
+    Rect more = SettingRow(
+        area, tr(L"녹화 타이머"), tr(L"정한 길이가 되면 알리거나 멈춥니다 · 녹화 탭과 같은 값"), 380,
+        [&](Rect c) {
+            if (ui_.Segmented(HashId("set.timer"), c, {tr(L"끔"), tr(L"30분"), tr(L"1시간"), tr(L"2시간"), tr(L"직접 입력")},
+                              settings_.timerIdx)) {
+                changed = true;
+                if (settings_.timerIdx == kTimerCustom) ui_.Focus(HashId("timer.field", 0));
+            }
+        },
+        custom ? 32 + 8 + 16 + 14.f : 0.f);
+    if (custom) {
+        TimerFields(more.CutTop(32));
+        more.CutTop(8);
+        ui_.Text(more.CutTop(16), tr(L"최대 24시간 · 녹화된 길이로 셉니다 (일시정지한 시간은 빼고)"), 12.f, TextFaint);
+    }
+    const int minutes = settings_.TimerMinutes();
+    int end = settings_.timerStop ? 1 : 0;
+    SettingRow(area, tr(L"시간이 되면"),
+               !minutes             ? tr(L"타이머를 켜면 고를 수 있습니다")
+               : settings_.timerStop ? tr(L"녹화를 멈추고 저장합니다 (지금까지의 최대 녹화 길이와 같음)")
+                                     : tr(L"알림과 효과음으로 알리고 녹화는 계속합니다"),
+               260, [&](Rect c) {
+                   if (ui_.Segmented(HashId("set.timerEnd"), c, {tr(L"알림만"), tr(L"멈추고 저장")}, end, minutes ? 0 : 0b11)) {
+                       settings_.timerStop = end == 1;
+                       changed = true;
+                   }
                });
 
     SettingRow(area, tr(L"시작 카운트다운"), tr(L"녹화를 누른 뒤 시작까지의 시간 · 영역 지정 막대에서도 바꿈 (단축키는 즉시 시작)"), 230,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.cd"), c, {tr(L"없음"), tr(L"3초"), tr(L"5초")}, settings_.countdown);
+               });
+
+    // #46: hidden in the tray, or a taskbar button that opens the window while recording.
+    SettingRow(area, tr(L"녹화를 시작하면"),
+               settings_.startHide == kHideMinimize ? tr(L"작업 표시줄 단추로 녹화 중에도 엽니다 · 연 창은 녹화에 안 찍힘")
+                                                    : tr(L"창을 트레이로 숨깁니다 · 트레이 아이콘을 눌러 다시 엽니다"),
+               330, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.startHide"), c, {tr(L"트레이로 숨기기"), tr(L"작업 표시줄로 최소화")},
+                                            settings_.startHide);
                });
 
     SettingRow(area, tr(L"창 캡처 방식"), tr(L"자동: 전체화면 게임만 화면 캡처 · 검은 화면이 녹화되면 ‘화면’으로 바꾸세요"),
@@ -2441,19 +2759,21 @@ void App::SettingsRecord(Rect& area, bool& changed) {
 
 void App::SettingsVideo(Rect& area, bool& changed) {
     ProbeEncoders();
-    const bool hevcOk = !encName_[1][1].empty() || !encName_[1][0].empty();
-    // HEVC is written as a plain MP4 (Windows' fragmented MP4 sink refuses it), so a crash leaves no recording.
+    const bool hevcOk = HevcEncoder();
+    // HEVC is written as a plain MP4 (Windows' fragmented MP4 sink refuses it), so a crash leaves no recording. 자동
+    // takes it only where H.264 would have to shrink the picture (#42).
     SettingRow(area, tr(L"코덱"),
-               !hevcOk                ? tr(L"H.264: 어디서나 재생 · 이 PC에는 HEVC 인코더가 없습니다")
-               : settings_.vCodec == 1 ? tr(L"HEVC: 용량 약 절반 · 일부 기기 미지원 · 비정상 종료되면 녹화가 남지 않음")
-                                       : tr(L"H.264: 어디서나 재생 · HEVC: 같은 화질에 용량 약 절반 (일부 기기 · 메신저 미지원)"),
-               230, [&](Rect c) {
-                   changed |= ui_.Segmented(HashId("set.vcodec"), c, {L"H.264", L"HEVC"}, settings_.vCodec,
-                                            hevcOk ? 0 : 0b10);
+               settings_.vCodec == kCodecH264   ? tr(L"H.264: 어디서나 재생 · 긴 변 4096까지 (큰 화면은 줄여서 녹화)")
+               : settings_.vCodec == kCodecHevc ? tr(L"HEVC: 용량 약 절반 · 일부 기기 미지원 · 비정상 종료되면 녹화가 남지 않음")
+               : hevcOk && HevcPlayable()       ? tr(L"자동: 보통은 H.264 · 긴 변이 4096보다 큰 화면만 HEVC로 원본 크기")
+                                                : tr(L"자동: H.264 · HEVC 비디오 확장이 없어 큰 화면은 줄여서 녹화"),
+               300, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.vcodec"), c, {tr(L"자동"), L"H.264", L"HEVC"}, settings_.vCodec,
+                                            hevcOk ? 0 : 0b100);
                });
-    if (!hevcOk && settings_.vCodec == 1) settings_.vCodec = 0;
+    if (!hevcOk && settings_.vCodec == kCodecHevc) settings_.vCodec = kCodecAuto;
 
-    const std::wstring& hwName = encName_[settings_.vCodec][1];
+    const std::wstring& hwName = encName_[settings_.vCodec == kCodecHevc][1];
     std::wstring hwDesc = hwName.empty() ? tr(L"그래픽카드 인코더를 찾지 못해 CPU로 인코딩합니다")
                                          : tr(L"그래픽카드 인코더 사용: ") + hwName + tr(L" (게임 성능에 영향이 거의 없음)");
     SettingRow(area, tr(L"하드웨어 인코딩"), hwDesc, 60, [&](Rect c) {
@@ -2474,9 +2794,10 @@ void App::SettingsVideo(Rect& area, bool& changed) {
         RecTarget t;
         if (CurrentTarget(t, nullptr)) {
             int sw, sh, ow, oh;
+            bool hevc = false;
             SourceSize(t, sw, sh);
-            PlannedSize(sw, sh, ow, oh);
-            UINT32 auto_ = Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], settings_.vCodec == 1);
+            PlannedSize(sw, sh, ow, oh, &hevc);
+            UINT32 auto_ = Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], hevc);
             brDesc = util::Format(tr(L"자동: 지금 대상(%d×%d)이면 약 %.1f Mbps · 1분에 %.0f MB"), ow, oh, auto_ / 1e6,
                                   auto_ / 8.0 * 60 / 1e6);
         }

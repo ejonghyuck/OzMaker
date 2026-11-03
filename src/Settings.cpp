@@ -75,7 +75,11 @@ void Settings::Load() {
     region.top = ReadSigned(ini, L"RegionT");
     region.right = ReadSigned(ini, L"RegionR");
     region.bottom = ReadSigned(ini, L"RegionB");
-    vCodec = ReadInt(ini, L"VideoCodec", vCodec, 0, 1);
+    // 자동 came in 0.6.5: a file from before keeps HEVC, and its H.264 becomes 자동.
+    if ((int)GetPrivateProfileIntW(L"OzMaker", L"Codec", (UINT)-1, ini.c_str()) < 0)
+        vCodec = ReadInt(ini, L"VideoCodec", 0, 0, 1) == 1 ? kCodecHevc : kCodecAuto;
+    else
+        vCodec = ReadInt(ini, L"Codec", vCodec, 0, 2);
     vHardware = ReadInt(ini, L"VideoHardware", vHardware, 0, 1) != 0;
     vFpsIdx = ReadInt(ini, L"VideoFps", vFpsIdx, 0, _countof(kVideoFpsOptions) - 1);
     vResIdx = ReadInt(ini, L"VideoRes", vResIdx, 0, _countof(kVideoResOptions) - 1);
@@ -113,7 +117,20 @@ void Settings::Load() {
     hkVk = (UINT)ReadInt(ini, L"HotkeyKey", (int)hkVk, 1, 0xFE);
     hkPauseMods = (UINT)ReadInt(ini, L"PauseHotkeyMods", (int)hkPauseMods, 0, 0xF);
     hkPauseVk = (UINT)ReadInt(ini, L"PauseHotkeyKey", (int)hkPauseVk, 1, 0xFE);
-    maxLengthIdx = ReadInt(ini, L"MaxLength", maxLengthIdx, 0, _countof(kMaxLengthOptions) - 1);
+    hkHook = ReadInt(ini, L"HotkeyHook", hkHook, 0, 1) != 0;
+    hkPauseHook = ReadInt(ini, L"PauseHotkeyHook", hkPauseHook, 0, 1) != 0;
+    startHide = ReadInt(ini, L"StartHide", startHide, 0, 1);
+    // The timer took the place of 최대 녹화 길이 (끔, 10분, 30분, 1시간) in 0.6.5: a length set there still stops.
+    if ((int)GetPrivateProfileIntW(L"OzMaker", L"Timer", (UINT)-1, ini.c_str()) < 0) {
+        const int old = ReadInt(ini, L"MaxLength", 0, 0, 3);
+        timerIdx = old == 1 ? kTimerCustom : old == 2 ? 1 : old == 3 ? 2 : 0;
+        if (old == 1) timerMinutes = 10;
+        timerStop = old != 0;
+    } else {
+        timerIdx = ReadInt(ini, L"Timer", timerIdx, 0, _countof(kTimerOptions) - 1);
+        timerMinutes = ReadInt(ini, L"TimerMinutes", timerMinutes, 1, kTimerMaxMinutes);
+        timerStop = ReadInt(ini, L"TimerStop", timerStop, 0, 1) != 0;
+    }
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
@@ -182,7 +199,7 @@ void Settings::Save() const {
     num(L"RegionR", region.right);
     num(L"RegionB", region.bottom);
     put(L"Monitor", monitor);
-    num(L"VideoCodec", vCodec);
+    num(L"Codec", vCodec);
     num(L"VideoHardware", vHardware);
     num(L"VideoFps", vFpsIdx);
     num(L"VideoRes", vResIdx);
@@ -220,7 +237,12 @@ void Settings::Save() const {
     num(L"HotkeyKey", (long)hkVk);
     num(L"PauseHotkeyMods", (long)hkPauseMods);
     num(L"PauseHotkeyKey", (long)hkPauseVk);
-    num(L"MaxLength", maxLengthIdx);
+    num(L"HotkeyHook", hkHook);
+    num(L"PauseHotkeyHook", hkPauseHook);
+    num(L"StartHide", startHide);
+    num(L"Timer", timerIdx);
+    num(L"TimerMinutes", timerMinutes);
+    num(L"TimerStop", timerStop);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
     num(L"GifLossy", gifLossy);
@@ -246,6 +268,24 @@ void Settings::Save() const {
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);
+}
+
+void Settings::Reset() {
+    Settings d;
+    d.ApplyPreset(d.exportPreset, false);  // as Load starts a new file
+    d.outDir = std::move(outDir);
+    d.window = window;
+    d.windowMax = windowMax;
+    d.source = source;
+    d.monitor = std::move(monitor);
+    d.region = region;
+    d.recent = std::move(recent);
+    d.crashSeen = std::move(crashSeen);
+    d.trayHintShown = trayHintShown;
+    d.settingsTab = settingsTab;
+    const bool video = exportVideo;  // the kind the editor shows stays in the fields
+    *this = std::move(d);
+    UseExportKind(video);
 }
 
 std::wstring Settings::PortableFile(const std::wstring& exeDir) {
