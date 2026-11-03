@@ -32,6 +32,7 @@ public:
         } else {
             WebPConfigPreset(&cfg_, WEBP_PRESET_DEFAULT, (float)q);
             cfg_.method = 4;
+            cfg_.use_sharp_yuv = 1;  // red text and thin coloured lines keep their edges (slower RGB to YUV)
         }
         cfg_.thread_level = 1;
         if (!WebPValidateConfig(&cfg_)) return Fail(err, L"WebP 설정이 올바르지 않습니다.");

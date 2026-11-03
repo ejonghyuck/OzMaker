@@ -7,6 +7,7 @@ struct EncoderParams {
     int width = 0, height = 0;
     int quality = 80;  // 1..100
     int plays = 0;     // times the animation plays, 0 = forever
+    int lossy = 0;     // GIF: 0 off, 1 light, 2 strong (lossy LZW, as gifsicle --lossy)
     std::wstring path;
 };
 
