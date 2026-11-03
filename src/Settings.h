@@ -14,6 +14,12 @@ inline constexpr double kHoldLastMs = 1000;       // "끝에서 멈춤": the las
 inline constexpr const wchar_t* kNameTemplates[] = {L"OzMaker_{날짜}", L"{창 이름}_{날짜}", L"{날짜}"};
 inline constexpr int kOutFpsOptions[] = {0, 30, 25, 20, 15, 10};  // 0 = as recorded
 inline constexpr double kSpeedOptions[] = {0.5, 1.0, 1.5, 2.0};
+// 화질 in the export panel (고화질, 보통, 저용량): the size (kExportSizes) and frame rate (kOutFpsOptions) for 움짤 and
+// for MP4, and the GIF lossy level.
+struct ExportPreset {
+    int animSize, animFps, videoSize, videoFps, gifLossy;
+};
+inline constexpr ExportPreset kExportPresets[] = {{0, 0, 0, 0, 1}, {4, 3, 2, 1, 1}, {5, 4, 4, 1, 2}};
 inline constexpr size_t kMaxRecent = 12;
 
 // MP4 recording
@@ -86,6 +92,7 @@ struct Settings {
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip
     int quality[3] = {85, 80, 60};      // per 움짤 format
+    int gifLossy = 1;                   // GIF lossy compression: 0 off, 1 light, 2 strong
     int scaleIdx = 0;  // kExportSizes
     int outFpsIdx = 0;
     int speedIdx = 1;
@@ -93,6 +100,8 @@ struct Settings {
     int previewVolume = 100;  // %, 0-100: the editor's sound preview, not the saved file
     int targetIdx = 0;  // kTargetMB
     bool holdLast = false;
+    int exportPreset = 1;        // kExportPresets; -1 = 직접 설정 (the values were picked by hand)
+    bool exportDetails = false;  // the export panel's 자세히 설정 is open
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 
     std::vector<std::wstring> recent;  // saved and opened files, newest first
@@ -101,6 +110,10 @@ struct Settings {
     void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
+    // Sets the size, frame rate and GIF lossy level to kExportPresets[i] (exportPreset itself stays).
+    void ApplyPreset(int i, bool video);
+    // The preset the size and frame rate (and for GIF the lossy level) match, -1 if none.
+    int MatchPreset(bool video, bool gif) const;
 
     // Where the settings live: OZMAKER_SETTINGS (test runs), settings.ini next to the exe (portable mode, #25), or
     // %APPDATA%\OzMaker\settings.ini.

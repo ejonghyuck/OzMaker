@@ -191,6 +191,139 @@ int GifDurationCs(const std::wstring& path) {
     return -1;
 }
 
+// Every frame of a GIF as shown (RGB, w × h): frames drawn over the one before, transparent pixels left as they
+// were (OzMaker writes disposal 1 only). Empty if the file can't be read.
+std::vector<std::vector<uint8_t>> DecodeGif(const std::wstring& path, int& w, int& h) {
+    std::vector<std::vector<uint8_t>> frames;
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    if (d.size() < 13 || memcmp(d.data(), "GIF89a", 6) != 0) return frames;
+    w = d[6] | d[7] << 8;
+    h = d[8] | d[9] << 8;
+    size_t p = 13;
+    std::vector<uint8_t> global;
+    if (d[10] & 0x80) {
+        size_t n = 3u << ((d[10] & 7) + 1);
+        global.assign(d.begin() + p, d.begin() + p + n);
+        p += n;
+    }
+    std::vector<uint8_t> canvas((size_t)w * h * 3, 0);
+    int transparent = -1;
+    auto subBlocks = [&](std::vector<uint8_t>* out) {
+        while (p < d.size() && d[p]) {
+            if (out) out->insert(out->end(), d.begin() + p + 1, d.begin() + std::min(d.size(), p + 1 + d[p]));
+            p += d[p] + 1;
+        }
+        ++p;
+    };
+    while (p < d.size()) {
+        uint8_t b = d[p++];
+        if (b == 0x3B) return frames;
+        if (b == 0x21 && p < d.size()) {
+            uint8_t label = d[p++];
+            if (label == 0xF9 && p + 4 < d.size()) transparent = (d[p + 1] & 1) ? d[p + 4] : -1;
+            subBlocks(nullptr);
+            continue;
+        }
+        if (b != 0x2C || p + 9 > d.size()) return {};
+        int fx = d[p] | d[p + 1] << 8, fy = d[p + 2] | d[p + 3] << 8, fw = d[p + 4] | d[p + 5] << 8,
+            fh = d[p + 6] | d[p + 7] << 8, flags = d[p + 8];
+        p += 9;
+        std::vector<uint8_t> table = global;
+        if (flags & 0x80) {
+            size_t n = 3u << ((flags & 7) + 1);
+            table.assign(d.begin() + p, d.begin() + p + n);
+            p += n;
+        }
+        int minCode = d[p++];
+        std::vector<uint8_t> data, idx;
+        subBlocks(&data);
+        // LZW
+        const int clear = 1 << minCode, eoi = clear + 1;
+        std::vector<int> prefix(4096), suffix(4096), first(4096), len(4096);
+        int size = minCode + 1, next = eoi + 1, prev = -1;
+        for (int i = 0; i < clear; ++i) prefix[i] = -1, suffix[i] = first[i] = i, len[i] = 1;
+        uint32_t bits = 0;
+        int nbits = 0;
+        std::vector<uint8_t> str;
+        for (size_t i = 0; i < data.size() || nbits >= size;) {
+            while (nbits < size && i < data.size()) bits |= (uint32_t)data[i++] << nbits, nbits += 8;
+            if (nbits < size) break;
+            int code = bits & ((1 << size) - 1);
+            bits >>= size;
+            nbits -= size;
+            if (code == clear) {
+                size = minCode + 1;
+                next = eoi + 1;
+                prev = -1;
+                continue;
+            }
+            if (code == eoi) break;
+            int c = code;
+            if (code >= next) {
+                if (code > next || prev < 0) return {};
+                c = prev;  // KwKwK: the code being defined, prev + its own first pixel
+            }
+            str.clear();
+            for (int k = c; k >= 0; k = prefix[k]) str.push_back((uint8_t)suffix[k]);
+            std::reverse(str.begin(), str.end());
+            if (code >= next) str.push_back(str[0]);
+            idx.insert(idx.end(), str.begin(), str.end());
+            if (prev >= 0 && next < 4096) {
+                prefix[next] = prev;
+                suffix[next] = str[0];
+                first[next] = first[prev];
+                len[next] = len[prev] + 1;
+                if (++next == (1 << size) && size < 12) ++size;
+            }
+            prev = code;
+        }
+        if (idx.size() < (size_t)fw * fh) return {};
+        for (int y = 0; y < fh; ++y)
+            for (int x = 0; x < fw; ++x) {
+                int v = idx[(size_t)y * fw + x];
+                if (v == transparent || fx + x >= w || fy + y >= h || (size_t)v * 3 + 2 >= table.size()) continue;
+                uint8_t* c = canvas.data() + ((size_t)(fy + y) * w + fx + x) * 3;
+                c[0] = table[v * 3];
+                c[1] = table[v * 3 + 1];
+                c[2] = table[v * 3 + 2];
+            }
+        frames.push_back(canvas);
+        transparent = -1;
+    }
+    return frames;
+}
+
+// A stretch of video as a camera or a video file gives it (BGRA): a soft gradient with a few shapes and a striped
+// "sign", grain in every frame (±3), and a square moving across. clean: the same without the grain.
+void DrawGrainy(uint8_t* p, int w, int h, int t, bool clean, int amp = 3) {
+    const int sx = 20 + t * 6, sy = h / 2 - 20;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            int r = 60 + x * 120 / w, g = 80 + y * 100 / h, b = 120 + (x + y) * 60 / (w + h);
+            if (x > w * 3 / 5 && y < h / 3) r = 200, g = 70, b = 60;                        // a red shape
+            if (y > h * 3 / 4 && (x / 5) % 2 == 0 && x < w / 2) r = g = b = 225;             // stripes
+            if (std::hypot(x - w * 0.8, y - h * 0.75) < h / 8.0) r = 240, g = 210, b = 90;  // a yellow disc
+            if (x >= sx && x < sx + 40 && y >= sy && y < sy + 40) r = 30, g = 200, b = 230;  // the moving square
+            if (!clean) {
+                uint32_t n = (uint32_t)(x * 73856093u ^ y * 19349663u ^ (uint32_t)t * 83492791u);
+                n = n * 1103515245u + 12345u;
+                r += (int)(n >> 8) % (2 * amp + 1) - amp;
+                g += (int)(n >> 12) % (2 * amp + 1) - amp;
+                b += (int)(n >> 16) % (2 * amp + 1) - amp;
+            }
+            uint8_t* q = p + ((size_t)y * w + x) * 4;
+            q[0] = (uint8_t)std::clamp(b, 0, 255);
+            q[1] = (uint8_t)std::clamp(g, 0, 255);
+            q[2] = (uint8_t)std::clamp(r, 0, 255);
+            q[3] = 255;
+        }
+}
+
 class Log {
 public:
     explicit Log(const std::wstring& path) { f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO); }
@@ -445,6 +578,7 @@ int App::RunSelfTest(const std::wstring& dir) {
         job.outH = H;
         job.format = fmt;
         job.quality = f < (int)Format::Mp4 ? settings_.quality[f] : 0;
+        if (fmt == Format::Gif) job.lossy = settings_.gifLossy;
         if (fmt == Format::Mp4) job.fpsLimit = fps;
         job.path = dir + L"\\selftest." + FormatExt(fmt);
         double s = util::NowSeconds();
@@ -466,6 +600,17 @@ int App::RunSelfTest(const std::wstring& dir) {
             if (!good) ++failures;
         }
         if (!r.ok) ++failures;
+        // AVIF from quality 90 keeps the colour at full resolution (4:4:4, #23).
+        if (fmt == Format::Avif) {
+            job.quality = 95;
+            job.path = dir + L"\\selftest_444.avif";
+            ExportResult hi = ExportSync(ex, job);
+            bool good = hi.ok && hi.bytes > r.bytes;
+            log(util::Format(L"AVIF 4:4:4: %s %s at quality 95 (%s at %d) %s", good ? L"ok" : L"FAIL",
+                             util::FormatBytes(hi.bytes).c_str(), util::FormatBytes(r.bytes).c_str(),
+                             settings_.quality[f], hi.error.c_str()));
+            if (!good) ++failures;
+        }
     }
     // Cropped, scaled, rate-limited, sped-up GIF.
     {
@@ -507,6 +652,76 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"GIF 2x: %s %d frames, file plays %.2fs %s", r.ok ? L"ok" : L"FAIL", r.frames, cs / 100.0,
                          r.error.c_str()));
         if (!r.ok || std::fabs(cs / 100.0 - N / fps / 2) > 0.03) ++failures;
+    }
+    // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
+    // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
+    // without grain (PSNR). Read back with DecodeGif.
+    for (int amp : {3, 6}) {
+        const int gw = 320, gh = 180, gn = 30;
+        std::vector<std::vector<uint8_t>> clean(gn, std::vector<uint8_t>((size_t)gw * gh * 4));
+        std::vector<uint8_t> grainy((size_t)gw * gh * 4);
+        for (int t = 0; t < gn; ++t) DrawGrainy(clean[t].data(), gw, gh, t, true);
+        uint64_t bytes[3] = {};
+        double flicker[3] = {}, psnr[3] = {};
+        bool decoded = true;
+        for (int level = 0; level < 3; ++level) {
+            std::wstring path = dir + util::Format(L"\\selftest_grain%d_lossy%d.gif", amp, level);
+            auto enc = CreateEncoder(Format::Gif);
+            EncoderParams p;
+            p.width = gw;
+            p.height = gh;
+            p.quality = 85;
+            p.lossy = level;
+            p.path = path;
+            std::wstring err;
+            bool ok = enc->Begin(p, err);
+            for (int t = 0; t < gn && ok; ++t) {
+                DrawGrainy(grainy.data(), gw, gh, t, false, amp);
+                ok = enc->Add(grainy.data(), 1000.0 / 15, err);
+            }
+            ok = ok && enc->End(err);
+            enc.reset();
+            bytes[level] = util::FileSize(path);
+            int dw = 0, dh = 0;
+            auto frames = DecodeGif(path, dw, dh);
+            if (!ok || dw != gw || dh != gh || frames.size() != (size_t)gn) {
+                decoded = false;
+                continue;
+            }
+            double se = 0;
+            size_t moved = 0, still = 0;
+            for (int t = 0; t < gn; ++t) {
+                const uint8_t* c = clean[t].data();
+                const uint8_t* f = frames[t].data();
+                for (size_t i = 0, n = (size_t)gw * gh; i < n; ++i)
+                    for (int k = 0; k < 3; ++k) {
+                        double e = (double)f[i * 3 + k] - c[i * 4 + 2 - k];
+                        se += e * e;
+                    }
+                if (t == 0) continue;
+                // Still background: away from where the square was in this frame or the one before.
+                const int x0 = 20 + (t - 1) * 6 - 3, x1 = 20 + t * 6 + 40 + 3, y0 = gh / 2 - 20 - 3, y1 = gh / 2 + 20 + 3;
+                for (int y = 0; y < gh; ++y)
+                    for (int x = 0; x < gw; ++x) {
+                        if (x >= x0 && x < x1 && y >= y0 && y < y1) continue;
+                        size_t i = ((size_t)y * gw + x) * 3;
+                        ++still;
+                        moved += memcmp(frames[t].data() + i, frames[t - 1].data() + i, 3) != 0;
+                    }
+            }
+            flicker[level] = 100.0 * moved / std::max<size_t>(1, still);
+            psnr[level] = 10 * std::log10(255.0 * 255.0 / (se / ((double)gw * gh * 3 * gn)));
+        }
+        // Before #23 the light grain flickered on about half the still background (54 %, 936 KB at quality 85).
+        bool good = decoded && flicker[0] < (amp <= 3 ? 1.0 : 20.0) && bytes[1] < bytes[0] * 0.9 &&
+                    bytes[2] < bytes[1] && psnr[0] > (amp <= 3 ? 39.0 : 34.0) && psnr[1] > psnr[0] - 2 &&
+                    psnr[2] > psnr[0] - 5;
+        if (!good) ++failures;
+        log(util::Format(L"gif grain ±%d: %s sizes %s / %s / %s (lossy off / light / strong), still background "
+                         L"changing per frame %.2f%% / %.2f%% / %.2f%%, PSNR %.2f / %.2f / %.2f dB",
+                         amp, good ? L"ok" : L"FAIL", util::FormatBytes(bytes[0]).c_str(),
+                         util::FormatBytes(bytes[1]).c_str(), util::FormatBytes(bytes[2]).c_str(), flicker[0],
+                         flicker[1], flicker[2], psnr[0], psnr[1], psnr[2]));
     }
     // Loop count and the hold on the last frame, read back from the files.
     for (int plays : {0, 1, 3}) {
@@ -939,6 +1154,49 @@ int App::RunSelfTest(const std::wstring& dir) {
         GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
         pcheck(!Settings::Portable() && Settings::FilePath() == env, L"a test run keeps OZMAKER_SETTINGS");
     }
+    // 화질 presets: a new settings file starts at 보통; one from before the presets keeps its values and shows the
+    // preset they match; a preset gives MP4 and 움짤 their own values. Each case is a file in this test's folder,
+    // read through OZMAKER_SETTINGS, which is then put back.
+    {
+        auto check = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"presets: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        wchar_t env[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
+        auto load = [&](const wchar_t* name, const char* text) {
+            std::wstring ini = dir + L"\\" + name;
+            HANDLE f = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD n = 0;
+                WriteFile(f, text, (DWORD)strlen(text), &n, nullptr);
+                CloseHandle(f);
+            }
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", ini.c_str());
+            Settings st;
+            st.Load();
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", env);
+            return st;
+        };
+        Settings fresh = load(L"preset_new.ini", "");
+        check(fresh.exportPreset == 1 && fresh.scaleIdx == 4 && fresh.outFpsIdx == 3 && !fresh.exportDetails,
+              L"a new settings file starts at 보통 (640px, 20fps) with 자세히 설정 folded");
+        Settings old = load(L"preset_old.ini", "[OzMaker]\r\nExportSize=0\r\nOutFps=0\r\n");
+        check(old.exportPreset == 0 && old.scaleIdx == 0 && old.outFpsIdx == 0,
+              L"an older file at full size keeps it and shows 고화질");
+        Settings odd = load(L"preset_odd.ini", "[OzMaker]\r\nExportSize=1\r\nOutFps=2\r\n");
+        check(odd.exportPreset == -1 && odd.scaleIdx == 1 && odd.outFpsIdx == 2,
+              L"other older values stay, shown as 직접 설정함");
+        Settings custom = load(L"preset_custom.ini", "[OzMaker]\r\nExportPreset=-1\r\nExportSize=4\r\nOutFps=3\r\n");
+        check(custom.exportPreset == -1, L"직접 설정 stays even when the values match a preset");
+        Settings st;
+        st.ApplyPreset(2, true);
+        bool video = st.scaleIdx == 4 && st.outFpsIdx == 1 && st.gifLossy == 2;
+        st.ApplyPreset(2, false);
+        check(video && st.scaleIdx == 5 && st.outFpsIdx == 4 && st.MatchPreset(false, true) == 2 &&
+                  st.MatchPreset(true, false) == -1,
+              L"저용량 is 640px/30fps for MP4 and 480px/15fps with strong lossy for 움짤");
+    }
     // Crash reports (#24): a child run that crashes on purpose leaves a dump and a log and ends without the Windows
     // error dialog. It shares this run's OZMAKER_SETTINGS, so the report lands in this test's folder.
     {
@@ -1362,6 +1620,17 @@ int App::RunScreenshots(const std::wstring& dir) {
     clipName_ = L"OzMaker Test Window";
     held_ = {{clip_, clock - 40, clipName_}};
     shot(L"editor.png", 96);
+    // 자세히 설정 open, with 강하게 (the longest hint), which no preset has at this size: 직접 설정함.
+    settings_.exportDetails = true;
+    settings_.gifLossy = 2;
+    settings_.exportPreset = settings_.MatchPreset(false, true);
+    shot(L"editor_details.png", 96);
+    fmt_ = (int)Format::Mp4;  // MP4: the same preset gives other values; 인코딩 instead of 품질
+    settings_.ApplyPreset(settings_.exportPreset = 1, true);
+    shot(L"editor_mp4.png", 96);
+    fmt_ = (int)Format::Gif;
+    settings_.exportDetails = false;
+    settings_.ApplyPreset(settings_.exportPreset = 1, false);
     settings_.targetIdx = 3;  // 15MB: the fit is under way in this shot
     shot(L"editor_target.png", 96);
     settings_.targetIdx = 0;

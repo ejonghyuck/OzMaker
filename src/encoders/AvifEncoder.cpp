@@ -26,7 +26,9 @@ public:
         enc_->quality = std::clamp(p.quality, 1, 100);
         enc_->qualityAlpha = AVIF_QUALITY_LOSSLESS;
 
-        img_ = avifImageCreate((uint32_t)w_, (uint32_t)h_, 8, AVIF_PIXEL_FORMAT_YUV420);
+        // From quality 90 the colour keeps full resolution (4:4:4): red text and thin coloured lines stay sharp.
+        img_ = avifImageCreate((uint32_t)w_, (uint32_t)h_, 8,
+                               enc_->quality >= 90 ? AVIF_PIXEL_FORMAT_YUV444 : AVIF_PIXEL_FORMAT_YUV420);
         if (!img_) return Fail(err, L"AVIF 이미지를 만들 수 없습니다.");
         img_->yuvRange = AVIF_RANGE_FULL;
         img_->colorPrimaries = AVIF_COLOR_PRIMARIES_BT709;

@@ -1589,6 +1589,7 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     // A video stays a video by default; a clip starts with the last 움짤 format.
     bool video = !clip_->SourcePath().empty();
     fmt_ = video && FormatAvailable(Format::Mp4) ? (int)Format::Mp4 : settings_.format;
+    if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
     exportAudio_ = true;
     AttachReaders();
     screen_ = Screen::Editor;
@@ -2188,13 +2189,14 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
         job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
     } else {
         job.quality = quality;
+        if (job.format == Format::Gif) job.lossy = settings_.gifLossy;
     }
     return job;
 }
 
 std::wstring App::ContentKey() const {
-    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top, crop_.right,
-                        crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx);
+    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top,
+                        crop_.right, crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx, settings_.gifLossy);
 }
 
 std::wstring App::EstimateKey() const {

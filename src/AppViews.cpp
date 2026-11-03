@@ -1570,15 +1570,24 @@ void App::DrawExportPanel(Rect r) {
     int ow = 0, oh = 0;
     OutputSize(ow, oh);
     double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
-    size_t outFrames = 0;
+    PlanSummary& pc = planCache_;
+    if (pc.clip != clip_.get() || pc.count != clip_->Count() || pc.first != inF_ || pc.last != outF_ ||
+        pc.fps != fpsLimit || pc.speed != speed || pc.mp4 != mp4) {
+        pc = {clip_.get(), clip_->Count(), inF_, outF_, fpsLimit, speed, mp4};
+        if (mp4) {
+            pc.frames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
+        } else {
+            auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
+            for (auto& p : plan) pc.ms += p.durationMs;
+            pc.frames = plan.size();
+        }
+    }
+    const size_t outFrames = pc.frames;
     if (mp4) {
-        outFrames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
         outFps = fpsLimit;
         outSec = outFrames / fpsLimit;
     } else {
-        auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
-        for (auto& p : plan) outSec += p.durationMs / 1000.0;
-        outFrames = plan.size();
+        outSec = pc.ms / 1000.0;
         outFps = outSec > 0 ? outFrames / outSec : 0;
         if (settings_.holdLast) outSec += kHoldLastMs / 1000.0;
     }
@@ -1621,6 +1630,8 @@ void App::DrawExportPanel(Rect r) {
         changed = true;
         hasResult_ = false;
         if (fmt_ != (int)Format::Mp4) settings_.format = fmt_;  // the 움짤 format the next clip starts with
+        // A preset means the same in every format: its values for this one.
+        if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
     }
     if (mp4) ProbeEncoders();
     std::wstring blurb = (disabled & (1u << fmt_)) ? L"이 빌드에는 포함되어 있지 않습니다"
@@ -1629,6 +1640,37 @@ void App::DrawExportPanel(Rect r) {
                                                    : L"어디서나 재생되는 동영상";
     ui_.Text(in.CutTop(20), blurb, 11.5f, TextFaint);
     in.CutTop(8);
+
+    // A hint under a row, on two lines when one is too short.
+    auto hintText = [&](const wchar_t* hint, D2D1_COLOR_F c) {
+        TextStyle st;
+        st.wrap = true;
+        ui_.Text(in.CutTop(ui_.Measure(hint, 11.5f) > in.W() ? 34.f : 20.f), hint, 11.5f, c, st);
+    };
+
+    // 화질 sets the size, frame rate and GIF lossy level at once. 용량 맞추기 picks those itself while it is on.
+    {
+        const bool fit = settings_.targetIdx != 0;
+        int preset = settings_.exportPreset;
+        Rect l = in.CutTop(20);
+        ui_.Text(l, L"화질", 12.5f, TextDim);
+        if (preset < 0 && !fit) ui_.Text(l, L"직접 설정함", 12.5f, Warning, Align(AlignEnd));
+        in.CutTop(4);
+        if (ui_.Segmented(HashId("ex.preset"), in.CutTop(32), {L"고화질", L"보통", L"저용량"}, preset,
+                          fit ? 7u : 0u)) {
+            settings_.exportPreset = preset;
+            settings_.ApplyPreset(preset, mp4);
+            changed = true;
+        }
+        static const wchar_t* const kPresetHint[] = {L"원본 크기 그대로입니다. 용량이 큽니다.",
+                                                     L"메신저로 보내기 좋은 크기입니다.",
+                                                     L"용량이 가장 작습니다. 화면이 조금 거칠 수 있습니다."};
+        hintText(fit          ? L"용량 맞추기가 크기와 프레임 레이트를 고릅니다."
+                 : preset < 0 ? L"‘자세히 설정’에서 고른 값으로 저장합니다."
+                              : kPresetHint[preset],
+                 TextFaint);
+        in.CutTop(8);
+    }
 
     // 용량 맞추기: size, frame rate and quality (MP4: the bitrate) are picked to land under the size.
     {
@@ -1639,7 +1681,11 @@ void App::DrawExportPanel(Rect r) {
             changed = true;
             fitContent_.clear();  // fit again even when nothing else changed
             fitCorrection_ = 1;
-            if (!settings_.targetIdx) fitBitrate_ = 0;
+            if (!settings_.targetIdx) {
+                fitBitrate_ = 0;
+                // Back to what 화질 asks for.
+                if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, mp4);
+            }
         }
         if (int mb = kTargetMB[settings_.targetIdx]) {
             const wchar_t* hint = missed     ? L"가장 작게 해도 넘습니다 · 구간을 줄여 보세요"
@@ -1652,58 +1698,7 @@ void App::DrawExportPanel(Rect r) {
         in.CutTop(8);
     }
 
-    if (mp4) {
-        // Codec and bitrate follow the video recording settings.
-        Rect head = in.CutTop(20);
-        ui_.Text(head, L"인코딩", 12.5f, TextDim);
-        Rect link = head.CutRight(90);
-        bool lh = ui_.Hover(link);
-        if (ui_.Click(HashId("ex.vsettings"), link)) OpenSettings(kTabVideo);
-        ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
-        in.CutTop(4);
-        ui_.Text(in.CutTop(22), VideoSummary(), 12.5f, TextColor);
-    } else {
-        int& q = settings_.quality[fmt_];
-        label(L"품질", q >= 100 && fmt == Format::WebP ? L"무손실" : std::to_wstring(q));
-        float qv = (float)q;
-        if (ui_.Slider(HashId("ex.q"), in.CutTop(22).Inset(7, 0), qv, 1.f, 100.f)) {
-            q = (int)std::lround(qv);
-            changed = true;
-        }
-    }
-    in.CutTop(8);
-
-    label(L"크기", util::Format(L"%d × %d", ow, oh));
-    changed |= ui_.Segmented(HashId("ex.scale"), in.CutTop(32), {L"100%", L"75%", L"50%", L"33%", L"640px", L"480px"},
-                             settings_.scaleIdx);
-    in.CutTop(8);
-
-    label(L"프레임 레이트", util::Format(L"%.0f fps", outFps));
-    changed |= ui_.Segmented(HashId("ex.fps"), in.CutTop(32), {L"원본", L"30", L"25", L"20", L"15", L"10"},
-                             settings_.outFpsIdx);
-    in.CutTop(8);
-
-    label(L"재생 속도", {});
-    int prevSpeed = settings_.speedIdx;
-    if (ui_.Segmented(HashId("ex.speed"), in.CutTop(32), {L"0.5×", L"1×", L"1.5×", L"2×"}, settings_.speedIdx)) {
-        changed = true;
-        // Re-base the preview clock so the playhead doesn't jump.
-        std::swap(prevSpeed, settings_.speedIdx);
-        size_t ph = playing_ ? PlayheadFromClock() : playhead_;
-        std::swap(prevSpeed, settings_.speedIdx);
-        playhead_ = ph;
-        SetPlaying(playing_);
-    }
-    in.CutTop(8);
-    if (!mp4) {
-        Rect row = in.CutTop(32);
-        ui_.Text(row, L"반복", 12.5f, TextDim);
-        changed |= ui_.Segmented(HashId("ex.loop"), row.CutRight(std::min(186.f, row.W() - 60)),
-                                 {L"계속", L"1번", L"3번"}, settings_.loopIdx);
-        in.CutTop(6);
-        changed |= ui_.ToggleRow(HashId("ex.hold"), in.CutTop(46).Inset(-10, 0), L"끝에서 잠깐 멈춤",
-                                 settings_.holdLast, L"마지막 장면을 1초 더 보여 줍니다");
-    } else if (clip_->HasAudio()) {
+    if (mp4 && clip_->HasAudio()) {
         auto* video = dynamic_cast<const VideoClip*>(clip_.get());
         if (video && !video->AudioExportable()) {
             bool off = false;
@@ -1713,6 +1708,112 @@ void App::DrawExportPanel(Rect r) {
             bool slow = speed != 1.0;
             changed |= ui_.ToggleRow(HashId("ex.audio"), in.CutTop(46).Inset(-10, 0), L"소리 포함", exportAudio_,
                                      slow ? L"속도를 바꾸면 소리는 빠집니다" : L"", !slow);
+        }
+        in.CutTop(8);
+    }
+
+    // 자세히 설정: everything else, folded away until it is asked for. Stays open once opened.
+    static const wchar_t* const kLossyNames[] = {L"끔", L"약하게", L"강하게"};
+    {
+        Rect row = in.CutTop(50);
+        bool hov = ui_.Hover(row);
+        if (ui_.Click(HashId("ex.details"), row)) {
+            settings_.exportDetails = !settings_.exportDetails;
+            settingsDirty_ = true;
+        }
+        ui_.Fill(row, Surface2, 10);
+        ui_.Stroke(row.Inset(0.5f), hov ? BorderStrong : Border, 10);
+        Rect t = row.Inset(12, 7);
+        ui_.Icon(t.CutRight(16), settings_.exportDetails ? icon::ChevronUp : icon::ChevronDown, 10.f, TextDim);
+        t.CutRight(6);
+        ui_.Text(t.CutTop(19), L"자세히 설정", 13.f, TextColor, Bold());
+        static const wchar_t* const kLoopNames[] = {L"계속 반복", L"한 번 재생", L"3번 반복"};
+        std::wstring sum;
+        auto part = [&](const std::wstring& p) { sum += (sum.empty() ? L"" : L" · ") + p; };
+        if (!mp4) {
+            int q = settings_.quality[fmt_];
+            part(q >= 100 && fmt == Format::WebP ? L"무손실" : L"품질 " + std::to_wstring(q));
+            if (fmt == Format::Gif) part(std::wstring(L"손실 압축 ") + kLossyNames[settings_.gifLossy]);
+        }
+        part(util::Format(L"%d×%d", ow, oh));
+        part(util::Format(L"%.0ffps", outFps));
+        part(util::Format(L"%g×", speed));
+        if (!mp4) part(kLoopNames[settings_.loopIdx]);
+        if (!mp4 && settings_.holdLast) part(L"끝에서 멈춤");
+        ui_.Text(t, sum, 11.5f, TextFaint);
+        in.CutTop(8);
+    }
+
+    if (settings_.exportDetails) {
+        // Size, frame rate and lossy level picked by hand: the preset they match now, if any.
+        auto byHand = [&](bool c) {
+            if (!c) return;
+            changed = true;
+            settings_.exportPreset = settings_.MatchPreset(mp4, fmt == Format::Gif);
+        };
+        if (mp4) {
+            // Codec and bitrate follow the video recording settings.
+            Rect head = in.CutTop(20);
+            ui_.Text(head, L"인코딩", 12.5f, TextDim);
+            Rect link = head.CutRight(90);
+            bool lh = ui_.Hover(link);
+            if (ui_.Click(HashId("ex.vsettings"), link)) OpenSettings(kTabVideo);
+            ui_.Text(link, L"세부 설정 ›", 12.f, lh ? AccentHi : Accent, Align(AlignEnd));
+            in.CutTop(4);
+            ui_.Text(in.CutTop(22), VideoSummary(), 12.5f, TextColor);
+        } else {
+            int& q = settings_.quality[fmt_];
+            label(L"품질", q >= 100 && fmt == Format::WebP ? L"무손실" : std::to_wstring(q));
+            float qv = (float)q;
+            if (ui_.Slider(HashId("ex.q"), in.CutTop(22).Inset(7, 0), qv, 1.f, 100.f)) {
+                q = (int)std::lround(qv);
+                changed = true;
+            }
+            if (fmt == Format::Gif) {
+                // 손실 압축 (#23): lossy LZW, as gifsicle --lossy.
+                in.CutTop(8);
+                label(L"손실 압축", {});
+                byHand(ui_.Segmented(HashId("ex.lossy"), in.CutTop(32), {L"끔", L"약하게", L"강하게"},
+                                     settings_.gifLossy));
+                static const wchar_t* const kLossyHint[] = {L"지금과 같은 화질과 용량",
+                                                            L"눈으로는 차이가 거의 없습니다",
+                                                            L"용량이 가장 작습니다. 점 무늬가 보일 수 있습니다."};
+                hintText(kLossyHint[settings_.gifLossy], TextFaint);
+            }
+        }
+        in.CutTop(8);
+
+        label(L"크기", util::Format(L"%d × %d", ow, oh));
+        byHand(ui_.Segmented(HashId("ex.scale"), in.CutTop(32),
+                             {L"100%", L"75%", L"50%", L"33%", L"640px", L"480px"}, settings_.scaleIdx));
+        in.CutTop(8);
+
+        label(L"프레임 레이트", util::Format(L"%.0f fps", outFps));
+        byHand(ui_.Segmented(HashId("ex.fps"), in.CutTop(32), {L"원본", L"30", L"25", L"20", L"15", L"10"},
+                             settings_.outFpsIdx));
+        in.CutTop(8);
+
+        label(L"재생 속도", {});
+        int prevSpeed = settings_.speedIdx;
+        if (ui_.Segmented(HashId("ex.speed"), in.CutTop(32), {L"0.5×", L"1×", L"1.5×", L"2×"},
+                          settings_.speedIdx)) {
+            changed = true;
+            // Re-base the preview clock so the playhead doesn't jump.
+            std::swap(prevSpeed, settings_.speedIdx);
+            size_t ph = playing_ ? PlayheadFromClock() : playhead_;
+            std::swap(prevSpeed, settings_.speedIdx);
+            playhead_ = ph;
+            SetPlaying(playing_);
+        }
+        in.CutTop(8);
+        if (!mp4) {
+            Rect row = in.CutTop(32);
+            ui_.Text(row, L"반복", 12.5f, TextDim);
+            changed |= ui_.Segmented(HashId("ex.loop"), row.CutRight(std::min(186.f, row.W() - 60)),
+                                     {L"계속", L"1번", L"3번"}, settings_.loopIdx);
+            in.CutTop(6);
+            changed |= ui_.ToggleRow(HashId("ex.hold"), in.CutTop(46).Inset(-10, 0), L"끝에서 잠깐 멈춤",
+                                     settings_.holdLast, L"마지막 장면을 1초 더 보여 줍니다");
         }
     }
     exportContentH_ = in.t - top;

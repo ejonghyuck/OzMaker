@@ -398,6 +398,17 @@ private:
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
     float exportScroll_ = 0, exportContentH_ = 0;
+    // The export panel's frame count and length, kept while the range, rate and speed stay: working them out walks
+    // every frame of the range, and the panel is drawn many times a second.
+    struct PlanSummary {
+        const Clip* clip = nullptr;
+        size_t count = 0, first = 0, last = 0;
+        double fps = 0, speed = 0;
+        bool mp4 = false;
+        size_t frames = 0;
+        double ms = 0;
+    };
+    PlanSummary planCache_;
     bool autostart_ = false;
     NOTIFYICONDATAW nid_{};
     HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr;
