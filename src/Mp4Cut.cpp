@@ -335,7 +335,7 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
                     std::atomic<float>& progress, Result& res, std::wstring& err) const {
     Plan p;
     if (!MakePlan(first, last, sound, p)) {
-        err = L"이 구간은 다시 인코딩하지 않고 자를 수 없습니다.";
+        err = tr(L"이 구간은 다시 인코딩하지 않고 자를 수 없습니다.");
         return false;
     }
     // The kept samples of each track, as new sample tables.
@@ -470,7 +470,7 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
     src.h = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (!src.Ok()) {
-        err = L"원본 동영상을 열 수 없습니다.";
+        err = tr(L"원본 동영상을 열 수 없습니다.");
         return false;
     }
     dst.h = CreateFileW(out.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -485,7 +485,7 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
     }
     if (!dst.Ok() || !dst.Write(ftyp.data(), ftyp.size()) || !dst.Write(moov.data(), moov.size()) ||
         !dst.Write(hdr, mdatHdr)) {
-        err = L"파일을 쓸 수 없습니다.";
+        err = tr(L"파일을 쓸 수 없습니다.");
         return false;
     }
     std::vector<uint8_t> buf;
@@ -501,11 +501,11 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
                 n += s[j++].size;
             buf.resize(n);
             if (!src.ReadAt(s[i].offset, buf.data(), n)) {
-                err = L"원본 동영상을 읽을 수 없습니다.";
+                err = tr(L"원본 동영상을 읽을 수 없습니다.");
                 return false;
             }
             if (!dst.Write(buf.data(), n)) {
-                err = L"파일을 쓸 수 없습니다.";
+                err = tr(L"파일을 쓸 수 없습니다.");
                 return false;
             }
             done += n;

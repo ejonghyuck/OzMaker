@@ -255,8 +255,8 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
 bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
     ComPtr<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
-    COMDLG_FILTERSPEC filters[] = {{L"동영상", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts"},
-                                   {L"모든 파일", L"*.*"}};
+    COMDLG_FILTERSPEC filters[] = {{tr(L"동영상"), L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts"},
+                                   {tr(L"모든 파일"), L"*.*"}};
     dlg->SetFileTypes(_countof(filters), filters);
     DWORD opts = 0;
     dlg->GetOptions(&opts);
@@ -341,11 +341,11 @@ std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& hole
 }
 
 std::wstring FormatAgo(double s) {
-    if (s < 60) return L"방금";
-    if (s < 3600) return Format(L"%d분 전", (int)(s / 60));
-    if (s < 86400) return Format(L"%d시간 전", (int)(s / 3600));
-    if (s < 2 * 86400) return L"어제";
-    return Format(L"%d일 전", (int)(s / 86400));
+    if (s < 60) return tr(L"방금");
+    if (s < 3600) return Format(tr(L"%d분 전"), (int)(s / 60));
+    if (s < 86400) return Format(tr(L"%d시간 전"), (int)(s / 3600));
+    if (s < 2 * 86400) return tr(L"어제");
+    return Format(tr(L"%d일 전"), (int)(s / 86400));
 }
 
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name, const wchar_t* ext,
@@ -392,6 +392,13 @@ static std::wstring VkName(UINT vk) {
     wchar_t buf[64] = {};
     if (sc && GetKeyNameTextW((LONG)(sc << 16), buf, 64) > 0) return buf;
     return Format(L"0x%02X", vk);
+}
+
+bool AppsUseLightTheme() {
+    DWORD v = 1, size = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &size);
+    return v != 0;
 }
 
 std::wstring HotkeyToString(UINT mods, UINT vk) {

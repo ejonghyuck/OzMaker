@@ -19,6 +19,10 @@ OzMaker {version}
 ■ 지우기
   트레이 아이콘에서 종료한 뒤 OzMaker.exe와 %APPDATA%\OzMaker 폴더를 지웁니다.
 
+■ English
+  OzMaker shows English when Windows is not in Korean.
+  To change it: Settings (the gear at the top right) › General › Language.
+
 ■ 사용 설명서
   https://github.com/ejonghyuck/OzMaker/blob/main/docs/guide.md
 

@@ -159,9 +159,9 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
                 std::wstring lost = vo.sound && !sound ? aerr : L"";
                 if (vo.mic && !mic) lost += (lost.empty() ? L"" : L" ") + merr;
                 if (!lost.empty())
-                    notice_ = lost + (!vo.audio.enabled ? L" 소리 없이 녹화했습니다."
-                                      : !sound      ? L" 마이크 소리만 녹음했습니다."
-                                                    : L" 마이크 없이 녹화했습니다.");
+                    notice_ = lost + (!vo.audio.enabled ? tr(L" 소리 없이 녹화했습니다.")
+                                      : !sound      ? tr(L" 마이크 소리만 녹음했습니다.")
+                                                    : tr(L" 마이크 없이 녹화했습니다."));
             }
             tickStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             firstFrame_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -184,7 +184,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         session_.StartCapture();
     } catch (winrt::hresult_error const& e) {
         running_ = false;
-        err = L"캡처를 시작할 수 없습니다. (" + std::wstring(e.message()) + L")";
+        err = tr(L"캡처를 시작할 수 없습니다. (") + std::wstring(e.message()) + L")";
         if (ticker_.joinable()) {
             SetEvent(tickStop_);
             ticker_.join();
@@ -362,7 +362,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         if (setupFailed_) return;
         if (!Setup(sw, sh)) {
             setupFailed_ = true;
-            if (opt_.video) Fail(L"녹화 버퍼를 만들 수 없습니다.");
+            if (opt_.video) Fail(tr(L"녹화 버퍼를 만들 수 없습니다."));
             return;
         }
         setupDone_ = true;
@@ -731,7 +731,7 @@ void Capture::TickLoop() {
             if (!sample) continue;  // encoder pool momentarily full: this tick is dropped
             int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;
             if (!writer_->WriteVideo(sample.Get(), t0, t1 - t0)) {
-                Fail(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요.");
+                Fail(tr(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요."));
                 break;
             }
             ++frames_;
@@ -834,7 +834,7 @@ CaptureResult Capture::Stop() {
             res.notice = res.notice.empty() ? writer_->Notice() : res.notice + L" " + writer_->Notice();
         if (res.ok && !videoError_.empty()) {
             res.seconds = (double)writer_->VideoFrames() / std::max(1, opt_.fps);
-            std::wstring kept = videoError_ + L" 오류 전까지(" + util::FormatClock(res.seconds, false) + L") 저장했습니다.";
+            std::wstring kept = videoError_ + tr(L" 오류 전까지(") + util::FormatClock(res.seconds, false) + tr(L") 저장했습니다.");
             res.notice = res.notice.empty() ? kept : kept + L" " + res.notice;
         }
         res.error = res.ok ? std::wstring() : !videoError_.empty() ? videoError_ : finishErr;

@@ -42,6 +42,8 @@ bool IsAnimPath(const std::wstring& path);
 std::wstring FormatAgo(double seconds);  // "방금", "3분 전", "어제" ...
 
 std::wstring HotkeyToString(UINT mods, UINT vk);
+// Windows' "default app mode" is light (read from the registry; true when it isn't set).
+bool AppsUseLightTheme();
 
 // Characters Windows doesn't allow in file names become '_'; trimmed to maxLen.
 std::wstring SafeFileName(std::wstring_view s, size_t maxLen = 80);

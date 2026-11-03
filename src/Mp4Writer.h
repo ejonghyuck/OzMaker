@@ -58,6 +58,9 @@ public:
     const std::wstring& EncoderName() const { return encoderName_; }
     bool HardwareEncoder() const { return hardwareUsed_; }
     bool HasAudio() const { return audioStream_ != MAXDWORD; }
+    // What Open tried before the encoder it settled on, or before giving up: "hardware+params: BeginWriting
+    // 0xC00D36B4; ...". For tests and logs.
+    const std::wstring& Tried() const { return tried_; }
     bool Failed() const { return failed_; }
     int64_t VideoFrames() const { return videoFrames_; }
 
@@ -73,6 +76,7 @@ private:
     std::wstring path_;
     std::wstring marker_;  // fragmented: names path_ while it is written, for Recover
     std::wstring notice_;
+    std::wstring tried_;
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<ID3D11Multithread> mt_;

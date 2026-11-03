@@ -101,7 +101,7 @@ std::vector<AudioCapture::Device> AudioCapture::InputDevices() {
             pv.vt == VT_LPWSTR)
             e.name = pv.pwszVal;
         PropVariantClear(&pv);
-        if (e.name.empty()) e.name = L"이름 없는 장치";
+        if (e.name.empty()) e.name = tr(L"이름 없는 장치");
         out.push_back(std::move(e));
     }
     return out;
@@ -132,9 +132,9 @@ bool AudioCapture::Start(Source src, DWORD pid, int sampleRate, int64_t originQp
         CloseHandle(ready_);
         stop_ = ready_ = nullptr;
         sink_ = nullptr;
-        err = util::Format(src == Source::Process ? L"이 창의 소리를 녹음할 수 없습니다. (0x%08X)"
-                           : src == Source::Mic       ? L"마이크를 녹음할 수 없습니다. (0x%08X)"
-                                                      : L"시스템 소리를 녹음할 수 없습니다. (0x%08X)",
+        err = util::Format(src == Source::Process ? tr(L"이 창의 소리를 녹음할 수 없습니다. (0x%08X)")
+                           : src == Source::Mic       ? tr(L"마이크를 녹음할 수 없습니다. (0x%08X)")
+                                                      : tr(L"시스템 소리를 녹음할 수 없습니다. (0x%08X)"),
                            (unsigned)startHr_);
         return false;
     }
@@ -472,7 +472,7 @@ bool AudioMonitor::Start(int sampleRate, std::wstring& err) {
     WaitForSingleObject(ready_, INFINITE);
     if (SUCCEEDED(startHr_)) return true;
     Stop();
-    err = util::Format(L"스피커로 들려줄 수 없습니다. (0x%08X)", (unsigned)startHr_);
+    err = util::Format(tr(L"스피커로 들려줄 수 없습니다. (0x%08X)"), (unsigned)startHr_);
     return false;
 }
 

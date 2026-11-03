@@ -38,7 +38,7 @@ bool IsHex64(const std::wstring& s) {
 bool IsLocal(const std::wstring& base) { return base.find(L"://") == std::wstring::npos; }
 
 std::wstring LastError(const wchar_t* what, DWORD e = GetLastError()) {
-    return util::Format(L"%s (오류 %lu)", what, e);
+    return util::Format(tr(L"%s (오류 %lu)"), what, e);
 }
 }  // namespace
 
@@ -198,7 +198,7 @@ bool Updater::Fetch(const std::wstring& name, const std::function<bool(const uin
         std::wstring path = base_ + L"\\" + name;
         HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) {
-            err = LastError(L"업데이트 정보를 읽지 못했습니다");
+            err = LastError(tr(L"업데이트 정보를 읽지 못했습니다"));
             return false;
         }
         LARGE_INTEGER sz{};
@@ -209,7 +209,7 @@ bool Updater::Fetch(const std::wstring& name, const std::function<bool(const uin
         while (!cancel_ && (ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr) != FALSE) && got > 0)
             if (!sink(buf.data(), got, (uint64_t)sz.QuadPart)) break;
         CloseHandle(f);
-        if (!ok) err = LastError(L"업데이트 파일을 읽지 못했습니다");
+        if (!ok) err = LastError(tr(L"업데이트 파일을 읽지 못했습니다"));
         return ok && !cancel_;
     }
 
@@ -221,14 +221,14 @@ bool Updater::Fetch(const std::wstring& name, const std::function<bool(const uin
     uc.lpszUrlPath = path;
     uc.dwUrlPathLength = _countof(path);
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
-        err = L"업데이트 주소가 올바르지 않습니다.";
+        err = tr(L"업데이트 주소가 올바르지 않습니다.");
         return false;
     }
     std::wstring agent = L"OzMaker/" OZ_VERSION_WSTR;
     HINTERNET session = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
                                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
-        err = LastError(L"인터넷에 연결하지 못했습니다");
+        err = LastError(tr(L"인터넷에 연결하지 못했습니다"));
         return false;
     }
     WinHttpSetTimeouts(session, 10000, 10000, 15000, 30000);
@@ -265,12 +265,12 @@ bool Updater::Fetch(const std::wstring& name, const std::function<bool(const uin
                 if (got == 0) break;
                 if (!sink(buf.data(), got, total)) break;
             }
-            if (!ok && !cancel_) err = LastError(L"내려받다가 연결이 끊겼습니다");
+            if (!ok && !cancel_) err = LastError(tr(L"내려받다가 연결이 끊겼습니다"));
         } else {
-            err = status == 404 ? L"업데이트 정보가 없는 릴리스입니다." : util::Format(L"서버 응답 %lu", status);
+            err = status == 404 ? tr(L"업데이트 정보가 없는 릴리스입니다.") : util::Format(tr(L"서버 응답 %lu"), status);
         }
     } else if (!cancel_) {
-        err = LastError(L"GitHub에 연결하지 못했습니다");
+        err = LastError(tr(L"GitHub에 연결하지 못했습니다"));
     }
     {
         std::lock_guard lk(mtx_);
@@ -292,7 +292,7 @@ void Updater::Run() {
     Info info;
     if (got && !Parse(text, info)) {
         got = false;
-        err = L"업데이트 정보를 알아볼 수 없습니다.";
+        err = tr(L"업데이트 정보를 알아볼 수 없습니다.");
     }
     if (!got) {
         if (cancel_) return;
@@ -380,8 +380,8 @@ void Updater::Run() {
     }
     DeleteFileW(part.c_str());
     if (cancel_) return;
-    if (got && writeOk) err = L"받은 파일이 손상되었습니다(크기 또는 SHA-256이 다름).";
-    else if (!writeOk) err = L"받은 파일을 저장하지 못했습니다.";
+    if (got && writeOk) err = tr(L"받은 파일이 손상되었습니다(크기 또는 SHA-256이 다름).");
+    else if (!writeOk) err = tr(L"받은 파일을 저장하지 못했습니다.");
     Set([&](Status& s) {
         s.state = State::Failed;
         s.error = err;
@@ -394,7 +394,7 @@ bool Updater::Install(std::wstring& err) {
     {
         std::lock_guard lk(mtx_);
         if (status_.state != State::Ready || running_) {
-            err = L"업데이트가 아직 준비되지 않았습니다.";
+            err = tr(L"업데이트가 아직 준비되지 않았습니다.");
             return false;
         }
         info = ready_;
@@ -402,7 +402,7 @@ bool Updater::Install(std::wstring& err) {
     const std::wstring staged = exe_ + L".new", old = exe_ + L".old";
     uint64_t size = 0;
     if (Sha256File(staged, &size) != info.sha256 || size != info.size) {
-        err = L"받아 둔 업데이트 파일이 바뀌었습니다. 다시 확인합니다.";
+        err = tr(L"받아 둔 업데이트 파일이 바뀌었습니다. 다시 확인합니다.");
         DeleteFileW(staged.c_str());
         Set([](Status& s) { s.state = State::Idle; });
         return false;
@@ -410,13 +410,13 @@ bool Updater::Install(std::wstring& err) {
     // A running exe can't be overwritten or deleted, but it can be renamed.
     DeleteFileW(old.c_str());
     if (!MoveFileExW(exe_.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        err = LastError(L"지금 실행 파일의 이름을 바꾸지 못했습니다");
+        err = LastError(tr(L"지금 실행 파일의 이름을 바꾸지 못했습니다"));
         return false;
     }
     if (!MoveFileExW(staged.c_str(), exe_.c_str(), 0)) {
         DWORD e = GetLastError();
         MoveFileExW(old.c_str(), exe_.c_str(), 0);
-        err = LastError(L"새 실행 파일을 넣지 못했습니다", e);
+        err = LastError(tr(L"새 실행 파일을 넣지 못했습니다"), e);
         return false;
     }
     Set([](Status& s) { s.state = State::Idle; });

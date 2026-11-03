@@ -100,6 +100,8 @@ void Settings::Load() {
     sounds = ReadInt(ini, L"Sounds", sounds, 0, 1) != 0;
     closeToTray = ReadInt(ini, L"CloseToTray", closeToTray, 0, 1) != 0;
     autoUpdate = ReadInt(ini, L"AutoUpdate", autoUpdate, 0, 1) != 0;
+    theme = ReadInt(ini, L"Theme", theme, 0, 2);
+    language = ReadInt(ini, L"Language", language, 0, 2);
     trayHintShown = ReadInt(ini, L"TrayHintShown", trayHintShown, 0, 1) != 0;
     settingsTab = ReadInt(ini, L"SettingsTab", settingsTab, 0, kTabCount - 1);
     window.left = ReadSigned(ini, L"WindowL");
@@ -205,6 +207,8 @@ void Settings::Save() const {
     num(L"Sounds", sounds);
     num(L"CloseToTray", closeToTray);
     num(L"AutoUpdate", autoUpdate);
+    num(L"Theme", theme);
+    num(L"Language", language);
     num(L"TrayHintShown", trayHintShown);
     num(L"SettingsTab", settingsTab);
     num(L"WindowL", window.left);

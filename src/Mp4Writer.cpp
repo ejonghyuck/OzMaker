@@ -84,6 +84,10 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
     v_ = v;
     a_ = a;
     path_ = path;
+    tried_.clear();
+    // Windows' fragmented MP4 sink takes H.264 only: it refuses HEVC, even with the encoder's sequence header in
+    // the type (--encoder-test). HEVC is written as a plain MP4, which a crash leaves without its index.
+    if (v_.hevc) v_.fragmented = false;
     dev_ = dev;
     dev_->GetImmediateContext(&ctx_);
     ctx_.As(&mt_);
@@ -104,7 +108,7 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
     if (SUCCEEDED(hr)) hr = vdev_->CreateVideoProcessorEnumerator(&cd, &vpEnum_);
     if (SUCCEEDED(hr)) hr = vdev_->CreateVideoProcessor(vpEnum_.Get(), 0, &vp_);
     if (FAILED(hr)) {
-        err = L"GPU 영상 변환을 시작할 수 없습니다. (" + Hr(hr) + L")";
+        err = tr(L"GPU 영상 변환을 시작할 수 없습니다. (") + Hr(hr) + L")";
         Close();
         return false;
     }
@@ -147,7 +151,7 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
         hr = allocator_->InitializeSampleAllocatorEx(4, 24, aa.Get(), nv12.Get());
     }
     if (FAILED(hr)) {
-        err = L"영상 버퍼를 만들 수 없습니다. (" + Hr(hr) + L")";
+        err = tr(L"영상 버퍼를 만들 수 없습니다. (") + Hr(hr) + L")";
         Close();
         return false;
     }
@@ -231,12 +235,13 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
         hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, wa.Get(), &writer_);
     }
     if (FAILED(hr)) {
-        err = L"파일을 만들 수 없습니다. (" + Hr(hr) + L")";
+        err = tr(L"파일을 만들 수 없습니다. (") + Hr(hr) + L")";
         writer_.Reset();
         return false;
     }
 
-    const wchar_t* stage = L"영상 인코더";
+    const wchar_t* stage = tr(L"영상 인코더");
+    const wchar_t* call = L"AddStream(video)";  // for Tried
     ComPtr<IMFMediaType> vo, vi;
     hr = MFCreateMediaType(&vo);
     if (SUCCEEDED(hr)) {
@@ -258,10 +263,11 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             params->SetUINT32(CODECAPI_AVEncMPVGOPSize, (UINT32)std::max(1, v_.gopFrames));
             params->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, (UINT32)std::clamp(v_.qualityVsSpeed, 0, 100));
         }
+        call = L"SetInputMediaType(video)";
         hr = writer_->SetInputMediaType(videoStream_, vi.Get(), params.Get());
     }
     if (SUCCEEDED(hr) && a_.enabled) {
-        stage = L"AAC 인코더";
+        stage = tr(L"AAC 인코더");
         ComPtr<IMFMediaType> ao, ai;
         hr = MFCreateMediaType(&ao);
         if (SUCCEEDED(hr)) {
@@ -271,6 +277,7 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             ao->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, a_.sampleRate);
             ao->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
             ao->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, a_.bitrate / 8);
+            call = L"AddStream(audio)";
             hr = writer_->AddStream(ao.Get(), &audioStream_);
         }
         if (SUCCEEDED(hr)) hr = MFCreateMediaType(&ai);
@@ -282,6 +289,7 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             ai->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
             ai->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
             ai->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, a_.sampleRate * 4);
+            call = L"SetInputMediaType(audio)";
             hr = writer_->SetInputMediaType(audioStream_, ai.Get(), nullptr);
         }
     }
@@ -308,10 +316,18 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             }
         }
     }
-    if (encoderName_.empty()) encoderName_ = v_.hevc ? L"Microsoft HEVC (소프트웨어)" : L"Microsoft H.264 (소프트웨어)";
-    if (SUCCEEDED(hr)) hr = writer_->BeginWriting();
+    if (encoderName_.empty()) encoderName_ = v_.hevc ? tr(L"Microsoft HEVC (소프트웨어)") : tr(L"Microsoft H.264 (소프트웨어)");
+    if (SUCCEEDED(hr)) {
+        call = L"BeginWriting";
+        hr = writer_->BeginWriting();
+    }
     if (FAILED(hr)) {
-        err = std::wstring(stage) + L"를 시작할 수 없습니다. (" + Hr(hr) + L")";
+        tried_ += util::Format(L"%s%s%s: %s ", tried_.empty() ? L"" : L"; ", hardware ? L"hardware" : L"software",
+                               codecParams ? L"+params" : L"", call) +
+                  Hr(hr);
+        // BeginWriting starts the file and every encoder at once: not the last stage that was set up.
+        err = wcscmp(call, L"BeginWriting") == 0 ? tr(L"동영상 파일을 쓰기 시작할 수 없습니다. (") + Hr(hr) + L")"
+                                                 : util::Format(tr(L"%s를 시작할 수 없습니다. ("), stage) + Hr(hr) + L")";
         writer_.Reset();
         DeleteFileW(path.c_str());
         videoStream_ = audioStream_ = MAXDWORD;
@@ -423,7 +439,7 @@ bool Mp4Writer::WriteAudioQueue() {
 
 bool Mp4Writer::Finish(std::wstring& err) {
     if (!writer_) {
-        err = L"녹화된 화면이 없습니다.";
+        err = tr(L"녹화된 화면이 없습니다.");
         Close();
         return false;
     }
@@ -431,8 +447,8 @@ bool Mp4Writer::Finish(std::wstring& err) {
     if (!failed_) WriteAudioQueue();
     HRESULT hr = videoFrames_ > 0 ? writer_->Finalize() : E_FAIL;
     if (FAILED(hr)) {
-        err = videoFrames_ == 0 ? L"녹화된 화면이 없습니다."
-                                : L"동영상 파일을 마무리하지 못했습니다. (" + Hr(hr) + L")";
+        err = videoFrames_ == 0 ? tr(L"녹화된 화면이 없습니다.")
+                                : tr(L"동영상 파일을 마무리하지 못했습니다. (") + Hr(hr) + L")";
         Abort();
         return false;
     }
@@ -440,7 +456,7 @@ bool Mp4Writer::Finish(std::wstring& err) {
     if (v_.fragmented) {
         std::wstring why;
         if (!mp4::Unfragment(path_, why))
-            notice_ = L"동영상을 일반 MP4로 바꾸지 못했습니다(" + why + L"). 대부분의 플레이어에서는 그대로 재생됩니다.";
+            notice_ = tr(L"동영상을 일반 MP4로 바꾸지 못했습니다(") + why + tr(L"). 대부분의 플레이어에서는 그대로 재생됩니다.");
     }
     Unmark();
     return true;

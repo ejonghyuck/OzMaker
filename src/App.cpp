@@ -77,8 +77,10 @@ std::vector<std::wstring> SplitArgs(const std::wstring& cmd) {
 int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     inst_ = inst;
     settings_.Load();
+    ApplyLanguage();
+    ApplyTheme();
     if (!gfx_.Init()) {
-        MessageBoxW(nullptr, L"그래픽 장치를 초기화할 수 없습니다.", L"OzMaker", MB_ICONERROR);
+        MessageBoxW(nullptr, tr(L"그래픽 장치를 초기화할 수 없습니다."), L"OzMaker", MB_ICONERROR);
         return 1;
     }
     Fonts::Init(gfx_.DWrite());
@@ -87,8 +89,16 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     regionPicker_.Init(inst, gfx_.D2D());
 
     auto args = SplitArgs(cmdLine);
+    // Every flag but --tray and --updated is a test mode. Those draw the same on any PC (CI runs on English
+    // Windows): Korean and dark. --screenshot picks its own look.
+    if (!args.empty() && args[0].starts_with(L"--") && args[0] != L"--tray" && args[0] != L"--updated") {
+        settings_.theme = kThemeDark;
+        settings_.language = kLangKorean;
+        ApplyLanguage();
+        ApplyTheme();
+    }
     if (args.size() >= 2 && args[0] == L"--crash-test") return RunCrashTest(args);
-    if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
+    if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--readme-media") return RunReadmeMedia(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
@@ -96,6 +106,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 3 && args[0] == L"--editor-test") return RunEditorTest(args[1], args[2]);
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--test-window") return RunTestWindow(_wtof(args[1].c_str()));
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--video-test")
@@ -114,9 +125,9 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way
     if (updated) {
         if (tray)
-            TrayBalloon(L"OzMaker를 업데이트했습니다", L"버전 " OZ_VERSION_WSTR);
+            TrayBalloon(tr(L"OzMaker를 업데이트했습니다"), util::Format(tr(L"버전 %s"), OZ_VERSION_WSTR));
         else
-            Toast(L"OzMaker " OZ_VERSION_WSTR L" 버전으로 업데이트했습니다");
+            Toast(util::Format(tr(L"OzMaker %s 버전으로 업데이트했습니다"), OZ_VERSION_WSTR));
     }
     // A crash report written since the user was last told, and the recordings it left behind: say so once (#24).
     bool crashed = false;
@@ -129,13 +140,13 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     size_t clips = RecoverRecordings();
     std::vector<std::wstring> videos = Mp4Writer::Recover();  // newest first
     if (crashed || clips || !videos.empty()) {
-        std::wstring title = crashed ? L"지난번에 OzMaker가 비정상 종료되었습니다" : L"지난번 녹화를 되살렸습니다";
+        std::wstring title = crashed ? tr(L"지난번에 OzMaker가 비정상 종료되었습니다") : tr(L"지난번 녹화를 되살렸습니다");
         std::wstring body =
-            clips && !videos.empty() ? util::Format(L"녹화 %zu개와 동영상 %zu개를 되살렸습니다", clips, videos.size())
-            : clips    ? util::Format(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다", clips)
-            : !videos.empty() ? (videos.size() == 1 ? L"녹화하던 동영상을 되살렸습니다 · " + util::FileNameOf(videos[0])
-                                                    : util::Format(L"녹화하던 동영상 %zu개를 되살렸습니다", videos.size()))
-                              : std::wstring(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
+            clips && !videos.empty() ? util::Format(tr(L"녹화 %zu개와 동영상 %zu개를 되살렸습니다"), clips, videos.size())
+            : clips    ? util::Format(tr(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다"), clips)
+            : !videos.empty() ? (videos.size() == 1 ? tr(L"녹화하던 동영상을 되살렸습니다 · ") + util::FileNameOf(videos[0])
+                                                    : util::Format(tr(L"녹화하던 동영상 %zu개를 되살렸습니다"), videos.size()))
+                              : std::wstring(tr(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다"));
         // A video is already a file in the save folder: it opens like one that was just saved.
         for (size_t i = videos.size(); i-- > 1;) AddRecent(videos[i]);
         if (!videos.empty()) {
@@ -155,11 +166,13 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
         }
         if (tray)
             TrayBalloon(title, body);
+        else if (crashed)
+            Alert(title + L". " + body + L".");
         else
-            Toast(title + L". " + body + L".", crashed);
+            Toast(title + L". " + body + L".");
     }
     if (!Capture::IsSupported())
-        Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
+        Toast(tr(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다."), true);
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
     Loop();
     return 0;
@@ -291,12 +304,9 @@ bool App::CreateMainWindow(int show) {
                             this);
     if (!hwnd_) return false;
     dpi_ = GetDpiForWindow(hwnd_);
-    BOOL dark = TRUE;
-    if (FAILED(DwmSetWindowAttribute(hwnd_, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark))))
-        DwmSetWindowAttribute(hwnd_, 19, &dark, sizeof(dark));
-    COLORREF caption = RGB(0x0D, 0x0F, 0x13);
-    DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR, Win11*/, &caption, sizeof(caption));
+    ApplyTheme();  // the title bar
     if (!gfx_.AttachWindow(hwnd_)) return false;
+    access_.Attach(hwnd_, &ui_, [this] { return Scale(); }, [this] { Invalidate(); });
     // No IME while no text field has the focus: in Korean mode it would swallow the letter shortcuts (I, O, J, K, L).
     ImmAssociateContextEx(hwnd_, nullptr, 0);
     dropTarget_ = MakeDropTarget();
@@ -310,9 +320,9 @@ bool App::CreateMainWindow(int show) {
     RegisterRecordHotkey();
     TrayUpdate();
     if (!hotkeyOk_)
-        TrayBalloon(L"녹화 단축키를 쓸 수 없습니다",
+        TrayBalloon(tr(L"녹화 단축키를 쓸 수 없습니다"),
                     util::HotkeyToString(settings_.hkMods, settings_.hkVk) +
-                        L"을(를) 다른 프로그램이 쓰고 있습니다. 설정에서 다른 조합을 지정하세요.");
+                        tr(L"을(를) 다른 프로그램이 쓰고 있습니다. 설정에서 다른 조합을 지정하세요."));
     RefreshWindows();
     WatchWindows(true);
     if (restored && settings_.windowMax && show != SW_HIDE && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE)
@@ -367,6 +377,7 @@ void App::Render() {
     DrawFrame(Rect(0, 0, rc.right / Scale(), rc.bottom / Scale()));
     ui_.End();
     gfx_.EndFrame();
+    access_.AfterFrame();
     ApplyThumbnail();
     SyncAudioPreview();
     SyncIme();
@@ -544,8 +555,18 @@ void App::RememberPlacement() {
 void App::Toast(std::wstring text, bool error) {
     toast_ = std::move(text);
     toastError_ = error;
+    toastSticky_ = false;
+    toastTab_ = -1;
     // Long enough to read: longer messages stay longer.
     toastUntil_ = util::NowSeconds() + std::min(12.0, (error ? 5.0 : 3.0) + toast_.size() / 25.0);
+    Invalidate();
+}
+
+void App::Alert(std::wstring text, int settingsTab) {
+    toast_ = std::move(text);
+    toastError_ = toastSticky_ = true;
+    toastTab_ = settingsTab;
+    toastUntil_ = std::numeric_limits<double>::infinity();
     Invalidate();
 }
 
@@ -634,8 +655,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     const UINT otherVk = record ? settings_.hkPauseVk : settings_.hkVk;
                     if ((fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) && mods == otherMods &&
                         vk == otherVk) {
-                        Toast(record ? L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요."
-                                     : L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요.",
+                        Toast(record ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
+                                     : tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요."),
                               true);
                     } else if (fkey || vk == VK_PAUSE || vk == VK_SCROLL || (mods & ~MOD_SHIFT)) {
                         // Try it first; the keys are registered for real once capturing ends.
@@ -648,12 +669,12 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                             TrayUpdate();
                         } else {
                             // Keep the previous key and let them try another.
-                            Toast(util::HotkeyToString(mods, vk) + L"은(는) 다른 프로그램이 쓰고 있습니다. 다른 조합을 눌러 주세요.",
+                            Toast(util::HotkeyToString(mods, vk) + tr(L"은(는) 다른 프로그램이 쓰고 있습니다. 다른 조합을 눌러 주세요."),
                                   true);
                         }
                     } else if (mods == MOD_SHIFT) {
                         // Shift + a letter would swallow capital letters in every other program.
-                        Toast(L"Ctrl, Alt, Win 중 하나와 함께 누르세요. (F1~F12는 단독으로도 됩니다)", true);
+                        Toast(tr(L"Ctrl, Alt, Win 중 하나와 함께 누르세요. (F1~F12는 단독으로도 됩니다)"), true);
                     }
                 }
                 Invalidate();
@@ -747,6 +768,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_DISPLAYCHANGE:
             monitors_ = EnumerateMonitors();
             Invalidate();
+            break;
+        case WM_SETTINGCHANGE:  // light or dark mode ("ImmersiveColorSet"), the contrast theme, animations
+        case WM_SYSCOLORCHANGE:
+        case WM_THEMECHANGED:
+            ApplyTheme();
             break;
         case WM_TIMER:
             if (w == kTimerRec) {
@@ -876,9 +902,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 if (!settings_.trayHintShown) {
                     settings_.trayHintShown = true;
                     settings_.Save();
-                    TrayBalloon(L"OzMaker는 트레이에서 계속 실행됩니다",
+                    TrayBalloon(tr(L"OzMaker는 트레이에서 계속 실행됩니다"),
                                 util::HotkeyToString(settings_.hkMods, settings_.hkVk) +
-                                    L" 로 언제든 녹화를 시작할 수 있습니다.");
+                                    tr(L" 로 언제든 녹화를 시작할 수 있습니다."));
                 }
                 return 0;
             }
@@ -898,7 +924,12 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 settings_.Save();
             }
             return 0;
+        case WM_GETOBJECT:
+            if (static_cast<long>(l) == static_cast<long>(UiaRootObjectId) && access_.Root())
+                return access_.OnGetObject(w, l);
+            break;
         case WM_DESTROY:
+            access_.Detach();
             if (rec_ == RecState::Recording) capture_.Stop();
             RememberPlacement();
             overlay_.Hide();
@@ -1095,18 +1126,18 @@ bool App::CurrentTarget(RecTarget& t, std::wstring* why) const {
     switch (settings_.source) {
         case kSourceDisplay: {
             const MonitorDesc* m = FindMonitor(monitors_, settings_.monitor);
-            if (!m) return fail(L"녹화할 화면을 찾을 수 없습니다.");
+            if (!m) return fail(tr(L"녹화할 화면을 찾을 수 없습니다."));
             t = MonitorTarget(m->handle);
             return true;
         }
         case kSourceRegion: {
-            if (!settings_.HasRegion()) return fail(L"녹화할 영역을 먼저 지정하세요.");
+            if (!settings_.HasRegion()) return fail(tr(L"녹화할 영역을 먼저 지정하세요."));
             RECT r = settings_.region, clip{};
             HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
             MONITORINFO mi{sizeof(mi)};
             if (!mon || !GetMonitorInfoW(mon, &mi) || !IntersectRect(&clip, &r, &mi.rcMonitor) ||
                 clip.right - clip.left < 16 || clip.bottom - clip.top < 16)
-                return fail(L"지정한 영역이 화면 밖에 있습니다. 영역을 다시 지정하세요.");
+                return fail(tr(L"지정한 영역이 화면 밖에 있습니다. 영역을 다시 지정하세요."));
             t = {};
             t.source = kSourceRegion;
             t.monitor = mon;
@@ -1114,7 +1145,7 @@ bool App::CurrentTarget(RecTarget& t, std::wstring* why) const {
             return true;
         }
         default:
-            if (!target_ || !IsWindow(target_)) return fail(L"녹화할 창을 먼저 선택하세요.");
+            if (!target_ || !IsWindow(target_)) return fail(tr(L"녹화할 창을 먼저 선택하세요."));
             t = WindowTarget(target_);
             return true;
     }
@@ -1163,12 +1194,12 @@ bool App::NotifyQuietly() const {
     return recFromHotkey_ && fg && fg != hwnd_ && IsFullscreenWindow(fg);
 }
 
-void App::ReportError(const std::wstring& title, const std::wstring& text) {
+void App::ReportError(const std::wstring& title, const std::wstring& text, int settingsTab) {
     if (NotifyQuietly()) {
         TrayBalloon(title, text);
     } else {
         ShowMain(true);
-        Toast(text, true);
+        Alert(text, settingsTab);
     }
 }
 
@@ -1223,28 +1254,28 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     recFromHotkey_ = fromHotkey;
     if (exporter_.Busy()) {
         if (fromHotkey)
-            TrayBalloon(L"녹화를 시작할 수 없습니다", L"내보내기가 끝난 뒤에 녹화할 수 있습니다.");
+            TrayBalloon(tr(L"녹화를 시작할 수 없습니다"), tr(L"내보내기가 끝난 뒤에 녹화할 수 있습니다."));
         else
-            Toast(L"내보내기가 끝난 뒤에 녹화할 수 있습니다.", true);
+            Toast(tr(L"내보내기가 끝난 뒤에 녹화할 수 있습니다."), true);
         return;
     }
     if (target.source == kSourceWindow && (!target.hwnd || !IsWindow(target.hwnd))) {
         ShowMain(true);
-        Toast(L"녹화할 창을 먼저 선택하세요.", true);
+        Toast(tr(L"녹화할 창을 먼저 선택하세요."), true);
         return;
     }
     recTarget_ = target;
     if (target.source == kSourceDisplay) {
-        recName_ = L"화면";
+        recName_ = tr(L"화면");
         for (auto& m : monitors_)
-            if (m.handle == target.monitor) recName_ = util::Format(L"화면 %d", m.number);
+            if (m.handle == target.monitor) recName_ = util::Format(tr(L"화면 %d"), m.number);
     } else if (target.source == kSourceRegion) {
-        recName_ = L"영역";
+        recName_ = tr(L"영역");
     } else {
         int len = GetWindowTextLengthW(target.hwnd);
         recName_.assign(len + 1, L'\0');
         recName_.resize(GetWindowTextW(target.hwnd, recName_.data(), len + 1));
-        if (recName_.empty()) recName_ = L"창";
+        if (recName_.empty()) recName_ = tr(L"창");
     }
     recVideo_ = settings_.output == kOutputVideo;
     if (target.source == kSourceWindow) {
@@ -1281,7 +1312,7 @@ void App::BeginCapture() {
         rec_ = RecState::Idle;
         overlay_.Hide();
         ShowMain(true);
-        Toast(L"녹화할 창이 닫혔습니다.", true);
+        Alert(tr(L"녹화할 창이 닫혔습니다."));
         return;
     }
     if (window) recTarget_.rect = WindowTarget(recTarget_.hwnd).rect;
@@ -1318,8 +1349,8 @@ void App::BeginCapture() {
             v.audioPid = AudioCapture::AudioProcessOf(recTarget_.hwnd);
             if (v.sound && !AudioCapture::ProcessLoopbackSupported()) {
                 v.sound = false;
-                recNotice_ = v.mic ? L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다."
-                                   : L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.";
+                recNotice_ = v.mic ? tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다.")
+                                   : tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.");
             }
         }
         v.audio.enabled = v.sound || v.mic;
@@ -1339,8 +1370,8 @@ void App::BeginCapture() {
         rec_ = RecState::Idle;
         overlay_.Hide();
         TrayUpdate();
-        ReportError(L"녹화를 시작하지 못했습니다",
-                    L"저장할 드라이브에 남은 공간이 " + util::FormatBytes(freeBytes) + L"뿐입니다. 공간을 비운 뒤 녹화하세요.");
+        ReportError(tr(L"녹화를 시작하지 못했습니다"),
+                    tr(L"저장할 드라이브에 남은 공간이 ") + util::FormatBytes(freeBytes) + tr(L"뿐입니다. 공간을 비운 뒤 녹화하세요."));
         return;
     }
     std::wstring err;
@@ -1348,7 +1379,14 @@ void App::BeginCapture() {
         rec_ = RecState::Idle;
         overlay_.Hide();
         TrayUpdate();
-        ReportError(L"녹화를 시작하지 못했습니다", err);
+        // The MP4 encoder refusing to start is most often the graphics card's: the video settings hold the way out.
+        if (recVideo_ && err.find(tr(L"인코더")) != std::wstring::npos)
+            ReportError(tr(L"녹화를 시작하지 못했습니다"),
+                        err + tr(L" 하드웨어 인코딩을 끄거나 해상도를 낮춰 보세요. 그래픽 드라이버를 업데이트하면 "
+                                 L"해결되는 경우도 많습니다."),
+                        kTabVideo);
+        else
+            ReportError(tr(L"녹화를 시작하지 못했습니다"), err);
         return;
     }
     rec_ = RecState::Recording;
@@ -1356,8 +1394,8 @@ void App::BeginCapture() {
     stopReason_.clear();
     nextDiskCheck_ = util::NowSeconds() + 2;
     if (freeBytes < kLowDiskWarn)
-        TrayBalloon(L"남은 공간이 적습니다", L"저장할 드라이브에 " + util::FormatBytes(freeBytes) +
-                                                L" 남았습니다. 300MB까지 줄면 녹화를 멈추고 저장합니다.");
+        TrayBalloon(tr(L"남은 공간이 적습니다"), tr(L"저장할 드라이브에 ") + util::FormatBytes(freeBytes) +
+                                                tr(L" 남았습니다. 300MB까지 줄면 녹화를 멈추고 저장합니다."));
     RegisterPauseHotkey();
     bool pill = settings_.overlayMode == kOverlayAlways ||
                 (settings_.overlayMode == kOverlayExceptFullscreen && !recFullscreen_);
@@ -1400,25 +1438,27 @@ void App::StopRecording() {
     if (clip) HoldRecording(clip);
     clipName_ = recName_;
     if (!clip) {
-        ReportError(L"녹화 실패", recTarget_.source == kSourceWindow
-                                      ? L"캡처된 화면이 없습니다. 설정에서 캡처 방식을 '화면'으로 바꿔 보세요."
-                                      : L"캡처된 화면이 없습니다.");
+        if (recTarget_.source == kSourceWindow)
+            ReportError(tr(L"녹화 실패"), tr(L"캡처된 화면이 없습니다. 녹화 설정에서 창 캡처 방식을 '화면'으로 바꿔 보세요."),
+                        kTabRecord);
+        else
+            ReportError(tr(L"녹화 실패"), tr(L"캡처된 화면이 없습니다."));
         return;
     }
     OpenEditor(clip);
     std::wstring warn;
     if (clip->WriteFailed())
-        warn = L"디스크 공간이 부족해 녹화를 멈췄습니다. 그 앞까지만 저장되어 있습니다.";
+        warn = tr(L"디스크 공간이 부족해 녹화를 멈췄습니다. 그 앞까지만 저장되어 있습니다.");
     else if (clip->Dropped() > 0)
-        warn = util::Format(L"디스크가 느려 프레임 %u개를 건너뛰었습니다.", clip->Dropped());
+        warn = util::Format(tr(L"디스크가 느려 프레임 %u개를 건너뛰었습니다."), clip->Dropped());
     if (!stopReason_.empty() && !clip->WriteFailed()) warn = stopReason_ + (warn.empty() ? L"" : L" " + warn);
     stopReason_.clear();
     if (NotifyQuietly()) {
-        TrayBalloon(L"녹화 완료 · " + util::FormatClock(clip->Seconds(), true),
-                    warn.empty() ? L"클릭하면 편집 탭이 열립니다." : warn);
+        TrayBalloon(tr(L"녹화 완료 · ") + util::FormatClock(clip->Seconds(), true),
+                    warn.empty() ? tr(L"클릭하면 편집 탭이 열립니다.") : warn);
     } else {
         ShowMain(true);
-        Toast(warn.empty() ? L"녹화를 편집 탭에서 열었습니다" : warn, !warn.empty());
+        Toast(warn.empty() ? tr(L"녹화를 편집 탭에서 열었습니다") : warn, !warn.empty());
     }
 }
 
@@ -1459,7 +1499,7 @@ void App::EditLastVideo() {
 void App::OnVideoSaved(const CaptureResult& r) {
     if (!r.ok) {
         if (settings_.sounds) sound::Play(sound::Cue::Stop);
-        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
+        ReportError(tr(L"동영상 저장 실패"), r.error.empty() ? tr(L"동영상을 저장하지 못했습니다.") : r.error);
         return;
     }
     if (settings_.sounds) sound::Play(sound::Cue::Saved);
@@ -1468,15 +1508,15 @@ void App::OnVideoSaved(const CaptureResult& r) {
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
     std::wstring reason = std::exchange(stopReason_, {});
     if (NotifyQuietly())
-        TrayBalloon(L"동영상 저장 완료 · " + util::FormatClock(r.seconds, false), reason.empty() ? info : reason);
+        TrayBalloon(tr(L"동영상 저장 완료 · ") + util::FormatClock(r.seconds, false), reason.empty() ? info : reason);
     else
         ShowMain(true);
     if (!lastVideo_.notice.empty())
-        Toast(reason.empty() ? lastVideo_.notice : reason + L" " + lastVideo_.notice, true);
+        Alert(reason.empty() ? lastVideo_.notice : reason + L" " + lastVideo_.notice);
     else if (!reason.empty())
-        Toast(reason + L" · " + info, true);
+        Alert(reason + L" · " + info);
     else
-        Toast(L"동영상을 저장했습니다 · " + info);
+        Toast(tr(L"동영상을 저장했습니다 · ") + info);
 }
 
 void App::TogglePause() {
@@ -1498,8 +1538,9 @@ void App::CheckLimits() {
     if (rec_ != RecState::Recording) return;
     int minutes = kMaxLengthOptions[settings_.maxLengthIdx];
     if (minutes > 0 && capture_.Elapsed() >= minutes * 60.0) {
-        stopReason_ = (minutes % 60 ? util::Format(L"%d분", minutes) : util::Format(L"%d시간", minutes / 60)) +
-                      L"이 되어 녹화를 멈췄습니다.";
+        const std::wstring limit =
+            minutes % 60 ? util::Format(tr(L"%d분"), minutes) : util::Format(tr(L"%d시간"), minutes / 60);
+        stopReason_ = util::Format(tr(L"%s이 되어 녹화를 멈췄습니다."), limit.c_str());
         StopRecording();
         return;
     }
@@ -1507,7 +1548,7 @@ void App::CheckLimits() {
     if (now < nextDiskCheck_) return;
     nextDiskCheck_ = now + 2;
     if (util::FreeBytes(RecordingDir()) < kLowDiskStop) {
-        stopReason_ = L"남은 저장 공간이 300MB까지 줄어 녹화를 멈추고 저장했습니다.";
+        stopReason_ = tr(L"남은 저장 공간이 300MB까지 줄어 녹화를 멈추고 저장했습니다.");
         StopRecording();
     }
 }
@@ -1549,11 +1590,11 @@ void App::OnHotkey() {
             if (CurrentTarget(t, &why))
                 StartRecording(t, true);
             else
-                TrayBalloon(L"영역 녹화를 시작할 수 없습니다", why);
+                TrayBalloon(tr(L"영역 녹화를 시작할 수 없습니다"), why);
             break;
         default:
             if (shell)
-                TrayBalloon(L"녹화할 창이 없습니다", L"녹화할 창을 앞에 띄운 뒤 단축키를 누르세요.");
+                TrayBalloon(tr(L"녹화할 창이 없습니다"), tr(L"녹화할 창을 앞에 띄운 뒤 단축키를 누르세요."));
             else
                 StartRecording(WindowTarget(root), true);
     }
@@ -1571,30 +1612,30 @@ std::wstring App::VideoSummary() const {
     std::wstring s = hevc ? L"HEVC" : L"H.264";
     const std::wstring& hw = encName_[hevc][1];
     if (settings_.vHardware && !hw.empty()) {
-        s += L" · " + Mp4Writer::Vendor(hw) + L" 가속";
+        s += L" · " + Mp4Writer::Vendor(hw) + tr(L" 가속");
     } else {
-        s += L" · CPU 인코딩";
+        s += tr(L" · CPU 인코딩");
     }
     int mbps = kVideoBitrateOptions[settings_.vBitrateIdx];
-    s += mbps ? util::Format(L" · %d Mbps", mbps) : L" · 자동 화질";
+    s += mbps ? util::Format(L" · %d Mbps", mbps) : tr(L" · 자동 화질");
     return s;
 }
 
 std::wstring App::AudioSummary(int source) const {
     std::wstring s;
     if (settings_.audio)
-        s = source != kSourceWindow                         ? L"시스템 전체 소리 녹음"
-            : AudioCapture::ProcessLoopbackSupported() ? L"이 창의 소리만 녹음"
-                                                       : L"창 소리 녹음 불가 (Windows 10 2004 이상)";
-    if (settings_.mic) s = s.empty() ? L"마이크만 녹음" : s + L" + 마이크";
-    return s.empty() ? L"소리 끔" : s;
+        s = source != kSourceWindow                         ? tr(L"시스템 전체 소리 녹음")
+            : AudioCapture::ProcessLoopbackSupported() ? tr(L"이 창의 소리만 녹음")
+                                                       : tr(L"창 소리 녹음 불가 (Windows 10 2004 이상)");
+    if (settings_.mic) s = s.empty() ? tr(L"마이크만 녹음") : s + tr(L" + 마이크");
+    return s.empty() ? tr(L"소리 끔") : s;
 }
 
 std::wstring App::MicDeviceName() const {
     for (const auto& d : micDevices_)
         if (settings_.micDevice.empty() ? d.isDefault : d.id == settings_.micDevice)
-            return settings_.micDevice.empty() ? L"기본 장치 · " + d.name : d.name;
-    return settings_.micDevice.empty() ? L"기본 장치" : L"연결되지 않은 장치";
+            return settings_.micDevice.empty() ? tr(L"기본 장치 · ") + d.name : d.name;
+    return settings_.micDevice.empty() ? tr(L"기본 장치") : tr(L"연결되지 않은 장치");
 }
 
 // The input devices as a native menu under `anchor` (DIPs): Windows' default, then each by name.
@@ -1605,7 +1646,7 @@ bool App::MicMenu(const Rect& anchor) {
         return s;
     };
     HMENU menu = CreatePopupMenu();
-    std::wstring def = L"Windows 기본 장치";
+    std::wstring def = tr(L"Windows 기본 장치");
     for (const auto& d : micDevices_)
         if (d.isDefault) def += L" (" + d.name + L")";
     AppendMenuW(menu, MF_STRING | (settings_.micDevice.empty() ? MF_CHECKED : 0), 1, escape(def).c_str());
@@ -1613,7 +1654,7 @@ bool App::MicMenu(const Rect& anchor) {
     for (size_t i = 0; i < micDevices_.size(); ++i)
         AppendMenuW(menu, MF_STRING | (micDevices_[i].id == settings_.micDevice ? MF_CHECKED : 0), 100 + (UINT)i,
                     escape(micDevices_[i].name).c_str());
-    if (micDevices_.empty()) AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, L"연결된 마이크가 없습니다");
+    if (micDevices_.empty()) AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, tr(L"연결된 마이크가 없습니다"));
     POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
     ClientToScreen(hwnd_, &pt);
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
@@ -1624,6 +1665,34 @@ bool App::MicMenu(const Rect& anchor) {
     if (cmd >= 100 && cmd - 100 < micDevices_.size()) pick = micDevices_[cmd - 100].id;
     if (pick == settings_.micDevice) return false;
     settings_.micDevice = pick;
+    return true;
+}
+
+// Each language by its own name; "System" says which one Windows gives.
+std::wstring App::LanguageName(int choice) const {
+    switch (choice) {
+        case kLangKorean: return L"한국어";
+        case kLangEnglish: return L"English";
+        default:
+            return util::Format(tr(L"시스템 (%s)"),
+                                LanguageName(SystemLanguage() == Lang::Korean ? kLangKorean : kLangEnglish).c_str());
+    }
+}
+
+// The languages as a native menu under `anchor` (DIPs), like MicMenu.
+bool App::LanguageMenu(const Rect& anchor) {
+    HMENU menu = CreatePopupMenu();
+    for (int i : {kLangSystem, kLangKorean, kLangEnglish}) {
+        AppendMenuW(menu, MF_STRING | (settings_.language == i ? MF_CHECKED : 0), 1 + i, LanguageName(i).c_str());
+        if (i == kLangSystem) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+    POINT pt{(LONG)std::lround(anchor.l * Scale()), (LONG)std::lround((anchor.b + 4) * Scale())};
+    ClientToScreen(hwnd_, &pt);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_,
+                              nullptr);
+    DestroyMenu(menu);
+    if (!cmd || (int)cmd - 1 == settings_.language) return false;
+    settings_.language = (int)cmd - 1;
     return true;
 }
 
@@ -1676,25 +1745,25 @@ void App::OpenMediaFile(const std::wstring& path) {
     ShowMain(true);
     filesOpen_ = false;
     if (rec_ != RecState::Idle) {
-        Toast(L"녹화 중에는 파일을 열 수 없습니다.", true);
+        Toast(tr(L"녹화 중에는 파일을 열 수 없습니다."), true);
         return;
     }
     if (exporter_.Busy()) {
-        Toast(L"내보내기가 끝난 뒤에 열 수 있습니다.", true);
+        Toast(tr(L"내보내기가 끝난 뒤에 열 수 있습니다."), true);
         return;
     }
     DWORD attr = GetFileAttributesW(path.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        Toast(L"파일을 찾을 수 없습니다: " + util::FileNameOf(path), true);
+        Toast(tr(L"파일을 찾을 수 없습니다: ") + util::FileNameOf(path), true);
         return;
     }
     if (util::IsAnimPath(path)) {
-        Toast(L"움짤은 아직 열 수 없습니다. 동영상을 열어 주세요.", true);
+        Toast(tr(L"움짤은 아직 열 수 없습니다. 동영상을 열어 주세요."), true);
         return;
     }
     if (OpenVideo(path)) {
         AddRecent(path);
-        Toast(L"편집 탭에서 열었습니다: " + util::FileNameOf(path));
+        Toast(tr(L"편집 탭에서 열었습니다: ") + util::FileNameOf(path));
     }
 }
 
@@ -1732,7 +1801,7 @@ void App::HoldRecording(std::shared_ptr<Clip> clip) {
     // Bounded: each one keeps a temporary file of compressed frames.
     if (held_.size() > kMaxHeld) {
         held_.resize(kMaxHeld);
-        Toast(util::Format(L"저장하지 않은 녹화가 %zu개를 넘어 가장 오래된 것을 지웠습니다.", kMaxHeld), true);
+        Toast(util::Format(tr(L"저장하지 않은 녹화가 %zu개를 넘어 가장 오래된 것을 지웠습니다."), kMaxHeld), true);
     }
 }
 
@@ -1740,7 +1809,7 @@ size_t App::RecoverRecordings() {
     auto found = FrameStore::Recover();  // newest first
     double now = util::NowSeconds();
     for (auto it = found.rbegin(); it != found.rend(); ++it)
-        held_.insert(held_.begin(), {it->clip, now - it->age, L"복구한 녹화"});
+        held_.insert(held_.begin(), {it->clip, now - it->age, tr(L"복구한 녹화")});
     if (held_.size() > kMaxHeld) held_.resize(kMaxHeld);  // the oldest go, with their files
     return found.size();
 }
@@ -1763,14 +1832,14 @@ void App::OpenHeld(size_t i) {
 void App::ConfirmDropHeld(size_t i) {
     if (i >= held_.size()) return;
     const HeldClip& h = held_[i];
-    Ask({L"이 녹화를 버릴까요?",
-         h.name + L" · " + util::FormatClock(h.clip->Seconds(), true) + L"\n버리면 되돌릴 수 없습니다.", L"버리기", true,
+    Ask({tr(L"이 녹화를 버릴까요?"),
+         h.name + L" · " + util::FormatClock(h.clip->Seconds(), true) + tr(L"\n버리면 되돌릴 수 없습니다."), tr(L"버리기"), true,
          [this, clip = std::weak_ptr<Clip>(h.clip)] {
              auto c = clip.lock();
              if (!c) return;
              if (c == clip_) CloseClip();
              DropHeld(c.get());
-             Toast(L"녹화를 버렸습니다.");
+             Toast(tr(L"녹화를 버렸습니다."));
              Invalidate();
          }});
 }
@@ -1780,10 +1849,10 @@ void App::AskQuit(bool restart, std::function<void()> then) {
         then();
         return;
     }
-    Ask({util::Format(L"저장하지 않은 녹화가 %zu개 있습니다", held_.size()),
-         restart ? L"다시 시작하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요."
-                 : L"종료하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요.",
-         restart ? L"다시 시작해서 업데이트" : L"종료", true, std::move(then)});
+    Ask({util::Format(tr(L"저장하지 않은 녹화가 %zu개 있습니다"), held_.size()),
+         restart ? tr(L"다시 시작하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요.")
+                 : tr(L"종료하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요."),
+         restart ? tr(L"다시 시작해서 업데이트") : tr(L"종료"), true, std::move(then)});
 }
 
 void App::Ask(Question q) {
@@ -1810,7 +1879,7 @@ bool App::UpdateReady() const { return updater_.Get().state == Updater::State::R
 void App::InstallUpdate() {
     updateOpen_ = false;
     if (rec_ != RecState::Idle || exporter_.Busy()) {
-        Toast(L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다.", true);
+        Toast(tr(L"녹화 · 내보내기가 끝나면 업데이트할 수 있습니다."), true);
         return;
     }
     AskQuit(true, [this] {
@@ -1821,7 +1890,7 @@ void App::InstallUpdate() {
 void App::RestartIntoUpdate() {
     std::wstring err;
     if (!updater_.Install(err)) {
-        Toast(err, true);
+        Alert(err);
         return;
     }
     // The new exe waits until this process has ended, then starts as this one did (main.cpp).
@@ -1831,7 +1900,7 @@ void App::RestartIntoUpdate() {
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        Toast(L"새 버전을 시작하지 못했습니다. OzMaker를 다시 켜면 새 버전으로 시작합니다.", true);
+        Alert(tr(L"새 버전을 시작하지 못했습니다. OzMaker를 다시 켜면 새 버전으로 시작합니다."));
         return;
     }
     AllowSetForegroundWindow(pi.dwProcessId);
@@ -1894,13 +1963,13 @@ void App::CloseClip() {
 }
 
 const wchar_t* App::Activity() const {
-    if (rec_ == RecState::Recording) return recVideo_ ? L"녹화 중 · 동영상" : L"녹화 중 · 움짤";
-    if (rec_ == RecState::Countdown) return L"녹화 카운트다운";
-    if (exporter_.Busy()) return L"내보내기 중";
+    if (rec_ == RecState::Recording) return recVideo_ ? tr(L"녹화 중 · 동영상") : tr(L"녹화 중 · 움짤");
+    if (rec_ == RecState::Countdown) return tr(L"녹화 카운트다운");
+    if (exporter_.Busy()) return tr(L"내보내기 중");
     switch (screen_) {
-        case Screen::Editor: return clip_ ? L"편집 탭" : L"편집 탭 · 연 파일 없음";
-        case Screen::Settings: return L"설정";
-        default: return L"녹화 탭";
+        case Screen::Editor: return clip_ ? tr(L"편집 탭") : tr(L"편집 탭 · 연 파일 없음");
+        case Screen::Settings: return tr(L"설정");
+        default: return tr(L"녹화 탭");
     }
 }
 
@@ -1920,14 +1989,14 @@ void App::ConfirmDiscard() {
         if (clip.lock() == clip_) DiscardRecording();
     };
     if (!clip_->SourcePath().empty())
-        Ask({L"이 동영상을 휴지통으로 옮길까요?",
-             util::FileNameOf(clip_->SourcePath()) + L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.", L"휴지통으로",
+        Ask({tr(L"이 동영상을 휴지통으로 옮길까요?"),
+             util::FileNameOf(clip_->SourcePath()) + tr(L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."), tr(L"휴지통으로"),
              true, discard});
     else
-        Ask({L"이 녹화를 버릴까요?",
+        Ask({tr(L"이 녹화를 버릴까요?"),
              ClipTitle() + L" · " + util::FormatClock(clip_->Seconds(), true) +
-                 (held ? L"\n버리면 되돌릴 수 없습니다." : L"\n저장한 파일은 그대로 남습니다."),
-             L"버리기", true, discard});
+                 (held ? tr(L"\n버리면 되돌릴 수 없습니다.") : tr(L"\n저장한 파일은 그대로 남습니다.")),
+             tr(L"버리기"), true, discard});
 }
 
 void App::DiscardRecording() {
@@ -1941,7 +2010,7 @@ void App::DiscardRecording() {
         bool gone = testDeleteFiles_ ? DeleteFileW(path.c_str()) != 0 : util::MoveToRecycleBin(hwnd_, path);
         if (!gone) {
             AttachReaders();
-            Toast(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.", true);
+            Toast(tr(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요."), true);
             Invalidate();
             return;
         }
@@ -1954,7 +2023,7 @@ void App::DiscardRecording() {
     frameBmp_.Reset();
     hasResult_ = resultOriginal_ = false;
     RefreshRecent();
-    Toast(path.empty() ? L"녹화를 버렸습니다." : L"휴지통으로 옮겼습니다 · " + util::FileNameOf(path));
+    Toast(path.empty() ? tr(L"녹화를 버렸습니다.") : tr(L"휴지통으로 옮겼습니다 · ") + util::FileNameOf(path));
     Invalidate();
 }
 
@@ -2084,7 +2153,7 @@ void App::ResetRange() {
     inF_ = 0;
     outF_ = clip_->Count() - 1;
     hasResult_ = false;
-    Toast(L"구간을 처음으로 되돌렸습니다");
+    Toast(tr(L"구간을 처음으로 되돌렸습니다"));
 }
 
 void App::RestartClock() {
@@ -2215,12 +2284,12 @@ bool App::ExportAudio() const {
 
 const wchar_t* App::CopyBlocker() const {
     if (!clip_ || !cutSource_ || fmt_ != (int)Format::Mp4) return nullptr;
-    if (settings_.targetIdx) return L"용량에 맞추려고";
-    if (settings_.scaleIdx != 0 || settings_.outFpsIdx != 0) return L"크기나 프레임 레이트를 바꿔서";
+    if (settings_.targetIdx) return tr(L"용량에 맞추려고");
+    if (settings_.scaleIdx != 0 || settings_.outFpsIdx != 0) return tr(L"크기나 프레임 레이트를 바꿔서");
     if (crop_.left != 0 || crop_.top != 0 || crop_.right != clip_->Width() || crop_.bottom != clip_->Height())
-        return L"화면을 잘라서";
-    if (kSpeedOptions[settings_.speedIdx] != 1.0) return L"재생 속도를 바꿔서";
-    if (!caption_.empty()) return L"자막을 넣어서";
+        return tr(L"화면을 잘라서");
+    if (kSpeedOptions[settings_.speedIdx] != 1.0) return tr(L"재생 속도를 바꿔서");
+    if (!caption_.empty()) return tr(L"자막을 넣어서");
     return L"";
 }
 
@@ -2236,20 +2305,53 @@ VideoConfig App::VideoSettings(int fps) const {
     return v;
 }
 
-// Exports of a video are named after it ("<name>_trim.mp4", "<name>.gif"); a fresh clip gets a timestamp.
-std::wstring App::FileStem(const std::wstring& what) const {
-    std::wstring s = settings_.nameTemplate, ts = util::TimestampName();
+// In one pass, so a window title that looks like a token stays as it is.
+std::wstring App::FillName(std::wstring_view pattern, const std::wstring& what, const SYSTEMTIME& t, int number) {
     std::wstring name = util::SafeFileName(what.empty() ? L"OzMaker" : what, 60);
     if (name.empty()) name = L"OzMaker";
-    auto fill = [&](std::wstring_view key, const std::wstring& v) {
-        for (size_t p; (p = s.find(key)) != std::wstring::npos;) s.replace(p, key.size(), v);
-    };
-    fill(L"{날짜}", ts);
-    fill(L"{date}", ts);
-    fill(L"{창 이름}", name);
-    fill(L"{window}", name);
+    const std::wstring date =
+        util::Format(L"%04d%02d%02d_%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    const std::wstring values[kTokCount] = {date,
+                                            util::Format(L"%04d", t.wYear),
+                                            util::Format(L"%02d", t.wMonth),
+                                            util::Format(L"%02d", t.wDay),
+                                            util::Format(L"%02d", t.wHour),
+                                            util::Format(L"%02d", t.wMinute),
+                                            util::Format(L"%02d", t.wSecond),
+                                            name,
+                                            util::Format(L"%03d", number)};
+    std::wstring s;
+    for (size_t i = 0, len = 0; i < pattern.size();) {
+        if (int k = NameTokenAt(pattern, i, len); k >= 0) {
+            s += values[k];
+            i += len;
+        } else {
+            s += pattern[i++];
+        }
+    }
     s = util::SafeFileName(s, 120);
-    return s.empty() ? L"OzMaker_" + ts : s;
+    return s.empty() ? L"OzMaker_" + date : s;
+}
+
+// Exports of a video are named after it ("<name>_trim.mp4", "<name>.gif"); a fresh clip gets the pattern of the
+// settings. Its {번호} is the first one no file in the save folder has yet, whatever the extension.
+std::wstring App::FileStem(const std::wstring& what, bool findNumber) const {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    const std::wstring& p = settings_.nameTemplate;
+    std::wstring s = FillName(p, what, t, 1);
+    if (!findNumber || (p.find(kNameTokens[kTokNumber][0]) == std::wstring::npos &&
+                        p.find(kNameTokens[kTokNumber][1]) == std::wstring::npos))
+        return s;
+    auto taken = [&](const std::wstring& stem) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((settings_.outDir + L"\\" + stem + L".*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        FindClose(h);
+        return true;
+    };
+    for (int n = 2; n < 100000 && taken(s); ++n) s = FillName(p, what, t, n);
+    return s;
 }
 
 std::wstring App::ExportName(Format f) const {
@@ -2270,7 +2372,7 @@ void App::StartExport(bool saveAs) {
     if (!clip_ || exporter_.Busy()) return;
     Format f = (Format)fmt_;
     if (!FormatAvailable(f)) {
-        Toast(std::wstring(FormatName(f)) + L" 인코더가 이 빌드에 포함되어 있지 않습니다.", true);
+        Toast(std::wstring(FormatName(f)) + tr(L" 인코더가 이 빌드에 포함되어 있지 않습니다."), true);
         return;
     }
     std::wstring name = ExportName(f);
@@ -2279,13 +2381,13 @@ void App::StartExport(bool saveAs) {
         if (!util::PickSavePath(hwnd_, settings_.outDir, name, FormatExt(f), FormatName(f), path)) return;
     } else {
         if (!util::EnsureDir(settings_.outDir)) {
-            Toast(L"저장 폴더를 만들 수 없습니다: " + settings_.outDir, true);
+            Toast(tr(L"저장 폴더를 만들 수 없습니다: ") + settings_.outDir, true);
             return;
         }
         path = settings_.outDir + L"\\" + name;
     }
     if (_wcsicmp(path.c_str(), clip_->SourcePath().c_str()) == 0) {
-        Toast(L"편집 중인 원본 파일에는 덮어쓸 수 없습니다. 다른 이름을 고르세요.", true);
+        Toast(tr(L"편집 중인 원본 파일에는 덮어쓸 수 없습니다. 다른 이름을 고르세요."), true);
         return;
     }
     ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, f == Format::Mp4 ? 0 : settings_.quality[fmt_]);
@@ -2301,9 +2403,9 @@ void App::StartExport(bool saveAs) {
 void App::OnExportDone() {
     ExportResult r = exporter_.Take();
     if (r.cancelled) {
-        Toast(L"내보내기를 취소했습니다.");
+        Toast(tr(L"내보내기를 취소했습니다."));
     } else if (!r.ok) {
-        Toast(r.error.empty() ? L"내보내기에 실패했습니다." : r.error, true);
+        Alert(r.error.empty() ? tr(L"내보내기에 실패했습니다.") : r.error);
     } else {
         lastResult_ = r;
         hasResult_ = true;
@@ -2316,7 +2418,7 @@ void App::OnExportDone() {
             // The guess was low for this clip: learn by how much and fit again, smaller.
             if (exportEstimate_) fitCorrection_ = std::clamp(fitCorrection_ * r.bytes / (double)exportEstimate_, 1.0, 4.0);
             fitContent_.clear();
-            Toast(util::Format(L"목표 %dMB보다 커졌습니다(%s). 더 작게 다시 맞췄으니 한 번 더 저장하세요.",
+            Toast(util::Format(tr(L"목표 %dMB보다 커졌습니다(%s). 더 작게 다시 맞췄으니 한 번 더 저장하세요."),
                                kTargetMB[settings_.targetIdx], util::FormatBytes(r.bytes).c_str()),
                   true);
         }
@@ -2586,7 +2688,7 @@ void App::SetCapturingHotkey(int which) {
 }
 
 std::wstring App::HotkeyLabel() const {
-    return hotkeyOk_ ? util::HotkeyToString(settings_.hkMods, settings_.hkVk) : L"단축키 없음";
+    return hotkeyOk_ ? util::HotkeyToString(settings_.hkMods, settings_.hkVk) : tr(L"단축키 없음");
 }
 
 void App::TrayAdd() {
@@ -2603,17 +2705,52 @@ void App::TrayAdd() {
     TrayUpdate();
 }
 
+void App::ApplyTheme() {
+    HIGHCONTRASTW hc{sizeof(hc)};
+    const bool contrast =
+        contrastForTest_ || (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+                             (hc.dwFlags & HCF_HIGHCONTRASTON));
+    const bool light =
+        settings_.theme == kThemeLight || (settings_.theme == kThemeSystem && util::AppsUseLightTheme());
+    theme::P = contrastForTest_ ? theme::HighContrastBlack()
+               : contrast       ? theme::HighContrast()
+               : light          ? theme::Light()
+                                : theme::Dark();
+    BOOL motion = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &motion, 0);
+    ui_.SetMotion(motion != FALSE);
+    overlay_.SetMotion(motion != FALSE);
+    if (!hwnd_) return;
+    BOOL dark = !theme::P.light;
+    if (FAILED(DwmSetWindowAttribute(hwnd_, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(hwnd_, 19, &dark, sizeof(dark));
+    // Windows 11 draws the title bar in the page's color; in a contrast theme, in its own.
+    const D2D1_COLOR_F bg = theme::P.Bg;
+    COLORREF caption = contrast ? 0xFFFFFFFF /*DWMWA_COLOR_DEFAULT*/
+                                : RGB(std::lround(bg.r * 255), std::lround(bg.g * 255), std::lround(bg.b * 255));
+    DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR*/, &caption, sizeof(caption));
+    Invalidate();
+}
+
+void App::ApplyLanguage() {
+    SetLanguage(settings_.language == kLangKorean    ? Lang::Korean
+                : settings_.language == kLangEnglish ? Lang::English
+                                                     : SystemLanguage());
+    TrayUpdate();
+    Invalidate();
+}
+
 void App::TrayUpdate() {
     if (!nid_.hWnd) return;
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid_.hIcon = rec_ == RecState::Recording ? iconRec_ : iconAppSmall_;
     std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
-    std::wstring tip = rec_ == RecState::Recording && recPaused_ ? L"OzMaker · 일시정지 (" +
-                                                                         util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk) + L" 이어서)"
-                       : rec_ == RecState::Recording ? L"OzMaker · 녹화 중" + (hotkeyOk_ ? L" (" + hk + L" 중지)" : L"")
-                       : hotkeyOk_                  ? L"OzMaker · " + hk + L" 녹화"
-                                                    : L"OzMaker · 녹화 단축키를 쓸 수 없음";
-    if (rec_ != RecState::Recording && UpdateReady()) tip += L"\n업데이트 준비 완료";
+    std::wstring tip = rec_ == RecState::Recording && recPaused_ ? tr(L"OzMaker · 일시정지 (") +
+                                                                         util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk) + tr(L" 이어서)")
+                       : rec_ == RecState::Recording ? tr(L"OzMaker · 녹화 중") + (hotkeyOk_ ? L" (" + hk + tr(L" 중지)") : L"")
+                       : hotkeyOk_                  ? L"OzMaker · " + hk + tr(L" 녹화")
+                                                    : tr(L"OzMaker · 녹화 단축키를 쓸 수 없음");
+    if (rec_ != RecState::Recording && UpdateReady()) tip += tr(L"\n업데이트 준비 완료");
     wcsncpy_s(nid_.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
@@ -2637,26 +2774,26 @@ void App::TrayBalloon(const std::wstring& title, const std::wstring& text) {
 void App::TrayMenu() {
     HMENU menu = CreatePopupMenu();
     std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
-    AppendMenuW(menu, MF_STRING, 1, L"OzMaker 열기");
+    AppendMenuW(menu, MF_STRING, 1, tr(L"OzMaker 열기"));
     RecTarget current;
     bool canRecord = CurrentTarget(current, nullptr);
-    const wchar_t* what = settings_.source == kSourceDisplay  ? L"선택한 화면 녹화\t"
-                          : settings_.source == kSourceRegion ? L"지정한 영역 녹화\t"
-                                                              : L"선택한 창 녹화\t";
+    const wchar_t* what = settings_.source == kSourceDisplay  ? tr(L"선택한 화면 녹화\t")
+                          : settings_.source == kSourceRegion ? tr(L"지정한 영역 녹화\t")
+                                                              : tr(L"선택한 창 녹화\t");
     if (rec_ == RecState::Idle)
         AppendMenuW(menu, MF_STRING | (canRecord ? 0 : MF_GRAYED), 2, (what + hk).c_str());
     else
-        AppendMenuW(menu, MF_STRING, 2, (L"녹화 중지\t" + hk).c_str());
+        AppendMenuW(menu, MF_STRING, 2, (tr(L"녹화 중지\t") + hk).c_str());
     if (rec_ == RecState::Recording)
         AppendMenuW(menu, MF_STRING, 5,
-                    ((recPaused_ ? L"이어서 녹화\t" : L"일시정지\t") +
+                    ((recPaused_ ? tr(L"이어서 녹화\t") : tr(L"일시정지\t")) +
                      util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk))
                         .c_str());
     if (UpdateReady())
         AppendMenuW(menu, MF_STRING | (rec_ == RecState::Idle ? 0 : MF_GRAYED), 4,
-                    (L"새 버전 " + updater_.Get().version + L"으로 업데이트").c_str());
+                    util::Format(tr(L"새 버전 %s으로 업데이트"), updater_.Get().version.c_str()).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 3, L"종료");
+    AppendMenuW(menu, MF_STRING, 3, tr(L"종료"));
     SetMenuDefaultItem(menu, 1, FALSE);
     POINT pt;
     GetCursorPos(&pt);

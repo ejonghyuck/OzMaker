@@ -224,7 +224,7 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
     if (empty) *empty = false;
     File f(path);
     if (!f.Ok()) {
-        err = util::Format(L"파일을 열 수 없습니다. (%lu)", GetLastError());
+        err = util::Format(tr(L"파일을 열 수 없습니다. (%lu)"), GetLastError());
         return false;
     }
     // Top-level boxes. A crash can cut the last one short: a cut mdat keeps what reached the disk, anything else goes.
@@ -235,7 +235,7 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
         uint8_t h[16];
         size_t n = (size_t)std::min<uint64_t>(16, end - p);
         if (!f.Read(p, h, n)) {
-            err = L"파일을 읽을 수 없습니다.";
+            err = tr(L"파일을 읽을 수 없습니다.");
             return false;
         }
         uint32_t type = Be32(h + 4), hdr = 8;
@@ -286,13 +286,13 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
     };
     if (plain) {
         if (!renameFragments()) {
-            err = L"파일에 쓸 수 없습니다.";
+            err = tr(L"파일에 쓸 수 없습니다.");
             return false;
         }
         return true;
     }
     if (!src) {
-        err = L"MP4 구조를 읽을 수 없습니다.";
+        err = tr(L"MP4 구조를 읽을 수 없습니다.");
         return false;
     }
 
@@ -300,7 +300,7 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
     std::vector<Track> tracks;
     const Box* mvhd = Find(kids, kMvhd);
     if (!mvhd || mvhd->BodySize() < 24 || !ReadTracks(moov, kids, tracks)) {
-        err = L"MP4 구조를 읽을 수 없습니다.";
+        err = tr(L"MP4 구조를 읽을 수 없습니다.");
         return false;
     }
     // What a crash cut off: the mdat ends where the file does, and a partial box after the last whole one goes.
@@ -313,16 +313,16 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
         else
             Set32(s, (uint32_t)last.size);
         if (last.hdr == 8 && last.size > UINT32_MAX) {
-            err = L"MP4 구조를 읽을 수 없습니다.";
+            err = tr(L"MP4 구조를 읽을 수 없습니다.");
             return false;
         }
         if (!f.Write(last.pos + (last.hdr == 16 ? 8 : 0), s, last.hdr == 16 ? 8 : 4)) {
-            err = L"파일에 쓸 수 없습니다.";
+            err = tr(L"파일에 쓸 수 없습니다.");
             return false;
         }
     }
     if (p < end && !f.Truncate(p)) {
-        err = L"파일에 쓸 수 없습니다.";
+        err = tr(L"파일에 쓸 수 없습니다.");
         return false;
     }
     end = p;
@@ -336,7 +336,7 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
     for (const Track& t : tracks) samples += t.dur.size();
     if (samples == 0) {
         if (empty) *empty = true;
-        err = L"저장된 화면이 없습니다.";
+        err = tr(L"저장된 화면이 없습니다.");
         return false;
     }
 
@@ -364,13 +364,13 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
         }
     });
     if (!ok) {
-        err = L"MP4 구조를 읽을 수 없습니다.";
+        err = tr(L"MP4 구조를 읽을 수 없습니다.");
         return false;
     }
     // The new moov first. Until the old one is renamed the file plays as it did, and if that is never done, the next
     // call finds both and only renames.
     if (!f.Write(end, o.data(), o.size()) || !renameFragments()) {
-        err = L"파일에 쓸 수 없습니다.";
+        err = tr(L"파일에 쓸 수 없습니다.");
         return false;
     }
     return true;

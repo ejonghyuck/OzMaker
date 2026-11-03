@@ -60,7 +60,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;imm32.lib;winhttp.lib;bcrypt.lib;dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;imm32.lib;winhttp.lib;bcrypt.lib;dbghelp.lib;uiautomationcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <FxCompile>
       <ShaderModel>5.0</ShaderModel>
@@ -97,6 +97,7 @@
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\Access.cpp" />
     <ClCompile Include="src\App.cpp" />
     <ClCompile Include="src\AudioCapture.cpp" />
     <ClCompile Include="src\AudioPreview.cpp" />
@@ -112,11 +113,13 @@
     <ClCompile Include="src\Mp4Cut.cpp" />
     <ClCompile Include="src\Mp4Unfragment.cpp" />
     <ClCompile Include="src\Gfx.cpp" />
+    <ClCompile Include="src\Lang.cpp" />
     <ClCompile Include="src\Overlays.cpp" />
     <ClCompile Include="src\Resize.cpp" />
     <ClCompile Include="src\SelfTest.cpp" />
     <ClCompile Include="src\Settings.cpp" />
     <ClCompile Include="src\Sound.cpp" />
+    <ClCompile Include="src\Theme.cpp" />
     <ClCompile Include="src\Ui.cpp" />
     <ClCompile Include="src\Updater.cpp" />
     <ClCompile Include="src\Util.cpp" />
@@ -128,6 +131,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\Access.h" />
     <ClInclude Include="src\App.h" />
     <ClInclude Include="src\AudioCapture.h" />
     <ClInclude Include="src\AudioPreview.h" />
@@ -147,6 +151,7 @@
     <ClInclude Include="src\Resize.h" />
     <ClInclude Include="src\Settings.h" />
     <ClInclude Include="src\Sound.h" />
+    <ClInclude Include="src\Lang.h" />
     <ClInclude Include="src\Theme.h" />
     <ClInclude Include="src\Ui.h" />
     <ClInclude Include="src\Updater.h" />

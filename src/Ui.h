@@ -121,6 +121,26 @@ constexpr UiId HashId(const char* s, uint32_t n = 0) {
 
 enum class BtnStyle { Primary, Secondary, Ghost, Danger };
 
+// What a screen reader is told about a control (UI Automation), and how the keyboard reaches it. Every clickable drawn
+// in a frame is a node; a Segmented row is a group node with one choice node per cell.
+enum class Role : uint8_t { Button, Toggle, Choice, Group, Tab, Slider, Edit, Item };
+struct UiNode {
+    UiId id = 0;
+    Rect r;  // DIPs, cut to the scroll view it is drawn in
+    Rect full, view;  // as laid out, and the scroll view it is in (empty: none)
+    Role role = Role::Button;
+    std::wstring name;
+    std::wstring keys;  // its shortcut, e.g. "Ctrl+Alt+R"
+    bool enabled = true;
+    bool on = false;  // a toggle that is on, the chosen cell or tab, the open item
+    float value = 0, lo = 0, hi = 1;  // a slider
+    bool settable = false;  // a Ui::Slider: the arrow keys and a reader set it (the editor's timeline only shows)
+    std::wstring text;  // a text field's text
+    int pos = 0, count = 0;  // a choice: its place in the row
+    UiId group = 0;  // the row a choice is in
+    bool blocked = false;  // drawn under a popover or a question, which take all input
+};
+
 // Immediate-mode widgets. Rendering happens only when input arrives or an animation is running.
 class Ui : public Painter {
 public:
@@ -128,6 +148,9 @@ public:
     void End();
 
     bool Animating() const { return animating_; }
+    // Windows' "Show animations" (SPI_GETCLIENTAREAANIMATION): off, every Anim is at its target at once.
+    void SetMotion(bool on) { motion_ = on; }
+    bool Motion() const { return motion_; }
     double WakeAt() const { return wakeAt_; }  // absolute time a redraw is wanted, 0 = none
     void RequestWake(double t) { if (wakeAt_ == 0 || t < wakeAt_) wakeAt_ = t; }
     void RequestRedraw() { animating_ = true; }
@@ -172,11 +195,34 @@ public:
     // it takes every key, and the IME's text being composed shows underlined at the caret. True when text changed.
     bool TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view placeholder, size_t maxLen);
     void Focus(UiId id);  // the field takes the focus, caret at the end, when it is drawn next
+    // Puts `s` where field `id` had its caret, over its selection (at the end if it never had the focus), and gives the
+    // field the focus back: for a button beside it, whose press took the focus away. False when it doesn't fit.
+    bool InsertText(UiId id, std::wstring& text, std::wstring_view s, size_t maxLen);
     bool TextFocused() const { return focus_ != 0; }
     const Rect& CaretRect() const { return caretRect_; }  // for the IME's windows
     // True once after a field let go of the focus with IME text in it: that text went into the field, so the IME
     // should drop it.
     bool TakeImeReset() { return std::exchange(imeReset_, false); }
+
+    // Accessibility. The widgets name their nodes; a control drawn with Click alone is named with Describe after it, or
+    // with Declare before it (which also puts it in a list when it is scrolled out and not drawn). Name gives its text
+    // to the next node drawn without one (a toggle or slider in a settings row) or to the next Segmented row.
+    void Name(std::wstring_view name) { nextName_ = name; }
+    UiNode* Describe(UiId id, std::wstring_view name, Role role = Role::Button);
+    UiNode& Declare(UiId id, const Rect& r, Role role, std::wstring_view name, bool enabled = true);
+    const std::vector<UiNode>& Nodes() const { return shown_; }  // the last frame's, in drawing order
+    const UiNode* Shown(UiId id) const;
+    // Keyboard focus. Tab and Shift+Tab move it through the nodes in drawing order (into a Segmented row at its chosen
+    // cell); once the keyboard moved it, Space and Enter press the focused control and the arrow keys move along a row
+    // or a slider. The ring around it shows only then; a click puts the focus where it was, without the ring.
+    UiId KeyboardFocus() const { return kbd_; }
+    bool FocusRing() const { return ring_; }
+    void SetKeyboardFocus(UiId id, bool ring = true);
+    void Press(UiId id) { press_ = id; }  // as if clicked, in the next frame (a screen reader's Invoke)
+    void SetSliderValue(UiId id, float v) { setId_ = id, setValue_ = v; }
+    bool TakeFocusMoved() { return std::exchange(focusMoved_, false); }  // for the screen reader's focus event
+    // A scroll view, before it draws: once the keyboard moved the focus to something in it, scrolls so it shows.
+    void KeepInView(const Rect& view, float& scroll);
 
     // Layers. The page is drawn first; anything drawn over it (popovers, toasts, tooltips) goes between BeginFloat
     // and EndFloat, and the bounds of what each float draws are kept for the frame. A native layer is something DWM
@@ -207,6 +253,7 @@ private:
     UiId active_ = 0;
     bool pressTaken_ = false;
     bool animating_ = false;
+    bool motion_ = true;
     bool blocked_ = false;
     double wakeAt_ = 0;
     LPCWSTR cursor_ = IDC_ARROW;
@@ -224,10 +271,21 @@ private:
     UiId focus_ = 0;
     bool focusDrawn_ = false;  // this frame
     size_t caret_ = 0, anchor_ = 0;  // the selection runs between them
+    UiId caretOf_ = 0;               // the field they were last in
     float scrollX_ = 0;
     double caretMoved_ = 0;  // the caret blinks from here
     Rect caretRect_;
     bool imeReset_ = false;
     bool keepRects_ = false;
     std::unordered_map<UiId, Rect> rects_;
+    // Accessibility: this frame's nodes, the last frame's, and the keyboard focus.
+    UiNode& Node(UiId id, const Rect& r, Role role, bool enabled, std::wstring_view name = {});
+    void KeyboardInput();
+    std::vector<UiNode> nodes_, shown_;
+    std::unordered_map<UiId, size_t> nodeAt_, shownAt_;
+    std::wstring nextName_;
+    UiId kbd_ = 0, press_ = 0, setId_ = 0;
+    float setValue_ = 0;
+    int step_ = 0;  // arrow keys on the focused slider
+    bool ring_ = false, focusMoved_ = false, blurField_ = false, scrollTo_ = false;
 };

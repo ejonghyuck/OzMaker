@@ -13,6 +13,7 @@
 #include <mmsystem.h>
 #include <commctrl.h>
 #include <imm.h>
+#include <uiautomation.h>
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
@@ -56,3 +57,5 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+
+#include "Lang.h"
