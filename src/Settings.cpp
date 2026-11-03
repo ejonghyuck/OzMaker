@@ -4,12 +4,13 @@
 
 namespace {
 // OZMAKER_SETTINGS points test runs at a scratch file instead of the user's settings.
-std::wstring IniPath() {
+std::wstring TestIniPath() {
     wchar_t buf[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"OZMAKER_SETTINGS", buf, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) return buf;
-    return util::AppDataDir() + L"\\settings.ini";
+    return n > 0 && n < MAX_PATH ? std::wstring(buf, n) : std::wstring();
 }
+
+std::wstring IniPath() { return Settings::FilePath(); }
 
 int ReadInt(const std::wstring& ini, const wchar_t* key, int def, int lo, int hi) {
     int v = (int)GetPrivateProfileIntW(L"OzMaker", key, def, ini.c_str());
@@ -104,6 +105,8 @@ void Settings::Load() {
     outDir = buf;
     GetPrivateProfileStringW(L"OzMaker", L"MicDevice", L"", buf, _countof(buf), ini.c_str());
     micDevice = buf;
+    GetPrivateProfileStringW(L"OzMaker", L"CrashSeen", L"", buf, _countof(buf), ini.c_str());
+    crashSeen = buf;
     recent.clear();
     for (size_t i = 0; i < kMaxRecent; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
@@ -177,10 +180,34 @@ void Settings::Save() const {
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
     put(L"OutDir", outDir);
+    put(L"CrashSeen", crashSeen);
     put(L"MicDevice", micDevice);
     put(L"FileName", nameTemplate);
     for (size_t i = 0; i < recent.size() && i < kMaxRecent; ++i) put(util::Format(L"Recent%zu", i).c_str(), recent[i]);
     WriteIni(IniPath(), s);
+}
+
+std::wstring Settings::PortableFile(const std::wstring& exeDir) {
+    std::wstring p = exeDir + L"\\settings.ini";
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY) ? p : std::wstring();
+}
+
+bool Settings::Portable() {
+    static const bool portable = TestIniPath().empty() && !PortableFile(util::ExeDir()).empty();
+    return portable;
+}
+
+std::wstring Settings::FilePath() {
+    if (std::wstring t = TestIniPath(); !t.empty()) return t;
+    if (Portable()) return PortableFile(util::ExeDir());
+    return util::AppDataDir() + L"\\settings.ini";
+}
+
+std::wstring Settings::Dir() {
+    std::wstring p = FilePath();
+    size_t slash = p.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring(L".") : p.substr(0, slash);
 }
 
 void Settings::AddRecent(const std::wstring& path) {

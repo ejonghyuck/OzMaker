@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 #include "Resize.h"
 #include "Sound.h"
 #include "Util.h"
@@ -85,6 +86,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     regionPicker_.Init(inst, gfx_.D2D());
 
     auto args = SplitArgs(cmdLine);
+    if (args.size() >= 2 && args[0] == L"--crash-test") return RunCrashTest(args);
     if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
@@ -102,8 +104,9 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     const bool updated = args.size() >= 3 && args[0] == L"--updated";
     const bool tray = (!args.empty() && args[0] == L"--tray") || (updated && args[2] == L"0");
     if (updated) Updater::CleanUp(util::ExePath());
-    autostart_ = util::AutostartEnabled();
-    if (autostart_) util::SetAutostart(true);  // keeps pointing at this exe if it was moved
+    // Keeps pointing at this exe if it was moved. A portable copy leaves this PC's startup programs alone.
+    autostart_ = !Settings::Portable() && util::AutostartEnabled();
+    if (autostart_) util::SetAutostart(true);
     if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
     updater_.Init(util::ExePath(), hwnd_, WM_APP_UPDATE);
     SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way
@@ -112,6 +115,46 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
             TrayBalloon(L"OzMaker를 업데이트했습니다", L"버전 " OZ_VERSION_WSTR);
         else
             Toast(L"OzMaker " OZ_VERSION_WSTR L" 버전으로 업데이트했습니다");
+    }
+    // A crash report written since the user was last told, and the recordings it left behind: say so once (#24).
+    bool crashed = false;
+    if (auto reports = crash::List(); !reports.empty() && reports[0].name > settings_.crashSeen) {
+        settings_.crashSeen = reports[0].name;
+        settings_.Save();
+        crashed = true;
+    }
+    crash::Prune(5);
+    size_t clips = RecoverRecordings();
+    std::vector<std::wstring> videos = Mp4Writer::Recover();  // newest first
+    if (crashed || clips || !videos.empty()) {
+        std::wstring title = crashed ? L"지난번에 OzMaker가 비정상 종료되었습니다" : L"지난번 녹화를 되살렸습니다";
+        std::wstring body =
+            clips && !videos.empty() ? util::Format(L"녹화 %zu개와 동영상 %zu개를 되살렸습니다", clips, videos.size())
+            : clips    ? util::Format(L"녹화 %zu개를 되살렸습니다 · 파일 목록의 \"저장하지 않은 녹화\"에 있습니다", clips)
+            : !videos.empty() ? (videos.size() == 1 ? L"녹화하던 동영상을 되살렸습니다 · " + util::FileNameOf(videos[0])
+                                                    : util::Format(L"녹화하던 동영상 %zu개를 되살렸습니다", videos.size()))
+                              : std::wstring(L"설정 › 정보 › 충돌 기록에서 볼 수 있습니다");
+        // A video is already a file in the save folder: it opens like one that was just saved.
+        for (size_t i = videos.size(); i-- > 1;) AddRecent(videos[i]);
+        if (!videos.empty()) {
+            CaptureResult r;
+            r.video = r.ok = true;
+            r.path = videos[0];
+            r.bytes = util::FileSize(r.path);
+            std::wstring err;
+            if (auto v = VideoClip::Open(r.path, err)) {
+                r.seconds = v->Seconds();
+                r.audio = v->HasAudio();
+            }
+            ShowVideo(r);
+        } else if (clips && !tray) {
+            clipName_ = held_[0].name;
+            OpenEditor(held_[0].clip);
+        }
+        if (tray)
+            TrayBalloon(title, body);
+        else
+            Toast(title + L". " + body + L".", crashed);
     }
     if (!Capture::IsSupported())
         Toast(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다.", true);
@@ -194,6 +237,7 @@ bool App::CreateMainWindow(int show) {
 void App::Loop() {
     MSG msg;
     for (;;) {
+        crash::SetState(Activity());
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) return;
             TranslateMessage(&msg);
@@ -1226,18 +1270,12 @@ void App::StopRecording() {
     }
 }
 
-void App::OnVideoSaved(const CaptureResult& r) {
-    if (!r.ok) {
-        if (settings_.sounds) sound::Play(sound::Cue::Stop);
-        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
-        return;
-    }
-    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+// The file is already saved: the result card shows it, and the editor opens on it for trimming, with that file as the
+// current result.
+void App::ShowVideo(const CaptureResult& r) {
     AddRecent(r.path);
     lastVideo_ = r;
-    if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     showVideo_ = true;
-    // The file is already saved; the editor opens on it for trimming, with that file as the current result.
     std::wstring err;
     if (auto video = VideoClip::Open(r.path, err)) {
         OpenEditor(video);
@@ -1252,6 +1290,17 @@ void App::OnVideoSaved(const CaptureResult& r) {
         if (screen_ == Screen::Settings) screen_ = Screen::Home;
         if (screen_ == Screen::Editor) CloseEditor();
     }
+}
+
+void App::OnVideoSaved(const CaptureResult& r) {
+    if (!r.ok) {
+        if (settings_.sounds) sound::Play(sound::Cue::Stop);
+        ReportError(L"동영상 저장 실패", r.error.empty() ? L"동영상을 저장하지 못했습니다." : r.error);
+        return;
+    }
+    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    ShowVideo(r);
+    if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
     std::wstring reason = std::exchange(stopReason_, {});
     if (NotifyQuietly())
@@ -1278,9 +1327,7 @@ void App::TogglePause() {
 
 std::wstring App::RecordingDir() const {
     if (recVideo_) return settings_.outDir;
-    wchar_t tmp[MAX_PATH + 1] = {};
-    GetTempPathW(_countof(tmp), tmp);  // where FrameStore keeps the clip
-    return tmp;
+    return FrameStore::Dir();
 }
 
 void App::CheckLimits() {
@@ -1518,6 +1565,15 @@ void App::HoldRecording(std::shared_ptr<Clip> clip) {
     }
 }
 
+size_t App::RecoverRecordings() {
+    auto found = FrameStore::Recover();  // newest first
+    double now = util::NowSeconds();
+    for (auto it = found.rbegin(); it != found.rend(); ++it)
+        held_.insert(held_.begin(), {it->clip, now - it->age, L"복구한 녹화"});
+    if (held_.size() > kMaxHeld) held_.resize(kMaxHeld);  // the oldest go, with their files
+    return found.size();
+}
+
 void App::DropHeld(const Clip* clip) {
     std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
 }
@@ -1616,6 +1672,17 @@ void App::CloseEditor() {
     SyncAudioPreview();
     DetachReaders();
     RefreshWindows();
+}
+
+const wchar_t* App::Activity() const {
+    if (rec_ == RecState::Recording) return recVideo_ ? L"녹화 중 · 동영상" : L"녹화 중 · 움짤";
+    if (rec_ == RecState::Countdown) return L"녹화 카운트다운";
+    if (exporter_.Busy()) return L"내보내기 중";
+    switch (screen_) {
+        case Screen::Editor: return L"편집 화면";
+        case Screen::Settings: return L"설정";
+        default: return L"홈";
+    }
 }
 
 // The editor's 버리기 (a 움짤 recording) and 삭제 (the video just recorded, into the Recycle Bin). Only what this run

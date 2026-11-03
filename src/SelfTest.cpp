@@ -15,6 +15,8 @@
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
+#include "Mp4Unfragment.h"
 #include "Resize.h"
 #include "Util.h"
 #include "Version.h"
@@ -22,8 +24,53 @@
 
 namespace {
 
-// Further down, with the other test-tone helpers.
+// Further down, with the other test helpers.
 double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, double f, int rate);
+bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
+                  bool fragmented = false, bool crash = false);
+int ReadIndex(const uint8_t* p, int w, int h);
+
+struct TopBox {
+    std::string type;
+    uint64_t pos, size;
+};
+
+// The top-level boxes of an MP4 file, up to the first that does not fit. `fragmented`: its moov has an mvex.
+std::vector<TopBox> TopBoxes(const std::wstring& path, bool* fragmented) {
+    std::vector<uint8_t> d;
+    if (FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+    }
+    auto be32 = [&](size_t p) { return (uint32_t)d[p] << 24 | (uint32_t)d[p + 1] << 16 | (uint32_t)d[p + 2] << 8 | d[p + 3]; };
+    std::vector<TopBox> out;
+    *fragmented = false;
+    for (size_t p = 0; p + 8 <= d.size();) {
+        uint64_t size = be32(p);
+        if (size == 1 && p + 16 <= d.size()) size = (uint64_t)be32(p + 8) << 32 | be32(p + 12);
+        if (size < 8 || size > d.size() - p) break;
+        TopBox b{std::string(d.begin() + p + 4, d.begin() + p + 8), p, size};
+        if (b.type == "moov") {
+            static const char mvex[] = "mvex";
+            auto from = d.begin() + p, to = from + (size_t)size;
+            *fragmented |= std::search(from, to, mvex, mvex + 4) != to;
+        }
+        out.push_back(b);
+        p += (size_t)size;
+    }
+    return out;
+}
+
+bool CutFile(const std::wstring& path, uint64_t at) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)at;
+    bool ok = SetFilePointerEx(f, li, nullptr, FILE_BEGIN) && SetEndOfFile(f);
+    CloseHandle(f);
+    return ok;
+}
 
 // The MP4 colour conversion runs on the GPU's video processor, which machines without a GPU (CI runners) lack.
 bool HasVideoProcessor() {
@@ -317,7 +364,7 @@ ExportResult ExportSync(Exporter& ex, ExportJob job) {
 
 }  // namespace
 
-std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, double fps) {
+std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, double fps, bool finish) {
     auto s = std::make_shared<FrameStore>();
     std::wstring err;
     if (!s->Open(w, h, err)) return nullptr;
@@ -326,7 +373,7 @@ std::shared_ptr<FrameStore> App::MakeSyntheticClip(int w, int h, int frames, dou
         DrawSynthetic(buf->data(), w, h, i / fps);
         while (!s->Submit(buf, (int64_t)(i * 1e7 / fps))) Sleep(1);
     }
-    s->Finish((int64_t)(frames * 1e7 / fps));
+    if (finish) s->Finish((int64_t)(frames * 1e7 / fps));
     return s;
 }
 
@@ -792,8 +839,242 @@ int App::RunSelfTest(const std::wstring& dir) {
         if (!ok) ++failures;
         log(util::Format(L"discard: %s an unsaved recording goes from the editor", ok ? L"ok  " : L"FAIL"));
     }
+    // Portable mode (#25): a settings.ini next to the exe is the settings file; a test run keeps its scratch file.
+    {
+        auto pcheck = [&](bool ok, const wchar_t* what) {
+            if (!ok) ++failures;
+            log(util::Format(L"portable: %s %s", ok ? L"ok  " : L"FAIL", what));
+        };
+        std::wstring exeDir = dir + L"\\portable";
+        util::EnsureDir(exeDir);
+        DeleteFileW((exeDir + L"\\settings.ini").c_str());
+        pcheck(Settings::PortableFile(exeDir).empty(), L"no settings.ini next to the exe: not portable");
+        HANDLE f = CreateFileW((exeDir + L"\\settings.ini").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0,
+                               nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        pcheck(Settings::PortableFile(exeDir) == exeDir + L"\\settings.ini", L"an empty settings.ini turns it on");
+        wchar_t env[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
+        pcheck(!Settings::Portable() && Settings::FilePath() == env, L"a test run keeps OZMAKER_SETTINGS");
+    }
+    // Crash reports (#24): a child run that crashes on purpose leaves a dump and a log and ends without the Windows
+    // error dialog. It shares this run's OZMAKER_SETTINGS, so the report lands in this test's folder.
+    {
+        crash::Prune(0);
+        for (const wchar_t* kind : {L"access", L"abort"}) {
+            std::wstring cmd = L"\"" + util::ExePath() + L"\" --crash-test " + kind;
+            STARTUPINFOW si{sizeof(si)};
+            PROCESS_INFORMATION pi{};
+            DWORD code = 0, waited = WAIT_FAILED;
+            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                waited = WaitForSingleObject(pi.hProcess, 30000);
+                if (waited != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            auto reports = crash::List();
+            std::string text;
+            if (!reports.empty() && !reports[0].log.empty()) {
+                HANDLE f = CreateFileW(reports[0].log.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                                       nullptr);
+                if (f != INVALID_HANDLE_VALUE) {
+                    char buf[4096];
+                    DWORD n = 0;
+                    if (ReadFile(f, buf, sizeof(buf), &n, nullptr)) text.assign(buf, n);
+                    CloseHandle(f);
+                }
+            }
+            const char* want = kind[1] == L'c' ? "(access violation) at OzMaker.exe+" : "(abort";
+            bool ok = waited == WAIT_OBJECT_0 && reports.size() == 1 && util::FileSize(reports[0].dump) > 0 &&
+                      text.find(want) != std::string::npos && text.find("OzMaker " OZ_VERSION_STR) != std::string::npos;
+            if (!ok) ++failures;
+            log(util::Format(L"crash report: %s %s: a dump and a log (exit 0x%08lX, %zu report(s))", ok ? L"ok  " : L"FAIL",
+                             kind, code, reports.size()));
+            crash::Prune(0);
+        }
+    }
+    // Crash-safe 움짤 recording (#24): what a run that crashed mid-recording had on disk comes back frame for frame,
+    // and goes with its files once dropped. This run's own recordings stay where they are.
+    {
+        auto rcheck = [&](bool ok, const std::wstring& what) {
+            if (!ok) ++failures;
+            log((ok ? L"recovery: ok   " : L"recovery: FAIL ") + what);
+        };
+        std::wstring cmd = L"\"" + util::ExePath() + L"\" --crash-test record";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            if (WaitForSingleObject(pi.hProcess, 30000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        crash::Prune(0);
+        auto mine = MakeSyntheticClip(32, 32, 3, 30);  // alive in this process: not taken
+        auto found = FrameStore::Recover();
+        int bad = 0;
+        if (found.size() == 1 && found[0].clip->Count() == 45) {
+            FrameStore::Reader rd(found[0].clip.get());
+            std::vector<uint8_t> want((size_t)160 * 90 * 4);
+            for (int i = 0; i < 45; ++i) {
+                DrawSynthetic(want.data(), 160, 90, i / 30.0);
+                const uint8_t* px = rd.Get(i);
+                if (!px || memcmp(px, want.data(), want.size()) != 0) ++bad;
+            }
+        }
+        rcheck(found.size() == 1 && found[0].clip->Count() == 45 && found[0].clip->Width() == 160 && bad == 0 &&
+                   std::fabs(found[0].clip->NominalFps() - 30) < 0.01,
+               util::Format(L"a crashed recording comes back: %zu found, %zu frames, %d differ", found.size(),
+                            found.empty() ? 0 : found[0].clip->Count(), bad));
+        std::wstring data = found.empty() ? L"" : found[0].clip->Path();
+        found.clear();
+        rcheck(!data.empty() && GetFileAttributesW(data.c_str()) == INVALID_FILE_ATTRIBUTES,
+               L"dropping it deletes its files");
+        std::wstring own = mine->Path();
+        mine.reset();
+        rcheck(GetFileAttributesW(own.c_str()) == INVALID_FILE_ATTRIBUTES, L"a recording dropped normally leaves nothing");
+    }
+    // Crash-safe MP4 recording (#24): a recording is fragmented while it is written. Finished, it is a plain MP4 with
+    // every frame; after a crash mid-recording the next start makes what reached the disk a plain MP4 too.
+    if (!HasVideoProcessor()) {
+        log(L"video recovery: skipped (no GPU video processor)");
+    } else {
+        auto vcheck = [&](bool ok, const std::wstring& what) {
+            if (!ok) ++failures;
+            log((ok ? L"video recovery: ok   " : L"video recovery: FAIL ") + what);
+        };
+        // plain: one moov without mvex, no moof, nothing after the last box. tables: the sample tables give the
+        // times and keyframes that reading every sample gives. wrong: frames not in their place.
+        struct Seen {
+            bool plain = false, tables = false, audio = false;
+            size_t frames = 0;
+            int wrong = 0;
+        };
+        auto inspect = [&](const std::wstring& path) {
+            Seen s;
+            bool frag = true;
+            auto boxes = TopBoxes(path, &frag);
+            int moovs = 0, moofs = 0;
+            for (const TopBox& b : boxes) {
+                moovs += b.type == "moov";
+                moofs += b.type == "moof";
+            }
+            s.plain = !frag && moovs == 1 && moofs == 0 && !boxes.empty() &&
+                      boxes.back().pos + boxes.back().size == util::FileSize(path);
+            std::wstring err;
+            auto clip = VideoClip::Open(path, err), scanned = VideoClip::Open(path, err, true);
+            if (!clip || !scanned) return s;
+            s.frames = clip->Count();
+            s.audio = clip->HasAudio();
+            s.tables = scanned->Count() == clip->Count();
+            for (size_t i = 0; s.tables && i < clip->Count(); ++i)
+                s.tables = std::llabs(scanned->Ts(i) - clip->Ts(i)) <= 2 && scanned->KeyBefore(i) == clip->KeyBefore(i);
+            auto rd = clip->NewReader();
+            for (size_t i = 0; i < clip->Count(); ++i) {
+                const uint8_t* px = rd->Get(i);
+                if (!px || ReadIndex(px, clip->Width(), clip->Height()) != (int)i) ++s.wrong;
+            }
+            return s;
+        };
+        auto describe = [](const Seen& s) {
+            return util::Format(L"%zu frames, %d wrong, plain %d, tables %d, audio %d", s.frames, s.wrong, s.plain,
+                                s.tables, s.audio);
+        };
+        const int N = 120;
+        std::wstring finished = dir + L"\\video_finished.mp4", err;
+        bool wrote = WriteTestMp4(finished, 320, 180, N, 60, 30, err, true);
+        Seen fin = inspect(finished);
+        vcheck(wrote && fin.plain && fin.frames == N && fin.wrong == 0 && fin.tables && fin.audio,
+               L"a finished recording is a plain MP4 with every frame: " + describe(fin) + L" " + err);
+
+        // A child process that crashes mid-recording; it has gone, so the next start takes its file.
+        std::wstring crashed = dir + L"\\video_crashed.mp4", cutMdat = dir + L"\\video_cut_mdat.mp4",
+                     cutMoof = dir + L"\\video_cut_moof.mp4", cutAll = dir + L"\\video_cut_all.mp4";
+        for (const std::wstring& p : {crashed, cutMdat, cutMoof, cutAll}) DeleteFileW(p.c_str());
+        std::wstring cmd = L"\"" + util::ExePath() + L"\" --crash-test video \"" + crashed + L"\"";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            if (WaitForSingleObject(pi.hProcess, 60000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        crash::Prune(0);
+        auto markers = [] {
+            size_t n = 0;
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW((FrameStore::Dir() + L"\\OzMaker_*.video").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do ++n;
+                while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+            return n;
+        };
+        // Copies cut where a crash can cut: in the middle of an mdat, of a moof, and before the first fragment.
+        bool frag = false;
+        auto boxes = TopBoxes(crashed, &frag);
+        std::vector<size_t> moofs;
+        for (size_t i = 0; i < boxes.size(); ++i)
+            if (boxes[i].type == "moof") moofs.push_back(i);
+        bool copied = false;
+        if (moofs.size() >= 3 && moofs[moofs.size() - 2] + 1 < boxes.size()) {
+            const TopBox& moof = boxes[moofs[moofs.size() - 2]];
+            const TopBox& mdat = boxes[moofs[moofs.size() - 2] + 1];
+            copied = mdat.type == "mdat" && CopyFileW(crashed.c_str(), cutMdat.c_str(), FALSE) &&
+                     CopyFileW(crashed.c_str(), cutMoof.c_str(), FALSE) &&
+                     CopyFileW(crashed.c_str(), cutAll.c_str(), FALSE) && CutFile(cutMdat, mdat.pos + mdat.size / 2) &&
+                     CutFile(cutMoof, moof.pos + moof.size / 2) && CutFile(cutAll, boxes[moofs[0]].pos + 4);
+        }
+        size_t before = markers();
+        auto videos = Mp4Writer::Recover();
+        Seen back = inspect(crashed);
+        vcheck(frag && before == 1 && videos.size() == 1 && _wcsicmp(videos[0].c_str(), crashed.c_str()) == 0 &&
+                   markers() == 0 && back.plain && back.frames >= N / 2 && back.frames <= N && back.wrong == 0 &&
+                   back.tables && back.audio,
+               util::Format(L"a recording a crash cut off comes back (fragmented %d, %zu marker(s), %zu found): ", frag,
+                            before, videos.size()) +
+                   describe(back));
+        for (const std::wstring& cut : {cutMdat, cutMoof}) {
+            std::wstring why;
+            bool ok = mp4::Unfragment(cut, why);
+            Seen s = inspect(cut);
+            vcheck(copied && ok && s.plain && s.frames > 0 && s.frames < back.frames && s.wrong == 0 && s.tables,
+                   L"cut short in " + std::wstring(cut == cutMdat ? L"an mdat" : L"a moof") + L": " + describe(s) +
+                       L" " + why);
+        }
+        {
+            std::wstring why;
+            bool empty = false;
+            bool ok = mp4::Unfragment(cutAll, why, &empty);
+            vcheck(copied && !ok && empty, L"cut before any fragment: nothing to keep (" + why + L")");
+        }
+        uint64_t size = util::FileSize(cutMoof);
+        std::wstring why;
+        vcheck(mp4::Unfragment(cutMoof, why) && util::FileSize(cutMoof) == size && inspect(cutMoof).plain,
+               L"converting a plain MP4 again changes nothing");
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
+}
+
+// A crash on purpose, for the self-test (#24): `access` and `abort` for the crash report; `record` with a 움짤
+// recording on disk and `video <path>` in the middle of an MP4, for recovery.
+int App::RunCrashTest(const std::vector<std::wstring>& args) {
+    if (args[1] == L"abort") std::abort();
+    std::shared_ptr<FrameStore> rec;
+    if (args[1] == L"record") {  // 45 frames on disk, never finished
+        rec = MakeSyntheticClip(160, 90, 45, 30, false);
+        if (rec) rec->SetNominalFps(30);  // as Capture does
+        Sleep(1000);
+    }
+    if (args[1] == L"video" && args.size() >= 3) {  // 2 s written as a recording is, never finished
+        std::wstring err;
+        WriteTestMp4(args[2], 320, 180, 120, 60, 30, err, true, true);
+    }
+    volatile int* nowhere = nullptr;
+    *nowhere = 1;
+    return 1;
 }
 
 // What DWM puts over the window preview, for screenshots (drawn offscreen, without it): the parts it would show,
@@ -964,6 +1245,21 @@ int App::RunScreenshots(const std::wstring& dir) {
     shot(L"settings_audio_mic.png", 96);
     settingsScroll_ = 0;
     micTestShow_ = -1;
+    settings_.settingsTab = kTabGeneral;
+    portableForTest_ = true;  // as a copy with settings.ini next to the exe shows it
+    shot(L"settings_portable.png", 96);
+    settings_.settingsTab = kTabAbout;
+    shot(L"settings_about_portable.png", 96);
+    portableForTest_ = false;
+    {
+        // A crash report on file (an empty stand-in in this test's own crash folder).
+        CreateDirectoryW(crash::Dir().c_str(), nullptr);
+        std::wstring fake = crash::Dir() + L"\\crash_20261102_142311_" OZ_VERSION_WSTR L".dmp";
+        HANDLE f = CreateFileW(fake.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        shot(L"settings_about_crash.png", 96);
+        DeleteFileW(fake.c_str());
+    }
     settings_.settingsTab = kTabGeneral;
 
     OpenEditor(MakeSyntheticClip(960, 540, 120, 30));
@@ -1482,7 +1778,9 @@ double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double
     return -1;
 }
 
-bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err) {
+// crash: the process crashes once the frames are written, the file as a crash leaves it (for the recovery test).
+bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
+                  bool fragmented, bool crash) {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11Multithread> mt;
@@ -1508,6 +1806,7 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
     v.height = H;
     v.fps = fps;
     v.gopFrames = gop;
+    v.fragmented = fragmented;
     AudioConfig a;
     a.enabled = true;
     Mp4Writer w;
@@ -1537,6 +1836,11 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
             w.Abort();
             return false;
         }
+    }
+    if (crash) {
+        Sleep(1500);  // the sink writes the fragments that are complete
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
     }
     return w.Finish(err);
 }
@@ -1890,6 +2194,13 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     lastResult_.bytes = util::FileSize(src);
     lastVideo_.path = src;  // as if just recorded: 삭제 shows
     shot(L"editor_video_saved.png");
+    // The notice at the start after a crash mid-recording (#24).
+    toast_ = L"지난번에 OzMaker가 비정상 종료되었습니다. 녹화하던 동영상을 되살렸습니다 · OzMaker_20261102_142311.mp4.";
+    toastUntil_ = clock + 60;
+    toastError_ = true;
+    shot(L"editor_video_recovered.png");
+    toastError_ = false;
+    toastUntil_ = 0;
     settings_.speedIdx = 3;
     hasResult_ = false;
     shot(L"editor_video_fast.png");

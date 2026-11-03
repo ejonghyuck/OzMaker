@@ -685,6 +685,7 @@ void Capture::TickLoop() {
         vc.width = outW_;
         vc.height = outH_;
         vc.fps = opt_.fps;
+        vc.fragmented = true;  // a crash leaves a file that plays; Finish makes it a plain MP4 (#24)
         std::wstring err;
         open = writer_->Open(opt_.video->path, vc, opt_.video->audio, dev_.Get(), err);
         if (!open) Fail(err);
@@ -829,6 +830,8 @@ CaptureResult Capture::Stop() {
         // An error mid-recording keeps what was encoded before it.
         std::wstring finishErr;
         res.ok = writer_->Finish(finishErr);
+        if (res.ok && !writer_->Notice().empty())
+            res.notice = res.notice.empty() ? writer_->Notice() : res.notice + L" " + writer_->Notice();
         if (res.ok && !videoError_.empty()) {
             res.seconds = (double)writer_->VideoFrames() / std::max(1, opt_.fps);
             std::wstring kept = videoError_ + L" 오류 전까지(" + util::FormatClock(res.seconds, false) + L") 저장했습니다.";

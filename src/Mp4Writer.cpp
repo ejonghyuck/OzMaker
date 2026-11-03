@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "Mp4Writer.h"
+#include "FrameStore.h"
+#include "Mp4Unfragment.h"
 #include "Util.h"
 
 #include <codecapi.h>
@@ -152,10 +154,68 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
 
     // Hardware first; codec tuning parameters are optional on some drivers; software as the last resort.
     if (TryOpen(path, v_.hardware, true, err) || TryOpen(path, v_.hardware, false, err) ||
-        (v_.hardware && TryOpen(path, false, true, err)))
+        (v_.hardware && TryOpen(path, false, true, err))) {
+        if (v_.fragmented) Mark();
         return true;
+    }
     Close();
     return false;
+}
+
+// OzMaker_<pid>_<qpc>.video next to the 움짤 recordings holds the path while the file is written: what a crash
+// leaves behind tells the next start which file to convert.
+void Mp4Writer::Mark() {
+    marker_ = FrameStore::Dir() + util::Format(L"\\OzMaker_%lu_%lld.video", GetCurrentProcessId(), util::Qpc100ns());
+    HANDLE h = CreateFileW(marker_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD bytes = (DWORD)(path_.size() * sizeof(wchar_t)), done = 0;
+    if (h == INVALID_HANDLE_VALUE || !WriteFile(h, path_.data(), bytes, &done, nullptr)) marker_.clear();
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+
+void Mp4Writer::Unmark() {
+    if (!marker_.empty()) DeleteFileW(marker_.c_str());
+    marker_.clear();
+}
+
+std::vector<std::wstring> Mp4Writer::Recover() {
+    const std::wstring dir = FrameStore::Dir();
+    std::vector<std::wstring> markers;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\OzMaker_*.video").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            markers.push_back(fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::vector<std::pair<uint64_t, std::wstring>> found;  // last write, path
+    for (const std::wstring& name : markers) {
+        DWORD pid = wcstoul(name.c_str() + 8, nullptr, 10);  // OzMaker_<pid>_<qpc>.video
+        if (pid == GetCurrentProcessId() || !util::ProcessGone(pid)) continue;
+        std::wstring marker = dir + L"\\" + name, path;
+        HANDLE f = CreateFileW(marker.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            wchar_t buf[4096];
+            DWORD got = 0;
+            if (ReadFile(f, buf, sizeof(buf), &got, nullptr)) path.assign(buf, got / sizeof(wchar_t));
+            CloseHandle(f);
+        }
+        DeleteFileW(marker.c_str());
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) continue;
+        std::wstring err;
+        bool empty = false;
+        if (!mp4::Unfragment(path, err, &empty) && empty) {  // nothing reached the disk: no file to offer
+            DeleteFileW(path.c_str());
+            continue;
+        }
+        // A file that could not be converted stays fragmented: most players open it as it is.
+        found.push_back({(uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32 | fa.ftLastWriteTime.dwLowDateTime, path});
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<std::wstring> out;
+    for (auto& f : found) out.push_back(std::move(f.second));
+    return out;
 }
 
 bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParams, std::wstring& err) {
@@ -166,7 +226,8 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
     if (SUCCEEDED(hr)) {
         wa->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware);
         wa->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, devManager_.Get());
-        wa->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        wa->SetGUID(MF_TRANSCODE_CONTAINERTYPE,
+                    v_.fragmented ? MFTranscodeContainerType_FMPEG4 : MFTranscodeContainerType_MPEG4);
         hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, wa.Get(), &writer_);
     }
     if (FAILED(hr)) {
@@ -376,6 +437,12 @@ bool Mp4Writer::Finish(std::wstring& err) {
         return false;
     }
     Close();
+    if (v_.fragmented) {
+        std::wstring why;
+        if (!mp4::Unfragment(path_, why))
+            notice_ = L"동영상을 일반 MP4로 바꾸지 못했습니다(" + why + L"). 대부분의 플레이어에서는 그대로 재생됩니다.";
+    }
+    Unmark();
     return true;
 }
 
@@ -383,6 +450,7 @@ void Mp4Writer::Abort() {
     bool had = writer_ != nullptr;
     Close();
     if (had) DeleteFileW(path_.c_str());
+    Unmark();
 }
 
 void Mp4Writer::Close() {

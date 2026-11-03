@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 #include "Util.h"
 #include "Version.h"
 
@@ -1687,8 +1688,15 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
         }
     });
 
-    SettingRow(area, L"Windows 시작 시 실행", L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다", 60,
-               [&](Rect c) {
+    const bool portable = Settings::Portable() || portableForTest_;
+    SettingRow(area, L"Windows 시작 시 실행",
+               portable ? L"포터블 모드에서는 이 PC의 시작 프로그램에 등록하지 않습니다"
+                        : L"로그인하면 창 없이 트레이에서 시작해 단축키를 바로 쓸 수 있습니다",
+               60, [&](Rect c) {
+                   if (portable) {
+                       ui_.Text(c, L"쓰지 않음", 13.f, TextFaint, Align(AlignEnd));
+                       return;
+                   }
                    bool on = autostart_;
                    if (ui_.Toggle(HashId("set.autostart"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) {
                        if (util::SetAutostart(on))
@@ -1933,6 +1941,31 @@ void App::SettingsAbout(Rect& area) {
     for (int i = 0; i < (int)Format::Mp4; ++i)
         if (FormatAvailable((Format)i)) formats += (formats.empty() ? L"" : L", ") + std::wstring(FormatName((Format)i));
     SettingRow(area, L"지원 형식", L"움짤: " + formats + L" · 동영상: MP4", 0, [](Rect) {});
+
+    const bool portable = Settings::Portable() || portableForTest_;
+    SettingRow(area, L"설정 파일",
+               portable ? L"포터블 모드 · OzMaker.exe 옆의 settings.ini에 저장합니다"
+                        : L"%APPDATA%\\OzMaker\\settings.ini · OzMaker.exe 옆에 settings.ini를 만들면 포터블로 씁니다",
+               94, [&](Rect c) {
+                   if (ui_.Button(HashId("set.iniDir"), c, L"열기", BtnStyle::Secondary, icon::Folder, true, 13.f))
+                       util::OpenFolderAndSelect(Settings::FilePath());
+               });
+
+    // Crash reports (#24): only on this PC, for the user to attach to an issue.
+    auto reports = crash::List();
+    std::wstring crashDesc = L"없음 · 비정상 종료되면 덤프와 로그를 이 PC에만 남깁니다";
+    if (!reports.empty()) {
+        const std::wstring& n = reports[0].name;  // crash_yyyymmdd_hhmmss_<version>
+        std::wstring when = n.size() >= 21 ? n.substr(6, 4) + L"-" + n.substr(10, 2) + L"-" + n.substr(12, 2) + L" " +
+                                                 n.substr(15, 2) + L":" + n.substr(17, 2)
+                                           : n;
+        crashDesc = util::Format(L"%zu개 · 최근 %s · 이슈에 첨부해 알려 주시면 고치는 데 도움이 됩니다", reports.size(),
+                                 when.c_str());
+    }
+    SettingRow(area, L"충돌 기록", crashDesc, 94, [&](Rect c) {
+        if (ui_.Button(HashId("set.crash"), c, L"열기", BtnStyle::Secondary, icon::Folder, !reports.empty(), 13.f))
+            util::OpenFolderAndSelect(reports[0].dump);
+    });
 
     Updater::Status st = updater_.Get();
     std::wstring desc;

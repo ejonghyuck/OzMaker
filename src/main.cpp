@@ -1,9 +1,11 @@
 #include "pch.h"
 #include "App.h"
+#include "Crash.h"
 
 #include <tlhelp32.h>
 
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+    crash::Install(Settings::Dir() + L"\\crash");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 

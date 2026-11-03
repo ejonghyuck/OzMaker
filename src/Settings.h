@@ -96,10 +96,19 @@ struct Settings {
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 
     std::vector<std::wstring> recent;  // saved and opened files, newest first
+    std::wstring crashSeen;            // the newest crash report the user was told about (crash::Report::name)
 
     void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
+
+    // Where the settings live: OZMAKER_SETTINGS (test runs), settings.ini next to the exe (portable mode, #25), or
+    // %APPDATA%\OzMaker\settings.ini.
+    static std::wstring FilePath();
+    static std::wstring Dir();  // the folder FilePath is in; crash reports go there too
+    static bool Portable();     // decided once, at startup
+    static std::wstring PortableFile(const std::wstring& exeDir);  // exeDir\settings.ini if it exists, else empty
+
     bool HasRegion() const { return region.right - region.left >= 16 && region.bottom - region.top >= 16; }
     int CountdownSeconds() const { return countdown == 1 ? 3 : countdown == 2 ? 5 : 0; }
 };

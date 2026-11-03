@@ -55,6 +55,11 @@ if (Test-Path -LiteralPath $installed) {
 }
 
 Compress-Archive -Path $stage -DestinationPath $zip
+# The PDB of this exact build reads its crash reports (#24); it goes next to the release, not into the zip.
+$pdb = Join-Path $root 'bin\Release\OzMaker.pdb'
+$pdbZip = Join-Path $dist "OzMaker-$version-pdb.zip"
+if (Test-Path -LiteralPath $pdbZip) { Remove-Item -LiteralPath $pdbZip -Force }
+if (Test-Path -LiteralPath $pdb) { Compress-Archive -LiteralPath $pdb -DestinationPath $pdbZip }
 
 # What the updater in earlier versions reads (src\Updater.h): the exe on its own, and update.txt describing it.
 $exeOut = Join-Path $dist 'OzMaker.exe'
@@ -65,5 +70,5 @@ $info = "version=$version`r`nexe=OzMaker.exe`r`nsize=$((Get-Item -LiteralPath $e
 
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
 Write-Host ''
-Write-Host "Created $zip, OzMaker.exe and update.txt"
+Write-Host "Created $zip, OzMaker.exe, update.txt and the PDB zip"
 Write-Host ('{0:N0} bytes, SHA-256 {1}' -f (Get-Item -LiteralPath $zip).Length, $hash)

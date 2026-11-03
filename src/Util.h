@@ -17,6 +17,7 @@ std::wstring Format(const wchar_t* fmt, ...);
 
 std::wstring KnownFolder(REFKNOWNFOLDERID id);
 std::wstring ExePath();
+std::wstring ExeDir();                   // the folder ExePath is in
 std::wstring AppDataDir();               // %APPDATA%\OzMaker, created on demand
 bool EnsureDir(const std::wstring& dir);
 std::wstring TimestampName();            // 20261102_142311
@@ -44,6 +45,8 @@ std::wstring SafeFileName(std::wstring_view s, size_t maxLen = 80);
 // Start with Windows (HKCU Run, "OzMaker" -> "<this exe>" --tray).
 bool AutostartEnabled();
 bool SetAutostart(bool on);
+// The process has exited. False while it runs, also under another account or elevated (access denied).
+bool ProcessGone(DWORD pid);
 
 // What is left of a rectangle with others taken out of it, as non-overlapping rectangles.
 std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& holes);

@@ -1,10 +1,69 @@
 #include "pch.h"
 #include "FrameStore.h"
+#include "Settings.h"
 #include "Util.h"
+
+namespace {
+constexpr char kMagic[4] = {'O', 'Z', 'F', 'S'};
+constexpr uint32_t kVersion = 1;
+constexpr uint32_t kRecFrame = 1, kRecEnd = 2, kRecFps = 3;
+
+struct JournalHeader {
+    char magic[4];
+    uint32_t version;
+    int32_t width, height;
+    uint32_t keyInterval, reserved;
+    uint64_t reserved2;
+};
+static_assert(sizeof(JournalHeader) == 32);
+
+std::wstring JournalPath(const std::wstring& data) { return data.substr(0, data.find_last_of(L'.')) + L".idx"; }
+}  // namespace
 
 FrameStore::~FrameStore() {
     if (!finished_) Finish(endTs_);
     if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    if (journal_ != INVALID_HANDLE_VALUE) CloseHandle(journal_);
+    if (!path_.empty()) {
+        DeleteFileW(path_.c_str());
+        DeleteFileW(JournalPath(path_).c_str());
+    }
+}
+
+std::wstring FrameStore::Dir() {
+    static const std::wstring dir = [] {
+        wchar_t env[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
+        std::wstring d;
+        if (n > 0 && n < MAX_PATH) {
+            d = Settings::Dir() + L"\\recovery";
+        } else {
+            wchar_t tmp[MAX_PATH + 1] = {};
+            GetTempPathW(_countof(tmp), tmp);
+            d = std::wstring(tmp) + L"OzMaker";
+        }
+        util::EnsureDir(d);
+        return d;
+    }();
+    return dir;
+}
+
+void FrameStore::SetNominalFps(double fps) {
+    std::lock_guard lk(mtx_);
+    nominalFps_ = fps;
+    JournalRecord r;
+    r.type = kRecFps;
+    memcpy(&r.offset, &fps, sizeof(fps));
+    Journal(r);
+}
+
+void FrameStore::Journal(const JournalRecord& r) {
+    if (journal_ == INVALID_HANDLE_VALUE) return;
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD)journalOffset_;
+    ov.OffsetHigh = (DWORD)(journalOffset_ >> 32);
+    DWORD written = 0;
+    if (WriteFile(journal_, &r, sizeof(r), &written, &ov) && written == sizeof(r)) journalOffset_ += sizeof(r);
 }
 
 bool FrameStore::Open(int width, int height, std::wstring& err) {
@@ -12,16 +71,25 @@ bool FrameStore::Open(int width, int height, std::wstring& err) {
     height_ = height;
     frameBytes_ = (size_t)width * height * 4;
 
-    wchar_t dir[MAX_PATH];
-    GetTempPathW(MAX_PATH, dir);
-    std::wstring path = util::Format(L"%sOzMaker_%lu_%llu.tmp", dir, GetCurrentProcessId(),
-                                     (unsigned long long)util::Qpc100ns());
-    file_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-    if (file_ == INVALID_HANDLE_VALUE) {
+    path_ = util::Format(L"%s\\OzMaker_%lu_%llu.frames", Dir().c_str(), GetCurrentProcessId(),
+                         (unsigned long long)util::Qpc100ns());
+    file_ = CreateFileW(path_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    journal_ = CreateFileW(JournalPath(path_).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    JournalHeader hdr{};
+    memcpy(hdr.magic, kMagic, 4);
+    hdr.version = kVersion;
+    hdr.width = width;
+    hdr.height = height;
+    hdr.keyInterval = (uint32_t)kKeyInterval;
+    DWORD written = 0;
+    if (file_ == INVALID_HANDLE_VALUE || journal_ == INVALID_HANDLE_VALUE ||
+        !WriteFile(journal_, &hdr, sizeof(hdr), &written, nullptr) || written != sizeof(hdr)) {
         err = L"임시 파일을 만들 수 없습니다.";
-        return false;
+        return false;  // the destructor closes and deletes what was made
     }
+    journalOffset_ = sizeof(hdr);
     // Bound queued (uncompressed) frames to ~768 MB so a slow disk can't balloon memory.
     maxInflight_ = std::clamp<size_t>((768ull << 20) / std::max<size_t>(frameBytes_, 1), 4, 240);
     unsigned hw = std::max(1u, std::thread::hardware_concurrency());
@@ -91,7 +159,94 @@ void FrameStore::Finish(int64_t endTs) {
     }
     int64_t lastTs = entries_.empty() ? 0 : entries_.back().ts;
     endTs_ = std::max(endTs, lastTs + 10'000'000 / 60);
+    JournalRecord r;
+    r.type = kRecEnd;
+    r.ts = endTs_;
+    Journal(r);
     finished_ = true;
+}
+
+bool FrameStore::Load(const std::wstring& data, const std::wstring& journal) {
+    HANDLE j = CreateFileW(journal.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
+    if (j == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    GetFileSizeEx(j, &size);
+    std::vector<uint8_t> buf((size_t)std::min<int64_t>(size.QuadPart, 1ll << 30));
+    DWORD read = 0;
+    bool ok = !buf.empty() && ReadFile(j, buf.data(), (DWORD)buf.size(), &read, nullptr) && read == buf.size();
+    CloseHandle(j);
+    JournalHeader hdr{};
+    if (!ok || buf.size() < sizeof(hdr)) return false;
+    memcpy(&hdr, buf.data(), sizeof(hdr));
+    if (memcmp(hdr.magic, kMagic, 4) != 0 || hdr.version != kVersion || hdr.width <= 0 || hdr.height <= 0 ||
+        hdr.width > 16384 || hdr.height > 16384 || hdr.keyInterval != kKeyInterval)
+        return false;
+
+    file_ = CreateFileW(data.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file_ == INVALID_HANDLE_VALUE) return false;
+    path_ = data;
+    LARGE_INTEGER dataSize{};
+    GetFileSizeEx(file_, &dataSize);
+    width_ = hdr.width;
+    height_ = hdr.height;
+    frameBytes_ = (size_t)width_ * height_ * 4;
+    int64_t end = 0;
+    for (size_t off = sizeof(hdr); off + sizeof(JournalRecord) <= buf.size(); off += sizeof(JournalRecord)) {
+        JournalRecord r;
+        memcpy(&r, buf.data() + off, sizeof(r));
+        if (r.type == kRecFrame && r.size > 0 && r.offset + r.size <= (uint64_t)dataSize.QuadPart) {
+            if (r.seq >= entries_.size()) entries_.resize((size_t)r.seq + 1);
+            entries_[r.seq] = {r.offset, r.size, r.raw != 0, r.ts};
+        } else if (r.type == kRecEnd) {
+            end = r.ts;
+        } else if (r.type == kRecFps) {
+            memcpy(&nominalFps_, &r.offset, sizeof(nominalFps_));
+        }
+    }
+    // Up to the first frame that never reached the disk: the later ones are deltas on it.
+    size_t n = 0;
+    while (n < entries_.size() && entries_[n].size > 0) ++n;
+    entries_.resize(n);
+    if (n == 0) return false;
+    endTs_ = std::max(end, entries_.back().ts + 10'000'000 / 60);
+    finished_ = true;
+    return true;
+}
+
+std::vector<FrameStore::Recovered> FrameStore::Recover() {
+    std::vector<Recovered> out;
+    const std::wstring dir = Dir();
+    std::vector<std::wstring> journals;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\OzMaker_*.idx").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        journals.push_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    auto ticks = [](const FILETIME& f) { return (int64_t)((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime); };
+    for (const std::wstring& name : journals) {
+        DWORD pid = wcstoul(name.c_str() + 8, nullptr, 10);  // OzMaker_<pid>_<qpc>.idx
+        if (pid == GetCurrentProcessId() || !util::ProcessGone(pid)) continue;
+        std::wstring journal = dir + L"\\" + name;
+        std::wstring data = journal.substr(0, journal.size() - 4) + L".frames";
+        auto s = std::make_shared<FrameStore>();
+        if (!s->Load(data, journal)) {
+            s.reset();  // drops any handle it opened
+            DeleteFileW(data.c_str());
+            DeleteFileW(journal.c_str());
+            continue;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        GetFileAttributesExW(journal.c_str(), GetFileExInfoStandard, &fa);
+        out.push_back({std::move(s), std::max<int64_t>(0, ticks(nowFt) - ticks(fa.ftLastWriteTime)) / 1e7});
+    }
+    std::sort(out.begin(), out.end(), [](const Recovered& a, const Recovered& b) { return a.age < b.age; });
+    return out;
 }
 
 size_t FrameStore::Count() const {
@@ -155,6 +310,16 @@ void FrameStore::Worker() {
         e.size = (uint32_t)size;
         e.raw = raw;
         --inflight_;
+        if (job.seq < firstBad_.load()) {
+            JournalRecord r;
+            r.type = kRecFrame;
+            r.seq = (uint32_t)job.seq;
+            r.offset = off;
+            r.size = (uint32_t)size;
+            r.raw = raw;
+            r.ts = e.ts;
+            Journal(r);
+        }
     }
     if (comp) CloseCompressor(comp);
 }

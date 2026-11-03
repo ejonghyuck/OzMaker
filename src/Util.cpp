@@ -89,6 +89,11 @@ std::wstring ExePath() {
     return std::wstring(exe, n);
 }
 
+std::wstring ExeDir() {
+    std::wstring p = ExePath();
+    return p.substr(0, p.find_last_of(L'\\'));
+}
+
 std::wstring AppDataDir() {
     std::wstring d = KnownFolder(FOLDERID_RoamingAppData) + L"\\OzMaker";
     EnsureDir(d);
@@ -283,6 +288,14 @@ bool SetAutostart(bool on) {
     std::wstring cmd = AutostartCommand();
     return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"OzMaker", REG_SZ, cmd.c_str(),
                            (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+bool ProcessGone(DWORD pid) {
+    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!p) return GetLastError() == ERROR_INVALID_PARAMETER;
+    bool gone = WaitForSingleObject(p, 0) == WAIT_OBJECT_0;
+    CloseHandle(p);
+    return gone;
 }
 
 std::vector<RECT> SubtractRects(const RECT& whole, const std::vector<RECT>& holes) {
