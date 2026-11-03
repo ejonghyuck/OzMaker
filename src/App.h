@@ -66,6 +66,7 @@ private:
     // ---- views (AppViews.cpp)
     void DrawFrame(Rect client);
     void DrawHeader(Rect r);
+    void DrawTabs(Rect r);  // 녹화 | 편집 in the middle of the header
     void DrawHome(Rect r);
     void DrawSourcePanel(Rect r);
     void DrawWindowList(Rect r);
@@ -76,6 +77,8 @@ private:
     void DrawMonitorLayout(Rect r, const RECT* region, bool pickable);
     void DrawVideoResult(Rect r);
     void DrawEditor(Rect r);
+    void DrawEditHome(Rect r);  // the 편집 tab with no file open: where to drop one, what to open
+    void DrawFileBar(Rect r);   // over the editor: the open file and 닫기
     void DrawPreview(Rect r);
     void DrawTransport(Rect r);
     void DrawTimeline(Rect r);
@@ -90,6 +93,7 @@ private:
     void DrawToast(Rect client);
     void DrawFilesButton(Rect& right);
     void DrawFilesPopover(Rect client);
+    void DrawDropCue(Rect client);
     void DrawUpdateButton(Rect& right);
     void DrawUpdatePopover(Rect client);
     void SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
@@ -118,6 +122,7 @@ private:
     void StopRecording();
     void OnVideoSaved(const CaptureResult& r);
     void ShowVideo(const CaptureResult& r);
+    void EditLastVideo();  // the video card's 편집
     void OnHotkey();
     void TogglePause();
     // Every recording tick: the length limit and the free space (#17). Stops with a reason when one is reached.
@@ -139,6 +144,8 @@ private:
     void RefreshRecent();
     void HoldRecording(std::shared_ptr<Clip> clip);
     void DropHeld(const Clip* clip);
+    void OpenHeld(size_t i);
+    void ConfirmDropHeld(size_t i);  // asks, then lets held_[i] go
     size_t RecoverRecordings();  // at startup: what a crash left behind, back among the unsaved recordings (#24)
     // Asks about unsaved recordings, if there are any, then (on yes) runs `then`.
     void AskQuit(bool restart, std::function<void()> then);
@@ -163,8 +170,11 @@ private:
     // ---- editor
     void OpenEditor(std::shared_ptr<Clip> clip);
     bool OpenVideo(const std::wstring& path);
-    void ResumeEditor();
-    void CloseEditor();
+    void ResumeEditor();  // the 편집 tab
+    void CloseEditor();   // the 녹화 tab
+    void CloseClip();     // the file bar's 닫기
+    std::wstring ClipTitle() const;  // the open file's name: a video's file, a recording's window
+    void PauseEditor();
     void AttachReaders();
     void DetachReaders();
     void ShowFrame(size_t index);
@@ -327,6 +337,16 @@ private:
     Rect filesBtn_;
     float filesScroll_ = 0;
     std::wstring pendingOpen_;
+    float editListScroll_[2]{};  // the 편집 tab's lists: 저장하지 않은 녹화, 최근 파일
+
+    // Files dragged over the window (OLE): what dropping them would do, shown over the whole window before the drop.
+    class DropTarget;
+    enum class DragKind { None, Video, Anim, Other, Busy };
+    DragKind ClassifyDrop(const std::wstring& path) const;
+    ComPtr<IDropTarget> MakeDropTarget();
+    ComPtr<IDropTarget> dropTarget_;
+    DragKind dragKind_ = DragKind::None;
+    std::wstring dragName_;
 
     // Export size estimate and "용량 맞추기" (EstimateBytes on the estimator's thread).
     struct FitKnobs {

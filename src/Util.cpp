@@ -111,6 +111,26 @@ std::wstring FileNameOf(const std::wstring& path) {
     return p == std::wstring::npos ? path : path.substr(p + 1);
 }
 
+static std::wstring LowerExt(const std::wstring& path) {
+    std::wstring name = FileNameOf(path);
+    size_t dot = name.find_last_of(L'.');
+    std::wstring ext = dot == std::wstring::npos ? L"" : name.substr(dot);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    return ext;
+}
+
+bool IsVideoPath(const std::wstring& path) {
+    static const wchar_t* const kExts[] = {L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi",
+                                           L".wmv", L".3gp", L".ts",  L".mts", L".m2ts"};
+    const std::wstring ext = LowerExt(path);
+    return std::any_of(std::begin(kExts), std::end(kExts), [&](const wchar_t* e) { return ext == e; });
+}
+
+bool IsAnimPath(const std::wstring& path) {
+    const std::wstring ext = LowerExt(path);
+    return ext == L".gif" || ext == L".webp" || ext == L".avif" || ext == L".png" || ext == L".apng";
+}
+
 uint64_t FileSize(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return 0;
@@ -235,7 +255,7 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
 bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
     ComPtr<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
-    COMDLG_FILTERSPEC filters[] = {{L"동영상", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts"},
+    COMDLG_FILTERSPEC filters[] = {{L"동영상", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts"},
                                    {L"모든 파일", L"*.*"}};
     dlg->SetFileTypes(_countof(filters), filters);
     DWORD opts = 0;

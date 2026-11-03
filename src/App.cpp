@@ -163,6 +163,85 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     return 0;
 }
 
+// ---------------------------------------------------------------- drag and drop
+
+// The first of the files dragged over the window. While they are over it, the whole window says what dropping them
+// would do (DrawDropCue); only a video can be dropped.
+class App::DropTarget : public IDropTarget {
+public:
+    explicit DropTarget(App* app) : app_(app) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *out = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG n = --refs_;
+        if (!n) delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
+        path_.clear();
+        FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM med{};
+        if (data && SUCCEEDED(data->GetData(&fmt, &med))) {
+            wchar_t p[MAX_PATH * 4];
+            if (DragQueryFileW((HDROP)med.hGlobal, 0, p, _countof(p)) > 0) path_ = p;
+            ReleaseStgMedium(&med);
+        }
+        app_->dragKind_ = path_.empty() ? DragKind::None : app_->ClassifyDrop(path_);
+        app_->dragName_ = path_.empty() ? L"" : util::FileNameOf(path_);
+        app_->Invalidate();
+        return DragOver(0, {}, effect);
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
+        if (!path_.empty()) app_->dragKind_ = app_->ClassifyDrop(path_);  // a recording may have started meanwhile
+        *effect = app_->dragKind_ == DragKind::Video ? (*effect & DROPEFFECT_COPY) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        app_->dragKind_ = DragKind::None;
+        app_->dragName_.clear();
+        app_->Invalidate();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject*, DWORD, POINTL, DWORD* effect) override {
+        const bool open = app_->dragKind_ == DragKind::Video;
+        DragLeave();
+        *effect = open ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        // After DoDragDrop returns in the program the file came from: Explorer stays usable while it opens.
+        if (open) {
+            app_->pendingOpen_ = path_;
+            PostMessageW(app_->hwnd_, WM_APP_OPEN, 0, 0);
+        }
+        return S_OK;
+    }
+
+private:
+    App* app_;
+    ULONG refs_ = 1;
+    std::wstring path_;
+};
+
+ComPtr<IDropTarget> App::MakeDropTarget() {
+    ComPtr<IDropTarget> t;
+    t.Attach(new DropTarget(this));
+    return t;
+}
+
+App::DragKind App::ClassifyDrop(const std::wstring& path) const {
+    if (rec_ != RecState::Idle || exporter_.Busy()) return DragKind::Busy;
+    if (util::IsVideoPath(path)) return DragKind::Video;
+    return util::IsAnimPath(path) ? DragKind::Anim : DragKind::Other;
+}
+
+// ---------------------------------------------------------------- window
+
 bool App::CreateMainWindow(int show) {
     int smX = GetSystemMetrics(SM_CXSMICON), smY = GetSystemMetrics(SM_CYSMICON);
     iconApp_ = (HICON)LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
@@ -216,7 +295,11 @@ bool App::CreateMainWindow(int show) {
     COLORREF caption = RGB(0x0D, 0x0F, 0x13);
     DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR, Win11*/, &caption, sizeof(caption));
     if (!gfx_.AttachWindow(hwnd_)) return false;
-    DragAcceptFiles(hwnd_, TRUE);
+    dropTarget_ = MakeDropTarget();
+    if (FAILED(OleInitialize(nullptr)) || FAILED(RegisterDragDrop(hwnd_, dropTarget_.Get()))) {
+        dropTarget_.Reset();
+        DragAcceptFiles(hwnd_, TRUE);  // no cue while dragging, but a drop still opens the file
+    }
 
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
@@ -764,6 +847,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             StopMicTest();
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
+            if (dropTarget_) {
+                RevokeDragDrop(hwnd_);
+                dropTarget_.Reset();
+                OleUninitialize();
+            }
             TrayRemove();
             settings_.Save();
             PostQuitMessage(0);
@@ -1263,33 +1351,45 @@ void App::StopRecording() {
     stopReason_.clear();
     if (NotifyQuietly()) {
         TrayBalloon(L"녹화 완료 · " + util::FormatClock(clip->Seconds(), true),
-                    warn.empty() ? L"클릭하면 편집 화면이 열립니다." : warn);
+                    warn.empty() ? L"클릭하면 편집 탭이 열립니다." : warn);
     } else {
         ShowMain(true);
-        if (!warn.empty()) Toast(warn, true);
+        Toast(warn.empty() ? L"녹화를 편집 탭에서 열었습니다" : warn, !warn.empty());
     }
 }
 
-// The file is already saved: the result card shows it, and the editor opens on it for trimming, with that file as the
-// current result.
+// The file is already saved: the card on the 녹화 tab shows it. Its 편집 opens it in the 편집 tab (EditLastVideo).
 void App::ShowVideo(const CaptureResult& r) {
     AddRecent(r.path);
     lastVideo_ = r;
     showVideo_ = true;
-    std::wstring err;
-    if (auto video = VideoClip::Open(r.path, err)) {
-        OpenEditor(video);
-        lastResult_ = {};
-        lastResult_.ok = true;
-        lastResult_.audio = r.audio;
-        lastResult_.path = r.path;
-        lastResult_.bytes = r.bytes;
-        lastResult_.seconds = r.seconds;
-        hasResult_ = resultOriginal_ = true;
-    } else {
-        if (screen_ == Screen::Settings) screen_ = Screen::Home;
-        if (screen_ == Screen::Editor) CloseEditor();
+    if (screen_ == Screen::Editor)
+        CloseEditor();
+    else
+        screen_ = Screen::Home;
+}
+
+// The video card's 편집: the video just recorded in the editor, with the file itself as the current result.
+void App::EditLastVideo() {
+    if (clip_ && _wcsicmp(clip_->SourcePath().c_str(), lastVideo_.path.c_str()) == 0) {
+        ResumeEditor();
+        return;
     }
+    if (exporter_.Busy()) return;
+    std::wstring err;
+    auto video = VideoClip::Open(lastVideo_.path, err);
+    if (!video) {
+        Toast(err, true);
+        return;
+    }
+    OpenEditor(video);
+    lastResult_ = {};
+    lastResult_.ok = true;
+    lastResult_.audio = lastVideo_.audio;
+    lastResult_.path = lastVideo_.path;
+    lastResult_.bytes = lastVideo_.bytes;
+    lastResult_.seconds = lastVideo_.seconds;
+    hasResult_ = resultOriginal_ = true;
 }
 
 void App::OnVideoSaved(const CaptureResult& r) {
@@ -1516,13 +1616,14 @@ void App::OpenMediaFile(const std::wstring& path) {
         Toast(L"파일을 찾을 수 없습니다: " + util::FileNameOf(path), true);
         return;
     }
-    std::wstring ext = path.substr(std::min(path.size(), path.find_last_of(L'.')));
-    for (auto& c : ext) c = (wchar_t)towlower(c);
-    if (ext == L".gif" || ext == L".webp" || ext == L".avif" || ext == L".png" || ext == L".apng") {
-        Toast(L"움짤은 편집할 수 없습니다. MP4 같은 동영상 파일을 여세요.", true);
+    if (util::IsAnimPath(path)) {
+        Toast(L"움짤은 아직 열 수 없습니다. 동영상을 열어 주세요.", true);
         return;
     }
-    if (OpenVideo(path)) AddRecent(path);
+    if (OpenVideo(path)) {
+        AddRecent(path);
+        Toast(L"편집 탭에서 열었습니다: " + util::FileNameOf(path));
+    }
 }
 
 void App::BrowseForVideo() {
@@ -1549,9 +1650,7 @@ void App::RefreshRecent() {
         f.path = p;
         f.bytes = (uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
         f.age = std::max<int64_t>(0, ticks(nowFt) - ticks(fa.ftLastWriteTime)) / 1e7;
-        std::wstring ext = p.substr(std::min(p.size(), p.find_last_of(L'.')));
-        for (auto& c : ext) c = (wchar_t)towlower(c);
-        f.video = ext != L".gif" && ext != L".webp" && ext != L".avif";
+        f.video = !util::IsAnimPath(p);
         recentFiles_.push_back(std::move(f));
     }
 }
@@ -1578,14 +1677,40 @@ void App::DropHeld(const Clip* clip) {
     std::erase_if(held_, [&](const HeldClip& h) { return h.clip.get() == clip; });
 }
 
+void App::OpenHeld(size_t i) {
+    if (i >= held_.size()) return;
+    filesOpen_ = false;
+    auto clip = held_[i].clip;
+    clipName_ = held_[i].name;
+    if (clip != clip_)
+        OpenEditor(clip);
+    else
+        ResumeEditor();
+}
+
+void App::ConfirmDropHeld(size_t i) {
+    if (i >= held_.size()) return;
+    const HeldClip& h = held_[i];
+    Ask({L"이 녹화를 버릴까요?",
+         h.name + L" · " + util::FormatClock(h.clip->Seconds(), true) + L"\n버리면 되돌릴 수 없습니다.", L"버리기", true,
+         [this, clip = std::weak_ptr<Clip>(h.clip)] {
+             auto c = clip.lock();
+             if (!c) return;
+             if (c == clip_) CloseClip();
+             DropHeld(c.get());
+             Toast(L"녹화를 버렸습니다.");
+             Invalidate();
+         }});
+}
+
 void App::AskQuit(bool restart, std::function<void()> then) {
     if (held_.empty()) {
         then();
         return;
     }
     Ask({util::Format(L"저장하지 않은 녹화가 %zu개 있습니다", held_.size()),
-         restart ? L"다시 시작하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요."
-                 : L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+         restart ? L"다시 시작하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요."
+                 : L"종료하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요.",
          restart ? L"다시 시작해서 업데이트" : L"종료", true, std::move(then)});
 }
 
@@ -1655,23 +1780,44 @@ bool App::OpenVideo(const std::wstring& path) {
     return true;
 }
 
+// The 편집 tab: the open file where it was left, playing again, or with none open, what there is to open.
 void App::ResumeEditor() {
-    if (!clip_) return;
-    AttachReaders();
     screen_ = Screen::Editor;
+    if (!clip_) {
+        RefreshRecent();
+        Invalidate();
+        return;
+    }
+    AttachReaders();
     SetPlaying(true);
 }
 
-// Back to the home screen. The clip stays (temp file only) so "이전 녹화 편집" can reopen it until
-// the next recording replaces it. A video's file is let go meanwhile so it can be moved or deleted.
+// The 녹화 tab. The open file stays open in the 편집 tab (the dot on the tab) until its 닫기 or the next one opened;
+// a video's file is let go meanwhile so it can be moved or deleted.
 void App::CloseEditor() {
     if (exporter_.Busy()) return;
+    PauseEditor();
+    screen_ = Screen::Home;
+    RefreshWindows();
+}
+
+void App::PauseEditor() {
     playing_ = false;
     cropMode_ = false;
-    screen_ = Screen::Home;
     SyncAudioPreview();
     DetachReaders();
-    RefreshWindows();
+}
+
+// The file bar's 닫기: the 편집 tab with nothing open. A recording not saved yet stays among 저장하지 않은 녹화.
+void App::CloseClip() {
+    if (!clip_ || exporter_.Busy()) return;
+    PauseEditor();
+    StopThumbnails();
+    clip_.reset();
+    frameBmp_.Reset();
+    hasResult_ = resultOriginal_ = false;
+    RefreshRecent();
+    Invalidate();
 }
 
 const wchar_t* App::Activity() const {
@@ -1679,9 +1825,9 @@ const wchar_t* App::Activity() const {
     if (rec_ == RecState::Countdown) return L"녹화 카운트다운";
     if (exporter_.Busy()) return L"내보내기 중";
     switch (screen_) {
-        case Screen::Editor: return L"편집 화면";
+        case Screen::Editor: return clip_ ? L"편집 탭" : L"편집 탭 · 연 파일 없음";
         case Screen::Settings: return L"설정";
-        default: return L"홈";
+        default: return L"녹화 탭";
     }
 }
 
@@ -1706,14 +1852,15 @@ void App::ConfirmDiscard() {
              true, discard});
     else
         Ask({L"이 녹화를 버릴까요?",
-             held ? L"아직 저장하지 않아서 되돌릴 수 없습니다." : L"저장한 파일은 그대로 남습니다.", L"버리기", true,
-             discard});
+             ClipTitle() + L" · " + util::FormatClock(clip_->Seconds(), true) +
+                 (held ? L"\n버리면 되돌릴 수 없습니다." : L"\n저장한 파일은 그대로 남습니다."),
+             L"버리기", true, discard});
 }
 
 void App::DiscardRecording() {
     if (!CanDiscard()) return;
     const std::wstring path = clip_->SourcePath();
-    CloseEditor();
+    PauseEditor();
     StopThumbnails();
     if (!path.empty()) {
         // Nothing may hold the file: the readers went with the editor; a size estimate in flight gets a moment.
@@ -1721,7 +1868,6 @@ void App::DiscardRecording() {
         bool gone = testDeleteFiles_ ? DeleteFileW(path.c_str()) != 0 : util::MoveToRecycleBin(hwnd_, path);
         if (!gone) {
             AttachReaders();
-            screen_ = Screen::Editor;
             Toast(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.", true);
             Invalidate();
             return;
@@ -1734,6 +1880,7 @@ void App::DiscardRecording() {
     clip_.reset();
     frameBmp_.Reset();
     hasResult_ = resultOriginal_ = false;
+    RefreshRecent();
     Toast(path.empty() ? L"녹화를 버렸습니다." : L"휴지통으로 옮겼습니다 · " + util::FileNameOf(path));
     Invalidate();
 }

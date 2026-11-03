@@ -92,6 +92,24 @@ void Painter::Stroke(const Rect& r, D2D1_COLOR_F c, float radius, float width) {
         rt_->DrawRectangle(r, Brush(c), width);
 }
 
+void Painter::StrokeDashed(const Rect& r, D2D1_COLOR_F c, float radius, float width, float dash, float gap) {
+    if (c.a <= 0) return;
+    const float d[2] = {dash / width, gap / width};
+    if (!dashStyle_ || dash_[0] != d[0] || dash_[1] != d[1]) {
+        ComPtr<ID2D1Factory> f;
+        rt_->GetFactory(&f);
+        dashStyle_.Reset();
+        D2D1_STROKE_STYLE_PROPERTIES p = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                                                                     D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.f,
+                                                                     D2D1_DASH_STYLE_CUSTOM, 0.f);
+        if (FAILED(f->CreateStrokeStyle(p, d, 2, &dashStyle_))) return Stroke(r, c, radius, width);
+        dash_[0] = d[0];
+        dash_[1] = d[1];
+    }
+    Painted(r.Inset(-width / 2));
+    rt_->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), Brush(c), width, dashStyle_.Get());
+}
+
 void Painter::Line(float x0, float y0, float x1, float y1, D2D1_COLOR_F c, float w) {
     Painted(Rect(std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::max(y0, y1)).Inset(-w / 2));
     rt_->DrawLine({x0, y0}, {x1, y1}, Brush(c), w);
