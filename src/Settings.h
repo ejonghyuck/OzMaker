@@ -41,7 +41,10 @@ inline constexpr size_t kMaxRecent = 12;
 // MP4 recording
 inline constexpr int kVideoFpsOptions[] = {24, 30, 60};
 inline constexpr int kVideoResOptions[] = {0, 2160, 1440, 1080, 720};       // short edge of the 16:9 box, 0 = original
-inline constexpr int kVideoBitrateOptions[] = {0, 6, 10, 16, 25, 40, 60};   // Mbps, 0 = automatic
+// Mbps, 0 = automatic, -1 = 직접 입력 (#53: Settings::vBitrateKbps)
+inline constexpr int kVideoBitrateOptions[] = {0, 6, 10, 16, 25, 40, 60, -1};
+inline constexpr int kVideoBitrateCustom = 7;
+inline constexpr int kVideoBitrateMinKbps = 500, kVideoBitrateMaxKbps = 150000;  // 0.5 – 150 Mbps
 inline constexpr int kKeyframeOptions[] = {1, 2, 5};                        // seconds
 inline constexpr int kPresetOptions[] = {0, 50, 100};                       // quality vs speed
 inline constexpr int kAudioBitrateOptions[] = {96, 128, 160, 192};          // kbps (AAC)
@@ -109,6 +112,7 @@ struct Settings {
     int vFpsIdx = 2;
     int vResIdx = 0;
     int vBitrateIdx = 0;
+    int vBitrateKbps = 20000;  // what 직접 입력 holds, in steps of 100 kbps (a tenth of a Mbps)
     int vRateCtrl = 0;  // 0 = VBR, 1 = CBR
     int vKeyIdx = 1;
     int vPresetIdx = 1;
@@ -121,8 +125,9 @@ struct Settings {
     bool micMonitor = true;  // 마이크 확인 plays the mic back while it runs
 
     // export
-    int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 is picked per clip
+    int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 and WebM are picked per clip
     int quality[3] = {85, 80, 60};      // per 움짤 format
+    int webmQuality = 70;               // WebM (#40): VP9's constant quality, unless 용량 맞추기 sets a bitrate
     int gifLossy = 1;                   // GIF lossy compression: 0 off, 1 light, 2 strong
     int scaleIdx = 0;  // kExportSizes
     int outFpsIdx = 0;
@@ -139,6 +144,13 @@ struct Settings {
     };
     bool exportVideo = false;
     ExportKnobs stashed{0, 0, 0};  // MP4 starts at 고화질: a video cut at full size isn't encoded again
+    // An opened 움짤 file (#41) starts at 고화질 and doesn't change what 움짤 recordings use: while it is in the editor,
+    // the recordings' 움짤 화질 waits here, and Save writes that.
+    struct AnimKnobs {
+        ExportKnobs knobs;
+        int gifLossy;
+    };
+    std::optional<AnimKnobs> recordingAnim;
     bool exportDetails = false;  // the export panel's 자세히 설정 is open
     int directionIdx = 0;        // 움짤: 0 그대로, 1 거꾸로, 2 부메랑
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
@@ -156,6 +168,9 @@ struct Settings {
     void ApplyPreset(int i, bool video);
     // Makes exportPreset, scaleIdx and outFpsIdx those of 움짤 or of MP4.
     void UseExportKind(bool video);
+    // An opened 움짤 file's own 화질, from 고화질 (the recordings' set aside in recordingAnim), and back.
+    void UseFileKnobs();
+    void UseRecordingKnobs();
     // The preset the size and frame rate (and for GIF the lossy level) match, -1 if none.
     int MatchPreset(bool video, bool gif) const;
 
@@ -170,5 +185,10 @@ struct Settings {
     int CountdownSeconds() const { return countdown == 1 ? 3 : countdown == 2 ? 5 : 0; }
     int TimerMinutes() const {  // 0 = off
         return timerIdx == kTimerCustom ? std::clamp(timerMinutes, 1, kTimerMaxMinutes) : kTimerOptions[timerIdx];
+    }
+    UINT32 VideoBitrate() const {  // bits per second, 0 = 자동
+        return vBitrateIdx == kVideoBitrateCustom
+                   ? (UINT32)std::clamp(vBitrateKbps, kVideoBitrateMinKbps, kVideoBitrateMaxKbps) * 1000u
+                   : (UINT32)kVideoBitrateOptions[vBitrateIdx] * 1'000'000u;
     }
 };

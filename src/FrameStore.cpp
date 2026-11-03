@@ -66,30 +66,37 @@ void FrameStore::Journal(const JournalRecord& r) {
     if (WriteFile(journal_, &r, sizeof(r), &written, &ov) && written == sizeof(r)) journalOffset_ += sizeof(r);
 }
 
-bool FrameStore::Open(int width, int height, std::wstring& err) {
+bool FrameStore::Open(int width, int height, std::wstring& err, bool journal) {
     width_ = width;
     height_ = height;
     frameBytes_ = (size_t)width * height * 4;
 
     path_ = util::Format(L"%s\\OzMaker_%lu_%llu.frames", Dir().c_str(), GetCurrentProcessId(),
                          (unsigned long long)util::Qpc100ns());
+    // Without a journal nothing could take the file back: it goes when its handle does, even in a crash.
     file_ = CreateFileW(path_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-    journal_ = CreateFileW(JournalPath(path_).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-    JournalHeader hdr{};
-    memcpy(hdr.magic, kMagic, 4);
-    hdr.version = kVersion;
-    hdr.width = width;
-    hdr.height = height;
-    hdr.keyInterval = (uint32_t)kKeyInterval;
-    DWORD written = 0;
-    if (file_ == INVALID_HANDLE_VALUE || journal_ == INVALID_HANDLE_VALUE ||
-        !WriteFile(journal_, &hdr, sizeof(hdr), &written, nullptr) || written != sizeof(hdr)) {
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | (journal ? 0 : FILE_FLAG_DELETE_ON_CLOSE), nullptr);
+    if (file_ == INVALID_HANDLE_VALUE) {
         err = tr(L"임시 파일을 만들 수 없습니다.");
-        return false;  // the destructor closes and deletes what was made
+        return false;
     }
-    journalOffset_ = sizeof(hdr);
+    if (journal) {
+        journal_ = CreateFileW(JournalPath(path_).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        JournalHeader hdr{};
+        memcpy(hdr.magic, kMagic, 4);
+        hdr.version = kVersion;
+        hdr.width = width;
+        hdr.height = height;
+        hdr.keyInterval = (uint32_t)kKeyInterval;
+        DWORD written = 0;
+        if (journal_ == INVALID_HANDLE_VALUE || !WriteFile(journal_, &hdr, sizeof(hdr), &written, nullptr) ||
+            written != sizeof(hdr)) {
+            err = tr(L"임시 파일을 만들 수 없습니다.");
+            return false;  // the destructor closes and deletes what was made
+        }
+        journalOffset_ = sizeof(hdr);
+    }
     // Bound queued (uncompressed) frames to ~768 MB so a slow disk can't balloon memory.
     maxInflight_ = std::clamp<size_t>((768ull << 20) / std::max<size_t>(frameBytes_, 1), 4, 240);
     unsigned hw = std::max(1u, std::thread::hardware_concurrency());
@@ -114,9 +121,10 @@ std::shared_ptr<FrameStore::Buffer> FrameStore::Acquire() {
     });
 }
 
-bool FrameStore::Submit(std::shared_ptr<Buffer> frame, int64_t ts) {
+bool FrameStore::Submit(std::shared_ptr<Buffer> frame, int64_t ts, bool wait) {
     {
-        std::lock_guard lk(mtx_);
+        std::unique_lock lk(mtx_);
+        if (wait) room_.wait(lk, [&] { return stopping_ || inflight_ < maxInflight_; });
         if (stopping_ || WriteFailed()) return false;
         if (inflight_ >= maxInflight_) {
             ++dropped_;
@@ -144,6 +152,7 @@ void FrameStore::Finish(int64_t endTs) {
         stopping_ = true;
     }
     cv_.notify_all();
+    room_.notify_all();
     for (auto& t : workers_) t.join();
     workers_.clear();
     last_.reset();
@@ -310,6 +319,7 @@ void FrameStore::Worker() {
         e.size = (uint32_t)size;
         e.raw = raw;
         --inflight_;
+        room_.notify_one();
         if (job.seq < firstBad_.load()) {
             JournalRecord r;
             r.type = kRecFrame;

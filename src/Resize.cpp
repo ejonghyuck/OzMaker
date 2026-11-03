@@ -28,8 +28,41 @@ void AreaResizer::Build(Taps& t, int srcLen, int dstLen) {
     }
 }
 
+// N = 3: colour only, alpha comes out 255. N = 4: premultiplied BGRA, alpha averaged with the rest.
+template <int N>
+void AreaResizer::Resample(const uint8_t* src, int srcStride, int cx, int cy, int ch, uint8_t* dst, int dw, int dh) {
+    tmp_.resize((size_t)ch * dw * N);
+    for (int y = 0; y < ch; ++y) {
+        const uint8_t* row = src + (size_t)(cy + y) * srcStride + (size_t)cx * 4;
+        float* out = tmp_.data() + (size_t)y * dw * N;
+        for (int x = 0; x < dw; ++x) {
+            const float* w = h_.w.data() + h_.off[x];
+            const uint8_t* p = row + (size_t)h_.start[x] * 4;
+            float sum[N] = {};
+            for (int k = 0; k < h_.count[x]; ++k, p += 4)
+                for (int c = 0; c < N; ++c) sum[c] += p[c] * w[k];
+            for (int c = 0; c < N; ++c) out[x * N + c] = sum[c];
+        }
+    }
+    std::vector<float> acc((size_t)dw * N);
+    for (int y = 0; y < dh; ++y) {
+        std::fill(acc.begin(), acc.end(), 0.f);
+        const float* w = v_.w.data() + v_.off[y];
+        for (int k = 0; k < v_.count[y]; ++k) {
+            const float* row = tmp_.data() + (size_t)(v_.start[y] + k) * dw * N;
+            float wk = w[k];
+            for (int i = 0; i < dw * N; ++i) acc[i] += row[i] * wk;
+        }
+        uint8_t* out = dst + (size_t)y * dw * 4;
+        for (int x = 0; x < dw; ++x) {
+            for (int c = 0; c < N; ++c) out[x * 4 + c] = (uint8_t)std::clamp(acc[x * N + c] + 0.5f, 0.f, 255.f);
+            if (N == 3) out[x * 4 + 3] = 255;
+        }
+    }
+}
+
 void AreaResizer::Run(const uint8_t* src, int srcStride, int cx, int cy, int cw, int ch, uint8_t* dst, int dw,
-                      int dh) {
+                      int dh, bool alpha) {
     if (cw == dw && ch == dh) {
         for (int y = 0; y < dh; ++y) memcpy(dst + (size_t)y * dw * 4, src + (size_t)(cy + y) * srcStride + cx * 4,
                                             (size_t)dw * 4);
@@ -43,39 +76,8 @@ void AreaResizer::Run(const uint8_t* src, int srcStride, int cx, int cy, int cw,
         key_[2] = dw;
         key_[3] = dh;
     }
-    tmp_.resize((size_t)ch * dw * 3);
-    for (int y = 0; y < ch; ++y) {
-        const uint8_t* row = src + (size_t)(cy + y) * srcStride + (size_t)cx * 4;
-        float* out = tmp_.data() + (size_t)y * dw * 3;
-        for (int x = 0; x < dw; ++x) {
-            const float* w = h_.w.data() + h_.off[x];
-            const uint8_t* p = row + (size_t)h_.start[x] * 4;
-            float b = 0, g = 0, r = 0;
-            for (int k = 0; k < h_.count[x]; ++k, p += 4) {
-                b += p[0] * w[k];
-                g += p[1] * w[k];
-                r += p[2] * w[k];
-            }
-            out[x * 3 + 0] = b;
-            out[x * 3 + 1] = g;
-            out[x * 3 + 2] = r;
-        }
-    }
-    std::vector<float> acc((size_t)dw * 3);
-    for (int y = 0; y < dh; ++y) {
-        std::fill(acc.begin(), acc.end(), 0.f);
-        const float* w = v_.w.data() + v_.off[y];
-        for (int k = 0; k < v_.count[y]; ++k) {
-            const float* row = tmp_.data() + (size_t)(v_.start[y] + k) * dw * 3;
-            float wk = w[k];
-            for (int i = 0; i < dw * 3; ++i) acc[i] += row[i] * wk;
-        }
-        uint8_t* out = dst + (size_t)y * dw * 4;
-        for (int x = 0; x < dw; ++x) {
-            out[x * 4 + 0] = (uint8_t)std::clamp(acc[x * 3 + 0] + 0.5f, 0.f, 255.f);
-            out[x * 4 + 1] = (uint8_t)std::clamp(acc[x * 3 + 1] + 0.5f, 0.f, 255.f);
-            out[x * 4 + 2] = (uint8_t)std::clamp(acc[x * 3 + 2] + 0.5f, 0.f, 255.f);
-            out[x * 4 + 3] = 255;
-        }
-    }
+    if (alpha)
+        Resample<4>(src, srcStride, cx, cy, ch, dst, dw, dh);
+    else
+        Resample<3>(src, srcStride, cx, cy, ch, dst, dw, dh);
 }

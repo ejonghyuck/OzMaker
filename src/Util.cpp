@@ -128,7 +128,7 @@ bool IsVideoPath(const std::wstring& path) {
 
 bool IsAnimPath(const std::wstring& path) {
     const std::wstring ext = LowerExt(path);
-    return ext == L".gif" || ext == L".webp" || ext == L".avif" || ext == L".png" || ext == L".apng";
+    return ext == L".gif" || ext == L".webp" || ext == L".avif";
 }
 
 uint64_t FileSize(const std::wstring& path) {
@@ -255,8 +255,11 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out) {
 bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
     ComPtr<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
-    COMDLG_FILTERSPEC filters[] = {{tr(L"동영상"), L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts"},
-                                   {tr(L"모든 파일"), L"*.*"}};
+    COMDLG_FILTERSPEC filters[] = {
+        {tr(L"동영상 · 움짤"), L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts;*.gif;*.webp;*.avif"},
+        {tr(L"동영상"), L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.3gp;*.ts;*.mts;*.m2ts"},
+        {tr(L"움짤 (GIF · WebP · AVIF)"), L"*.gif;*.webp;*.avif"},
+        {tr(L"모든 파일"), L"*.*"}};
     dlg->SetFileTypes(_countof(filters), filters);
     DWORD opts = 0;
     dlg->GetOptions(&opts);

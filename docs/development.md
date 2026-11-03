@@ -23,6 +23,8 @@
 | 번역 | 화면의 글은 한국어 원문을 그대로 `tr(L"...")`로 감싸고, 영어는 `src/Lang.cpp`의 표에서 원문으로 찾음(없으면 한국어 그대로). 배열에 든 글은 쓰는 자리에서 `tr()`. printf 서식 문자열은 영어도 같은 필드를 같은 순서로 씀. settings.ini에 저장되는 값(`{날짜}` 같은 파일 이름 형식)은 감싸지 않음 |
 | GIF | 자체 인코더: 바뀐 픽셀만 다시 인코딩(투명 + 영역 크롭). 바뀐 것으로 치는 문턱을 화면의 노이즈 정도에 맞춰 올려서 그레인이 있는 배경이 반짝이지 않음. Wu 양자화 + k-means 보정 팔레트를 만들되 앞 프레임의 팔레트로 충분하면 그대로 씀. 바뀐 영역에만 Floyd–Steinberg 디더링. 손실 압축(gifsicle `--lossy`와 같은 방식)은 LZW 문자열을 비슷한 색까지 이어 붙여 용량을 줄임. 누적 반올림으로 정확한 재생 시간 |
 | WebP / AVIF | libwebp(WebPAnimEncoder, 색 경계가 번지지 않게 sharp YUV) / libavif + aom(품질 90 이상이면 색을 줄이지 않는 4:4:4). vcpkg가 있을 때만 빌드에 포함됩니다 |
+| WebM | `src/WebmWriter.cpp`: libvpx VP9(CPU, `cpu-used` 5, 행 단위 멀티스레드, 화면 내용 튜닝, 품질 → CQ 4–63, 용량 맞추기는 VBR) + Opus(48 kHz, 20 ms. 44.1 kHz는 윈도 sinc로 바꿈) → libwebm(mkvmuxer)으로 파일에 씀(탐색용 큐 포함). 소리 패킷은 시각 순서대로 영상 사이에 넣고, 마지막 패킷의 남는 부분은 DiscardPadding으로 표시. 색은 libyuv BT.601 제한 범위 |
+| 움짤 열기 | `src/AnimClip.cpp`: GIF는 WIC로 읽고 처리 방식(disposal)을 직접 합성, WebP는 WebPAnimDecoder, AVIF는 libavif. 프레임은 미리 곱한 알파의 BGRA로 임시 저장(기록 없이, 닫으면 지워지는 파일)에 넣고, 내보낼 때 축소 · 자막도 알파를 지킴. 움짤 형식은 알파를 되돌려 쓰고, MP4 · WebM은 흰 바탕에 합성 |
 | 업데이트 | 시작할 때와 하루 한 번 GitHub 최신 릴리스의 `update.txt`(버전 · 크기 · SHA-256)를 WinHTTP로 읽고, 새 버전이면 exe를 옆에 `OzMaker.exe.new`로 받아 검증해 둠. 누르면 실행 중인 exe를 `.old`로 이름 바꾸고 새 exe를 넣은 뒤 다시 시작(쓰기 권한이 없는 폴더면 릴리스 페이지를 엶) |
 | 충돌 기록 | 처리하지 못한 예외 · abort · CRT 오류가 나면 작은 미니덤프(스레드와 스택만, 화면 내용 없음)와 짧은 로그를 설정 파일이 있는 폴더의 `crash`에 남기고 Windows 오류 창 없이 끝냄. 아무 데도 보내지 않고 다음 실행 때 한 번 알림(설정 › 정보 › 충돌 기록, 최근 5개만 남김). 덤프는 그 릴리스의 `OzMaker-<버전>-pdb.zip`으로 읽음 |
 
@@ -36,16 +38,16 @@ msbuild OzMaker.vcxproj /p:Configuration=Release /p:Platform=x64
 
 결과물: `bin\Release\OzMaker.exe` (런타임 정적 링크, 단일 실행 파일). MP4와 소리 녹음은 Windows에 들어 있는 Media Foundation·WASAPI만 쓰므로 추가 라이브러리가 필요 없습니다.
 
-### WebP / AVIF 포함하기
+### WebP / AVIF / WebM 포함하기
 
-`..\vcpkg`(또는 `VCPKG_ROOT`)에 부트스트랩된 vcpkg가 있으면 `vcpkg.json`의 라이브러리를 자동으로 받아 함께 빌드합니다. 첫 빌드는 aom(AV1 인코더) 컴파일 때문에 오래 걸립니다.
+`..\vcpkg`(또는 `VCPKG_ROOT`)에 부트스트랩된 vcpkg가 있으면 `vcpkg.json`의 라이브러리(libwebp, libavif + aom, libvpx, Opus, libwebm)를 자동으로 받아 함께 빌드합니다. 첫 빌드는 aom(AV1 인코더)과 libvpx 컴파일 때문에 오래 걸립니다.
 
 ```bash
 git clone https://github.com/microsoft/vcpkg ../vcpkg
 ../vcpkg/bootstrap-vcpkg.bat -disableMetrics
 ```
 
-vcpkg가 없으면 GIF와 MP4만 들어간 빌드가 만들어지고, WebP·AVIF 버튼은 비활성화됩니다. `/p:OzNoVcpkg=true`로 강제로 끌 수도 있습니다. 함께 들어가는 라이브러리는 모두 BSD 계열이며 [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)에 정리되어 있습니다.
+vcpkg가 없으면 GIF와 MP4만 들어간 빌드가 만들어지고, WebP·AVIF·WebM 버튼은 비활성화되며 WebP·AVIF 파일은 열 수 없습니다. `/p:OzNoVcpkg=true`로 강제로 끌 수도 있습니다. 함께 들어가는 라이브러리는 모두 BSD 계열이며 [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)에 정리되어 있습니다.
 
 ## 배포용 zip 만들기
 
@@ -62,7 +64,7 @@ Release로 빌드한 뒤 `dist\OzMaker-<버전>-win-x64.zip`을 만듭니다. �
 ## 테스트용 명령줄
 
 ```bash
-OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + 모든 인코더 검사
+OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + 모든 인코더 검사(WebM은 libwebm · libvpx · Opus로 다시 읽어 프레임 · 소리 확인)
 OzMaker.exe --screenshot <dir> [light|contrast|en]   # 각 화면을 PNG로 렌더링(창 미리보기 자리는 파란색), 레이어 오류나 이름 없는 단추가 있으면 실패
                                       # light · contrast · en: 라이트 테마 · 대비 테마 · 영어로. en은 영어가 없는 글이 있어도 실패
 OzMaker.exe --readme-media <dir>      # README 그림(hero.gif와 기능 PNG 4장)을 화면 밖에서 그려 저장(아래 참고)
@@ -70,7 +72,7 @@ OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|mo
                                       # mic: 기본 마이크를 섞어 녹음(방 소리가 녹음되므로 직접 실행할 때만)
                                       # click: 가짜 클릭 하나를 넣고 프레임에 클릭 강조가 보이는지 확인
 OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간격·테스트 톤 크기 측정
-OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계) 검사
+OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계, MP4와 WebM) 검사
 OzMaker.exe --encoder-test <dir>      # 녹화용 MP4를 HEVC · CBR · 2474×1392 등 설정마다 1초씩 써 보고, 고른 인코더와 실패한 호출을 기록
 OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드 → 잘라서 저장
 OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드), 막대(카운트다운·영역만 저장·녹화), 직전 영역

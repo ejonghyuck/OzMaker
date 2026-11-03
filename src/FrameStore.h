@@ -18,7 +18,8 @@ public:
     FrameStore(const FrameStore&) = delete;
     FrameStore& operator=(const FrameStore&) = delete;
 
-    bool Open(int width, int height, std::wstring& err);
+    // journal = false: frames decoded from a file (#41), which a crash need not leave behind.
+    bool Open(int width, int height, std::wstring& err, bool journal = true);
 
     // Where recordings live: %TEMP%\OzMaker, or next to the scratch settings in a test run.
     static std::wstring Dir();
@@ -31,7 +32,8 @@ public:
     const std::wstring& Path() const { return path_; }
     // Writer side (capture thread). Acquire a frame buffer, fill it with tightly packed BGRA, submit it.
     std::shared_ptr<Buffer> Acquire();
-    bool Submit(std::shared_ptr<Buffer> frame, int64_t ts100ns);
+    // wait: while the workers are behind, wait for them instead of dropping the frame (a file, not a live picture).
+    bool Submit(std::shared_ptr<Buffer> frame, int64_t ts100ns, bool wait = false);
     void Finish(int64_t endTs100ns);
 
     int Width() const override { return width_; }
@@ -100,6 +102,7 @@ private:
 
     mutable std::mutex mtx_;
     std::condition_variable cv_;
+    std::condition_variable room_;  // a worker finished a frame
     std::deque<Job> jobs_;
     std::vector<Entry> entries_;
     std::vector<std::thread> workers_;

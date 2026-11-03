@@ -8,8 +8,8 @@ public:
     virtual const uint8_t* Get(size_t index) = 0;
 };
 
-// Timestamped frames the editor and the exporter work on: a fresh recording (FrameStore) or an MP4 file
-// (VideoClip). Timestamps are 100 ns units from the first frame.
+// Timestamped frames the editor and the exporter work on: a fresh recording (FrameStore), an MP4 file (VideoClip) or
+// a 움짤 file (AnimClip). Timestamps are 100 ns units from the first frame.
 class Clip {
 public:
     virtual ~Clip() = default;
@@ -24,6 +24,10 @@ public:
     virtual bool HasAudio() const { return false; }
     // File the frames come from; empty for a recording that only lives in the temp store.
     virtual std::wstring SourcePath() const { return {}; }
+    // A video file: it stays a video (MP4) unless another format is picked, and can be cut without encoding.
+    virtual bool IsVideo() const { return false; }
+    // Some pixels are transparent (an opened 움짤): the frames are premultiplied BGRA. Others are opaque.
+    virtual bool HasAlpha() const { return false; }
 
     double Seconds() const { return EndTs() / 1e7; }
     // Index of the frame visible at time t.

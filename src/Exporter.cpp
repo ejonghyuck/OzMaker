@@ -5,6 +5,7 @@
 #include "Resize.h"
 #include "Util.h"
 #include "VideoClip.h"
+#include "WebmWriter.h"
 
 std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, double fpsLimit, double speed,
                                      int direction) {
@@ -60,10 +61,87 @@ std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, do
     return out;
 }
 
+// An opened 움짤's frames are premultiplied (#41): the 움짤 formats take them back to straight alpha, and a video,
+// which has none, shows them over white.
+static void FinishAlpha(uint8_t* bgra, size_t pixels, bool video) {
+    for (size_t i = 0; i < pixels; ++i, bgra += 4) {
+        const unsigned a = bgra[3];
+        if (a == 255) continue;
+        for (int c = 0; c < 3; ++c)
+            bgra[c] = (uint8_t)std::min(255u, video ? bgra[c] + 255 - a : a ? (bgra[c] * 255 + a / 2) / a : 0);
+        if (video) bgra[3] = 255;
+    }
+}
+
 // ---------------------------------------------------------------- size estimate
 
+// WebM by quality: like the 움짤 formats, a few short stretches encoded for real (no sound) and scaled up to the whole
+// length, plus the sound at its bitrate.
+static uint64_t EstimateWebm(const ExportJob& job, const std::atomic<bool>& cancel) {
+    const int fps = std::clamp((int)std::lround(job.fpsLimit > 0 ? job.fpsLimit : job.clip->AverageFps()), 1, 120);
+    const auto plan = PlanVideoFrames(*job.clip, job.first, job.last, fps, job.speed);
+    const size_t n = plan.size();
+    if (n == 0) return 0;
+    const int W = job.outW & ~1, H = job.outH & ~1;
+    wchar_t dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    const std::wstring path =
+        util::Format(L"%sOzMaker_estimate_%u_%u.webm", dir, GetCurrentProcessId(), GetCurrentThreadId());
+    auto reader = job.clip->NewReader();
+    AreaResizer resizer;
+    std::vector<uint8_t> frame((size_t)W * H * 4);
+    caption::Overlay cap;
+    cap.Make(job.caption, job.captionPos, W, H);
+    const int cx = job.crop.left, cy = job.crop.top;
+    const int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
+    auto encode = [&](size_t a, size_t b) -> uint64_t {
+        WebmWriter w;
+        WebmWriter::Config c;
+        c.width = W;
+        c.height = H;
+        c.fps = fps;
+        c.quality = job.quality;
+        std::wstring err;
+        if (!w.Open(path, c, err)) return 0;
+        bool ok = true;
+        for (size_t k = a; k < b && ok; ++k) {
+            const uint8_t* px = cancel ? nullptr : reader->Get(plan[k]);
+            if (!px) {
+                ok = false;
+                break;
+            }
+            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H, job.clip->HasAlpha());
+            cap.Blend(frame.data());
+            if (job.clip->HasAlpha()) FinishAlpha(frame.data(), (size_t)W * H, true);
+            ok = w.AddVideo(frame.data(), err);
+        }
+        if (ok) ok = w.Finish(err);
+        else w.Abort();
+        const uint64_t size = ok ? util::FileSize(path) : 0;
+        DeleteFileW(path.c_str());
+        return size;
+    };
+    const uint64_t audio = job.audio.enabled ? (uint64_t)(job.audio.bitrate * (n / (double)fps) / 8) : 0;
+    const size_t win = 6;
+    if (n <= win * 3) {
+        const uint64_t all = encode(0, n);
+        return all ? all + audio : 0;
+    }
+    const size_t starts[] = {0, n / 2 - win / 2, n - win};
+    uint64_t head = 0;
+    double perFrame = 0;
+    for (int w = 0; w < 3; ++w) {
+        const uint64_t one = encode(starts[w], starts[w] + 1), all = one ? encode(starts[w], starts[w] + win) : 0;
+        if (!one || !all) return 0;
+        if (w == 0) head = one;
+        perFrame += (double)(all > one ? all - one : 0) / (win - 1) / 3;
+    }
+    return head + (uint64_t)(perFrame * (n - 1)) + audio;
+}
+
 uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
-    if (job.format == Format::Mp4) {
+    if (job.format == Format::WebM && !job.video.bitrate) return EstimateWebm(job, cancel);
+    if (IsVideoFormat(job.format)) {
         size_t n = PlanVideoFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed).size();
         double sec = job.fpsLimit > 0 ? n / job.fpsLimit : 0;
         double video = job.video.bitrate ? job.video.bitrate
@@ -95,6 +173,7 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
         p.quality = job.quality;
         p.plays = job.plays;
         p.lossy = job.lossy;
+        p.alpha = job.clip->HasAlpha();
         p.path = path;
         std::wstring err;
         if (!enc || !enc->Begin(p, err)) return 0;
@@ -105,8 +184,9 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
                 ok = false;
                 break;
             }
-            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
+            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH, p.alpha);
             cap.Blend(frame.data());
+            if (p.alpha) FinishAlpha(frame.data(), (size_t)job.outW * job.outH, false);
             ok = enc->Add(frame.data(), plan[k].durationMs, err);
         }
         ok = ok && enc->End(err);
@@ -234,9 +314,10 @@ void Exporter::Run(ExportJob job) {
     ExportResult res;
     res.path = job.path;
     std::wstring tmp = job.path + L".part";
-    bool ok = job.cut                     ? RunCut(job, tmp, res)
-              : job.format == Format::Mp4 ? RunMp4(job, tmp, res)
-                                          : RunImage(job, tmp, res);
+    bool ok = job.cut                      ? RunCut(job, tmp, res)
+              : job.format == Format::Mp4  ? RunMp4(job, tmp, res)
+              : job.format == Format::WebM ? RunWebm(job, tmp, res)
+                                           : RunImage(job, tmp, res);
     if (ok) {
         ok = MoveFileExW(tmp.c_str(), job.path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
         if (!ok) res.error = tr(L"파일을 저장할 수 없습니다: ") + job.path;
@@ -267,6 +348,7 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     p.quality = job.quality;
     p.plays = job.plays;
     p.lossy = job.lossy;
+    p.alpha = job.clip->HasAlpha();
     p.path = tmp;
     if (!enc->Begin(p, res.error)) return false;
     auto reader = job.clip->NewReader();
@@ -289,8 +371,9 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
             ok = false;
             break;
         }
-        resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
+        resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH, p.alpha);
         cap.Blend(frame.data());
+        if (p.alpha) FinishAlpha(frame.data(), (size_t)job.outW * job.outH, false);
         double ms = plan[k].durationMs + (k + 1 == plan.size() ? job.holdLastMs : 0);
         ok = enc->Add(frame.data(), ms, res.error);
         res.seconds += ms / 1000.0;
@@ -394,8 +477,10 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
                 w.Abort();
                 return false;
             }
-            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H);
+            const bool alpha = job.clip->HasAlpha();
+            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H, alpha);
             cap.Blend(frame.data());
+            if (alpha) FinishAlpha(frame.data(), (size_t)W * H, true);
             ctx->UpdateSubresource(tex.Get(), 0, nullptr, frame.data(), W * 4, 0);
             uploaded = plan[k];
         }
@@ -418,6 +503,85 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
         }
         if (!s || !w.WriteVideo(s.Get(), t0, t1 - t0)) {
             res.error = tr(L"동영상 인코더가 프레임을 받지 못했습니다.");
+            w.Abort();
+            return false;
+        }
+        progress_ = 0.98f * (float)(k + 1) / plan.size();
+    }
+    if (!w.Finish(res.error)) return false;
+    res.frames = (int)plan.size();
+    res.seconds = plan.size() / (double)fps;
+    return true;
+}
+
+// VP9 + Opus on the CPU (#40): the frames as for MP4 (a constant rate, cropped and scaled, the caption on), and the
+// clip's sound cut to the range.
+bool Exporter::RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResult& res) {
+    const double rate = job.fpsLimit > 0 ? job.fpsLimit : job.clip->AverageFps();
+    const int fps = std::clamp((int)std::lround(rate), 1, 120);
+    auto plan = PlanVideoFrames(*job.clip, job.first, job.last, fps, job.speed);
+    if (plan.empty()) {
+        res.error = tr(L"내보낼 프레임이 없습니다.");
+        return false;
+    }
+    const int W = job.outW & ~1, H = job.outH & ~1;
+    WebmWriter::Config c;
+    c.width = W;
+    c.height = H;
+    c.fps = fps;
+    c.quality = job.quality;
+    c.bitrate = job.video.bitrate;
+    VideoClip::AudioReader audio;
+    auto* vc = dynamic_cast<const VideoClip*>(job.clip.get());
+    c.audio = job.audio.enabled && vc && vc->HasAudio() && std::fabs(job.speed - 1.0) < 1e-6 &&
+              audio.Open(*vc, job.clip->Ts(job.first)) && (audio.Rate() == 44100 || audio.Rate() == 48000);
+    if (c.audio) {
+        c.sampleRate = audio.Rate();
+        c.audioBitrate = job.audio.bitrate;
+    }
+    WebmWriter w;
+    if (!w.Open(tmp, c, res.error)) return false;
+    res.audio = w.HasAudio();
+    auto reader = job.clip->NewReader();
+    AreaResizer resizer;
+    std::vector<uint8_t> frame((size_t)W * H * 4);
+    caption::Overlay cap;
+    cap.Make(job.caption, job.captionPos, W, H);
+    std::vector<int16_t> pcm;
+    int64_t audioPushed = 0;
+    const bool alpha = job.clip->HasAlpha();
+    const int cx = job.crop.left, cy = job.crop.top;
+    const int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
+    size_t made = SIZE_MAX;
+    for (size_t k = 0; k < plan.size(); ++k) {
+        if (cancel_) {
+            res.cancelled = true;
+            w.Abort();
+            return false;
+        }
+        if (plan[k] != made) {
+            const uint8_t* px = reader->Get(plan[k]);
+            if (!px) {
+                res.error = tr(L"영상 프레임을 읽을 수 없습니다.");
+                w.Abort();
+                return false;
+            }
+            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H, alpha);
+            cap.Blend(frame.data());
+            if (alpha) FinishAlpha(frame.data(), (size_t)W * H, true);
+            made = plan[k];
+        }
+        if (res.audio) {
+            const int64_t want = (int64_t)(k + 1) * c.sampleRate / fps;
+            if (want > audioPushed) {
+                const size_t n = (size_t)(want - audioPushed);
+                pcm.resize(n * 2);
+                audio.Read(pcm.data(), n);
+                w.PushAudio(pcm.data(), n);
+                audioPushed = want;
+            }
+        }
+        if (!w.AddVideo(frame.data(), res.error)) {
             w.Abort();
             return false;
         }

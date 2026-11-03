@@ -19,6 +19,7 @@ public:
     bool SlowSeek() const override { return true; }
     bool HasAudio() const override { return audioRate_ > 0; }
     std::wstring SourcePath() const override { return path_; }
+    bool IsVideo() const override { return true; }
     size_t QuickIndexNear(int64_t t, int64_t tolerance) const override;
 
     // Last keyframe at or before frame i: decoding frame i has to start there.
@@ -32,7 +33,8 @@ public:
     int Rotation() const { return rotation_; }
     int CodedWidth() const { return rotation_ % 180 ? height_ : width_; }
     int CodedHeight() const { return rotation_ % 180 ? width_ : height_; }
-    // The MP4 writer's AAC encoder takes only these rates; other sound can't be carried into an export.
+    // The MP4 writer's AAC encoder takes only these rates (WebM resamples 44.1 kHz for Opus); other sound can't be
+    // carried into an export.
     bool AudioExportable() const { return audioRate_ == 44100 || audioRate_ == 48000; }
     // Device for hardware decoding shared by the readers; null when there is none.
     IMFDXGIDeviceManager* DeviceManager() const;

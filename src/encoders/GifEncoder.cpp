@@ -6,7 +6,9 @@
 //    disposal = "keep"), cropped to the changed bounding box;
 //  - each frame gets its own local palette (Wu quantizer + k-means refinement) built from the changed
 //    pixels only, so small animated regions get very accurate colors;
-//  - serpentine Floyd–Steinberg dithering limited to changed pixels to avoid temporal shimmer.
+//  - serpentine Floyd–Steinberg dithering limited to changed pixels to avoid temporal shimmer;
+//  - with alpha (an opened 움짤, #41), pixels below half opaque are transparent. A frame covers every opaque pixel, so
+//    where one must go transparent again, the frame before is cleared once shown (disposal 2) and this one drawn whole.
 
 namespace {
 
@@ -410,6 +412,8 @@ public:
         ref_.assign(n * 3, 0);
         comp_.assign(n * 3, 0);
         changed_.assign(n, 0);
+        alpha_ = p.alpha;
+        shownT_.assign(alpha_ ? n : 0, 1);
         cache_.assign(1 << 18, 0xFFFF);
 
         uint8_t hdr[13] = {'G', 'I', 'F', '8', '9', 'a', (uint8_t)(w_ & 255), (uint8_t)(w_ >> 8),
@@ -450,15 +454,26 @@ public:
             while (p25 < 255 && (seen += hist[p25]) < quarter) ++p25;
             threshold = std::clamp(p25 * 2, threshold_, threshold_ + 10);
         }
+        // A pixel going transparent while the screen still shows a colour there: the frame before goes once shown.
+        bool clear = false;
+        if (alpha_) {
+            for (size_t p = 0, n = (size_t)w_ * h_; p < n && !clear; ++p) clear = !shownT_[p] && bgra[p * 4 + 3] < 128;
+            if (clear) {
+                if (hasPending_) pending_[3] = (uint8_t)((pending_[3] & 0xE3) | (2 << 2));
+                std::fill(shownT_.begin(), shownT_.end(), 1);
+            }
+        }
         int x0 = w_, y0 = h_, x1 = -1, y1 = -1;
         size_t nChanged = 0;
         for (int y = 0; y < h_; ++y) {
             uint8_t* c = changed_.data() + (size_t)y * w_;
-            for (int x = 0; x < w_; ++x) {
-                const bool ch = first_ || c[x] > threshold;
+            const uint8_t* s = bgra + (size_t)y * w_ * 4;
+            for (int x = 0; x < w_; ++x, s += 4) {
+                const bool clearPx = alpha_ && s[3] < 128;
+                const bool ch = !clearPx && (first_ || c[x] > threshold || (alpha_ && shownT_[(size_t)y * w_ + x]));
                 c[x] = ch;
-                if (ch) {
-                    ++nChanged;
+                nChanged += ch;
+                if (alpha_ ? !clearPx : ch) {  // with alpha the frame spans every opaque pixel
                     x0 = std::min(x0, x);
                     x1 = std::max(x1, x);
                     y0 = std::min(y0, y);
@@ -466,7 +481,8 @@ public:
                 }
             }
         }
-        if (nChanged == 0) return true;  // identical: previous frame simply stays longer
+        if (nChanged == 0 && !clear && !first_) return true;  // identical: previous frame simply stays longer
+        if (x1 < 0) x0 = y0 = x1 = y1 = 0;  // all transparent: one pixel carries the time
 
         FlushPending(start);
         pendingStartMs_ = start;
@@ -510,6 +526,13 @@ private:
     // keeps its entry from frame to frame, pixels that didn't really change come out the same (and transparent), and
     // the dithering pattern stays put instead of shimmering.
     void ChoosePalette(const uint8_t* bgra, int x0, int y0, int x1, int y1, size_t nChanged) {
+        if (nChanged == 0) {  // nothing to draw (all transparent): any palette does
+            if (palN_ == 0) {
+                pal_[palN_++] = {0, 0, 0};
+                std::fill(cache_.begin(), cache_.end(), 0xFFFF);
+            }
+            return;
+        }
         wu_.Reset();
         size_t step = std::max<size_t>(1, nChanged / 50000);
         samples_.clear();
@@ -570,7 +593,7 @@ private:
     }
 
     void EncodeFrame(const uint8_t* bgra, int x0, int y0, int x1, int y1, size_t nChanged) {
-        const bool useTransparency = !first_;
+        const bool useTransparency = !first_ || alpha_;
         ChoosePalette(bgra, x0, y0, x1, y1, nChanged);
         const int tIdx = useTransparency ? palN_ : -1;
         bool usedT = false;
@@ -605,10 +628,12 @@ private:
                 int idx = Nearest((int)(fr + 0.5f), (int)(fg + 0.5f), (int)(fb + 0.5f));
                 const Rgb c = pal_[idx];
                 uint8_t* cp = comp_.data() + p * 3;
-                if (useTransparency && cp[0] == c.r && cp[1] == c.g && cp[2] == c.b) {
+                const bool shown = !alpha_ || !shownT_[p];
+                if (useTransparency && shown && cp[0] == c.r && cp[1] == c.g && cp[2] == c.b) {
                     out = (uint8_t)tIdx;  // already showing this color
                     usedT = true;
                 } else {
+                    if (alpha_) shownT_[p] = 0;
                     out = (uint8_t)idx;
                     cp[0] = c.r;
                     cp[1] = c.g;
@@ -701,6 +726,8 @@ private:
     int threshold_ = 0, maxColors_ = 255, lossyDist_ = 0;
     float dither_ = 0.85f;
     bool first_ = true;
+    bool alpha_ = false;
+    std::vector<uint8_t> shownT_;  // with alpha: the screen shows nothing at this pixel (it is transparent)
     double timeMs_ = 0, pendingStartMs_ = 0;
     int64_t emittedCs_ = 0;
 
