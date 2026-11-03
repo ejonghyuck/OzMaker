@@ -38,7 +38,9 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 
 Copy-Item -LiteralPath $exe -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
-Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $stage
+# A short notice read in Notepad (the manual lives in docs\guide.md). CRLF and a BOM so older Notepad reads Korean.
+$readme = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'zip-readme.txt') -Raw -Encoding UTF8).Replace('{version}', $version)
+[IO.File]::WriteAllText((Join-Path $stage 'README.txt'), ($readme -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding $true))
 Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.md') -Destination $stage
 
 # A vcpkg build links WebP/AVIF libraries statically; their licenses must travel with the exe.

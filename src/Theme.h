@@ -68,6 +68,7 @@ inline constexpr wchar_t ChevronDown = 0xE70D;
 inline constexpr wchar_t ChevronUp = 0xE70E;
 inline constexpr wchar_t Download = 0xE896;
 inline constexpr wchar_t Timer = 0xE916;  // stopwatch
+inline constexpr wchar_t Font = 0xE8D2;
 }  // namespace icon
 
 }  // namespace theme

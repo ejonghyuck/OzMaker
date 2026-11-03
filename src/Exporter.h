@@ -3,6 +3,10 @@
 #include "Mp4Writer.h"
 #include "encoders/Encoder.h"
 
+namespace mp4 {
+class CutSource;
+}
+
 struct ExportJob {
     std::shared_ptr<Clip> clip;
     size_t first = 0, last = 0;  // inclusive frame range
@@ -15,8 +19,13 @@ struct ExportJob {
     int plays = 0;               // 움짤: times it plays, 0 = forever
     int lossy = 0;               // GIF: lossy compression, 0 off, 1 light, 2 strong
     double holdLastMs = 0;       // 움짤: extra time on the last frame
+    int direction = 0;           // 움짤: 0 as recorded, 1 reversed, 2 boomerang (there and back)
+    std::wstring caption;        // one line over every frame (Caption.h), empty = none
+    int captionPos = 0;          // caption::Pos
     VideoConfig video;           // MP4: codec and bitrate; size and rate come from the fields above
     AudioConfig audio;           // MP4: enabled = keep the clip's sound (only at speed 1)
+    // MP4: copy frames first..last out of this (the clip's file) without encoding them again; encoded when that fails.
+    std::shared_ptr<const mp4::CutSource> cut;
     std::wstring path;
 };
 
@@ -33,8 +42,9 @@ struct PlannedFrame {
     size_t index;
     double durationMs;
 };
-// Frames to emit for a range after frame-rate limiting and speed change.
-std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, double fpsLimit, double speed);
+// Frames to emit for a range after frame-rate limiting and speed change, in the order of `direction` (ExportJob).
+std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, double fpsLimit, double speed,
+                                     int direction = 0);
 // MP4: the source frame shown at each tick of a constant output rate.
 std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, double fps, double speed);
 
@@ -86,6 +96,7 @@ private:
     void Run(ExportJob job);
     bool RunImage(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
     bool RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
+    bool RunCut(const ExportJob& job, const std::wstring& tmp, ExportResult& res);
 
     std::thread thread_;
     std::atomic<bool> cancel_{false}, busy_{false};

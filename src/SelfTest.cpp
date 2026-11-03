@@ -15,7 +15,9 @@
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
 #include "App.h"
+#include "Caption.h"
 #include "Crash.h"
+#include "Mp4Cut.h"
 #include "Mp4Unfragment.h"
 #include "Resize.h"
 #include "Util.h"
@@ -26,6 +28,8 @@ namespace {
 
 // Further down, with the other test helpers.
 double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, double f, int rate);
+double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double a, double b);
+std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double seconds, int& rate);
 bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
                   bool fragmented = false, bool crash = false);
 int ReadIndex(const uint8_t* p, int w, int h);
@@ -470,6 +474,130 @@ void DrawSynthetic(uint8_t* p, int w, int h, double t) {
         }
 }
 
+// The made-up game in the README pictures (--readme-media), drawn at 320×180 and scaled up by whole pixels. Flat
+// colours and a still background, with only the hero, the stars and the counter moving, keep GIF frames small. The
+// hero runs on the spot and jumps once a second for the star coming at it.
+constexpr int kDemoW = 320, kDemoH = 180;
+
+struct DemoCanvas {
+    int w, h;
+    std::vector<uint32_t> px;  // BGRA
+    DemoCanvas(int w, int h, uint32_t fill) : w(w), h(h), px((size_t)w * h, fill) {}
+    void Box(int x0, int y0, int x1, int y1, uint32_t c) {
+        x0 = std::max(x0, 0), y0 = std::max(y0, 0), x1 = std::min(x1, w), y1 = std::min(y1, h);
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) px[(size_t)y * w + x] = c;
+    }
+    // The top half of an ellipse standing on `base`: a hill.
+    void Hill(int cx, int base, int rx, int ry, uint32_t c) {
+        for (int y = base - ry; y < base; ++y) {
+            double dy = (base - y) / (double)ry;
+            int hw = (int)(rx * std::sqrt(std::max(0.0, 1 - dy * dy)));
+            Box(cx - hw, y, cx + hw, y + 1, c);
+        }
+    }
+    void Diamond(int cx, int cy, int r, uint32_t c) {
+        for (int dy = -r; dy <= r; ++dy) {
+            int hw = r - std::abs(dy);
+            Box(cx - hw, cy + dy, cx + hw + 1, cy + dy + 1, c);
+        }
+    }
+    // A 3×5 digit, s pixels to a dot.
+    void Digit(int x, int y, int d, int s, uint32_t c) {
+        static const uint16_t font[10] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7292, 0x7BEF, 0x7BCF};
+        for (int i = 0; i < 15; ++i)
+            if (font[d] >> (14 - i) & 1) Box(x + i % 3 * s, y + i / 3 * s, x + i % 3 * s + s, y + i / 3 * s + s, c);
+    }
+    // The hero: an orange block with one eye, 16×16 from its top left.
+    void Hero(int x, int y) {
+        const uint32_t body = 0xFFFF8A3D, shade = 0xFFE06A20, ink = 0xFF1D2433;
+        Box(x + 1, y, x + 15, y + 16, body);
+        Box(x, y + 1, x + 16, y + 15, body);
+        Box(x + 13, y + 2, x + 15, y + 15, shade);
+        Box(x + 2, y + 13, x + 15, y + 15, shade);
+        Box(x + 10, y + 4, x + 13, y + 9, ink);
+    }
+};
+
+std::vector<uint32_t> DemoFrame(double t) {
+    const uint32_t ink = 0xFF1D2433;
+    const int ground = 150;
+    DemoCanvas c(kDemoW, kDemoH, 0xFF4FB3E8);   // sky
+    c.Box(280, 14, 298, 32, 0xFFFFE27A);         // sun
+    const int clouds[2][2] = {{58, 36}, {196, 26}};
+    for (const auto& cl : clouds) {
+        c.Box(cl[0] - 22, cl[1] - 4, cl[0] + 22, cl[1] + 4, 0xFFF4FBFF);
+        c.Box(cl[0] - 12, cl[1] - 9, cl[0] + 10, cl[1] - 3, 0xFFF4FBFF);
+    }
+    c.Hill(250, ground, 86, 48, 0xFF5DB45C);
+    c.Hill(64, ground, 104, 38, 0xFF6CC36A);
+    c.Box(0, ground, kDemoW, ground + 5, 0xFF4FA54A);  // grass
+    c.Box(0, ground + 5, kDemoW, kDemoH, 0xFF8A5A3B);  // earth
+    for (int y = ground + 11; y < kDemoH; y += 10)
+        for (int x = y * 7 % 23; x < kDemoW; x += 23) c.Box(x, y, x + 4, y + 2, 0xFF7A4E33);
+
+    // A jump takes 0.6 s of every second; the star of jump k meets the hero at its top, at k + kMeet.
+    const int hx = 72, rise = 46, speed = 110;
+    const double kUp = 0.15, kLen = 0.6, kMeet = kUp + kLen / 2;
+    double v = (t - std::floor(t) - kUp) / kLen;
+    int lift = v > 0 && v < 1 ? (int)std::lround(rise * 4 * v * (1 - v)) : 0;
+    int hy = ground - 18 - lift;
+    const int starY = ground - 10 - rise;
+    int caught = t >= kMeet ? (int)std::floor(t - kMeet) + 1 : 0;
+    for (int k = caught; k < caught + 4; ++k) {
+        int sx = hx + 8 + (int)std::lround(speed * (k + kMeet - t));
+        c.Diamond(sx, starY, 5, 0xFFE0A800);
+        c.Diamond(sx, starY, 3, 0xFFFFD23F);
+    }
+    if (double since = t - (caught - 1 + kMeet); caught > 0 && since < 0.25) {
+        int d = 7 + (int)(since * 40);  // a sparkle where it was caught
+        const int dirs[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+        for (const auto& s : dirs) {
+            int x = hx + 8 + s[0] * d, y = starY + s[1] * d;
+            c.Box(x - 1, y - 1, x + 1, y + 1, 0xFFFFFFFF);
+        }
+    }
+    c.Hero(hx, hy);
+    if (!lift) {  // running: the feet take turns
+        bool step = (int)(t * 8) % 2;
+        c.Box(hx + (step ? 2 : 4), hy + 16, hx + (step ? 6 : 8), hy + 18, ink);
+        c.Box(hx + (step ? 10 : 8), hy + 16, hx + (step ? 14 : 12), hy + 18, ink);
+    } else {
+        c.Box(hx + 3, hy + 16, hx + 7, hy + 18, ink);
+        c.Box(hx + 9, hy + 16, hx + 13, hy + 18, ink);
+    }
+    // The star counter, top left.
+    c.Diamond(14, 14, 5, 0xFFE0A800);
+    c.Diamond(14, 14, 3, 0xFFFFD23F);
+    int n = 12 + caught;
+    for (int i = 0; i < 3; ++i) {
+        int d = n / (i == 0 ? 100 : i == 1 ? 10 : 1) % 10;
+        c.Digit(25 + i * 8 + 1, 9 + 1, d, 2, ink);
+        c.Digit(25 + i * 8, 9, d, 2, 0xFFFFFFFF);
+    }
+    return std::move(c.px);
+}
+
+// The scene scaled to w×h, nearest pixel.
+void DrawDemoScene(uint8_t* p, int w, int h, double t) {
+    auto src = DemoFrame(t);
+    auto* d = reinterpret_cast<uint32_t*>(p);
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* row = src.data() + (size_t)(y * kDemoH / h) * kDemoW;
+        for (int x = 0; x < w; ++x) d[(size_t)y * w + x] = row[x * kDemoW / w];
+    }
+}
+
+// The game's icon in the window list: the hero, 32×32, clear around it.
+std::vector<uint32_t> DemoIcon() {
+    DemoCanvas c(16, 16, 0);
+    c.Hero(0, 0);
+    std::vector<uint32_t> out(32 * 32);
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x) out[y * 32 + x] = c.px[y / 2 * 16 + x / 2];
+    return out;
+}
+
 bool SavePng(IWICImagingFactory* wic, const std::wstring& path, const uint8_t* bgra, int w, int h) {
     ComPtr<IWICBitmap> bmp;
     if (FAILED(wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGRA, w * 4, w * h * 4,
@@ -557,6 +685,17 @@ int App::RunSelfTest(const std::wstring& dir) {
     for (auto& p : plan2x) total2x += p.durationMs;
     log(util::Format(L"plan 2x capped at 50fps: %zu frames, %.1f ms", plan2x.size(), total2x));
     if (plan2x.size() < 73 || plan2x.size() > 77 || std::fabs(total2x - N * 500 / fps) > 1) ++failures;
+    // 재생 방향 (#22): backwards is the same frames the other way round; a boomerang goes there and back without
+    // either end twice in a row, so its loop runs on smoothly.
+    {
+        auto back = PlanFrames(*clip, 10, 19, 0, 1.0, 1), boom = PlanFrames(*clip, 10, 19, 0, 1.0, 2);
+        bool rev = back.size() == 10, there = boom.size() == 18;
+        for (size_t k = 0; rev && k < back.size(); ++k) rev = back[k].index == 19 - k;
+        for (size_t k = 0; there && k < boom.size(); ++k) there = boom[k].index == (k < 10 ? 10 + k : 28 - k);
+        log(util::Format(L"plan backwards / boomerang: %s %zu / %zu frames", rev && there ? L"ok" : L"FAIL",
+                         back.size(), boom.size()));
+        if (!rev || !there) ++failures;
+    }
 
     Exporter ex;
     for (int f = 0; f < (int)Format::Count; ++f) {
@@ -909,6 +1048,8 @@ int App::RunSelfTest(const std::wstring& dir) {
             bool ok = gifData && mp4Data;
             if (ok) ok = SUCCEEDED(target->DragEnter(gifData.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
                          dragKind_ == DragKind::Anim && effect == DROPEFFECT_NONE;
+            const std::wstring gifEnter = util::Format(L"data %d/%d, GIF kind %d effect %lu", !!gifData, !!mp4Data,
+                                                       (int)dragKind_, effect);
             frames(3);
             const bool gifShown = ui_.LayerErrors() == 0 &&
                                   std::any_of(ui_.Floats().begin(), ui_.Floats().end(),
@@ -928,8 +1069,9 @@ int App::RunSelfTest(const std::wstring& dir) {
             pendingOpen_.clear();  // an empty stand-in, not a video: nothing for WM_APP_OPEN to open
             good = ok && gifShown && left && clean && uncovered == 0 && dropped;
             log(util::Format(L"drag over the window: %s GIF refused with a cue %d, cue gone on leave %d, video cue over "
-                             L"the preview (%zu parts left) %d, the drop opens it afterwards %d",
-                             good ? L"ok" : L"FAIL", gifShown, left, uncovered, clean, dropped));
+                             L"the preview (%zu parts left) %d, the drop opens it afterwards %d%s",
+                             good ? L"ok" : L"FAIL", gifShown, left, uncovered, clean, dropped,
+                             good ? L"" : (L" (" + gifEnter + L")").c_str()));
             if (!good) ++failures;
             DeleteFileW(mp4.c_str());
             DeleteFileW(gif.c_str());
@@ -1136,6 +1278,146 @@ int App::RunSelfTest(const std::wstring& dir) {
                          ok ? L"ok  " : L"FAIL", away, back, closed, empty, reopened, asked, dropped));
         toastUntil_ = 0;
     }
+    // The preview plays the way the export goes (#22): 거꾸로 backwards, a boomerang turns at the end; J / L shuttle
+    // through the range at 1×, 2×, 4× and stop at its end, K stops, R gives back the whole clip.
+    {
+        auto pcheck = [&](bool ok, const std::wstring& what) {
+            if (!ok) ++failures;
+            log((ok ? L"preview: ok   " : L"preview: FAIL ") + what);
+        };
+        OpenEditor(MakeSyntheticClip(320, 180, 60, 30));
+        fmt_ = (int)Format::Gif;
+        settings_.speedIdx = 1;
+        settings_.loopIdx = 0;
+        settings_.directionIdx = 1;
+        SetPlaying(false);
+        Seek(30);
+        SetPlaying(true);
+        playWall_ -= 0.2;
+        size_t back = PlayheadFromClock();
+        pcheck(playBack_ && back >= 23 && back <= 25, util::Format(L"거꾸로 runs backwards: 30 -> %zu", back));
+        settings_.directionIdx = 2;
+        SetPlaying(false);
+        Seek(57);
+        SetPlaying(true);
+        playWall_ -= 0.2;
+        size_t turned = PlayheadFromClock();
+        pcheck(playBack_ && playing_ && turned >= 54 && turned <= 57,
+               util::Format(L"부메랑 turns at the end: 57 -> %zu, backwards %d", turned, playBack_));
+        settings_.directionIdx = 0;
+        SetPlaying(false);
+        Seek(10);
+        Shuttle(1);
+        Shuttle(1);
+        const int twice = shuttle_;
+        playWall_ -= 0.1;
+        size_t fast = PlayheadFromClock();
+        Shuttle(-1);
+        const bool backward = shuttle_ == -1 && playBack_;
+        SetPlaying(false);  // K
+        pcheck(twice == 2 && fast >= 15 && fast <= 17 && backward && !playing_ && shuttle_ == 0,
+               util::Format(L"L twice is 2× (10 -> %zu), J goes back, K stops", fast));
+        Seek(55);
+        Shuttle(1);
+        playWall_ -= 1.0;
+        size_t end = PlayheadFromClock();
+        pcheck(!playing_ && end == 59 && shuttle_ == 0, util::Format(L"a shuttle stops at the end: %zu", end));
+        inF_ = 10;
+        outF_ = 20;
+        ResetRange();
+        pcheck(inF_ == 0 && outF_ == 59, L"R gives back the whole clip");
+        CloseEditor();
+        CloseClip();
+        toastUntil_ = 0;
+    }
+    // The caption's text field (#22): typed text, Korean text the IME finished, keys, what the IME was still
+    // composing kept when the field lets go, and the length limit.
+    {
+        ComPtr<IWICImagingFactory> wic;
+        ComPtr<IWICBitmap> bmp;
+        ComPtr<ID2D1RenderTarget> rt;
+        bool drew = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                               IID_PPV_ARGS(&wic))) &&
+                    SUCCEEDED(wic->CreateBitmap(400, 60, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp)) &&
+                    SUCCEEDED(gfx_.D2D()->CreateWicBitmapRenderTarget(bmp.Get(), D2D1::RenderTargetProperties(), &rt));
+        Ui ui;
+        UiInput in;
+        std::wstring text;
+        double now = 1;
+        const UiId id = HashId("test.field");
+        auto frame = [&] {
+            rt->BeginDraw();
+            ui.Begin(rt.Get(), in, now += 0.05);
+            ui.TextField(id, Rect(10, 10, 390, 46), text, L"", 10);
+            ui.End();
+            drew &= SUCCEEDED(rt->EndDraw());
+            in.ClearEdges();
+        };
+        if (drew) {
+            in.mx = 50;
+            in.my = 20;
+            in.pressed = in.down = true;
+            frame();
+            in.down = false;
+            in.released = true;
+            frame();
+            const bool focused = ui.TextFocused();
+            in.chars = L"ab";
+            frame();
+            in.chars = L"한글";
+            frame();
+            in.keys = {VK_LEFT};
+            frame();
+            in.keys = {VK_BACK};
+            frame();
+            const bool edited = text == L"ab글";
+            in.keys = {VK_END};
+            in.composing = L"가";
+            frame();
+            const bool composing = text == L"ab글";
+            in.mx = 1000;
+            in.pressed = in.down = true;
+            frame();
+            in.down = false;
+            in.composing.clear();
+            const bool kept = text == L"ab글가" && !ui.TextFocused() && ui.TakeImeReset();
+            ui.Focus(id);
+            in.chars = L"0123456789";
+            frame();
+            const bool limited = text == L"ab글가012345";
+            in.keys = {VK_ESCAPE};
+            frame();
+            bool ok = focused && edited && composing && kept && limited && !ui.TextFocused();
+            if (!ok) ++failures;
+            log(util::Format(L"text field: %s focus %d, typing and keys %d, composing shown not kept %d, kept on "
+                             L"leaving %d, 10 at most %d: \"%s\"",
+                             ok ? L"ok  " : L"FAIL", focused, edited, composing, kept, limited, text.c_str()));
+        } else {
+            ++failures;
+            log(L"text field: FAIL no render target");
+        }
+    }
+    // The caption over an export (#22): white with a dark outline, at the bottom or the top, nothing elsewhere.
+    for (int pos : {caption::kBottom, caption::kTop}) {
+        const int cw = 320, ch = 180;
+        caption::Overlay cap;
+        bool made = cap.Make(L"자막 Caption", pos, cw, ch);
+        std::vector<uint8_t> f((size_t)cw * ch * 4);
+        for (size_t i = 0; i < f.size(); i += 4) f[i] = f[i + 1] = f[i + 2] = 128, f[i + 3] = 255;
+        cap.Blend(f.data());
+        int white[3] = {}, dark = 0;  // white pixels by third of the height
+        for (int y = 0; y < ch; ++y)
+            for (int x = 0; x < cw; ++x) {
+                const uint8_t* p = &f[((size_t)y * cw + x) * 4];
+                if (p[0] > 240 && p[1] > 240 && p[2] > 240) ++white[y * 3 / ch];
+                if (p[0] < 40 && p[1] < 40 && p[2] < 40) ++dark;
+            }
+        const int where = pos == caption::kTop ? 0 : 2;
+        bool ok = made && white[where] > 40 && white[1] == 0 && white[2 - where] == 0 && dark > 40;
+        if (!ok) ++failures;
+        log(util::Format(L"caption %s: %s white %d/%d/%d by third, dark %d", pos == caption::kTop ? L"top" : L"bottom",
+                         ok ? L"ok" : L"FAIL", white[0], white[1], white[2], dark));
+    }
     // Portable mode (#25): a settings.ini next to the exe is the settings file; a test run keeps its scratch file.
     {
         auto pcheck = [&](bool ok, const wchar_t* what) {
@@ -1154,9 +1436,9 @@ int App::RunSelfTest(const std::wstring& dir) {
         GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
         pcheck(!Settings::Portable() && Settings::FilePath() == env, L"a test run keeps OZMAKER_SETTINGS");
     }
-    // 화질 presets: a new settings file starts at 보통; one from before the presets keeps its values and shows the
-    // preset they match; a preset gives MP4 and 움짤 their own values. Each case is a file in this test's folder,
-    // read through OZMAKER_SETTINGS, which is then put back.
+    // 화질 presets: a new settings file starts at 보통 for 움짤 and 고화질 for MP4; one from before the presets keeps
+    // its values and shows the preset they match; 움짤 and MP4 keep their own. Each case is a file in this test's
+    // folder, read through OZMAKER_SETTINGS, which is then put back.
     {
         auto check = [&](bool ok, const wchar_t* what) {
             if (!ok) ++failures;
@@ -1164,9 +1446,10 @@ int App::RunSelfTest(const std::wstring& dir) {
         };
         wchar_t env[MAX_PATH] = {};
         GetEnvironmentVariableW(L"OZMAKER_SETTINGS", env, MAX_PATH);
-        auto load = [&](const wchar_t* name, const char* text) {
+        auto load = [&](const wchar_t* name, const char* text) {  // text null: the file as it is
             std::wstring ini = dir + L"\\" + name;
-            HANDLE f = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            HANDLE f = text ? CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr)
+                            : INVALID_HANDLE_VALUE;
             if (f != INVALID_HANDLE_VALUE) {
                 DWORD n = 0;
                 WriteFile(f, text, (DWORD)strlen(text), &n, nullptr);
@@ -1181,6 +1464,11 @@ int App::RunSelfTest(const std::wstring& dir) {
         Settings fresh = load(L"preset_new.ini", "");
         check(fresh.exportPreset == 1 && fresh.scaleIdx == 4 && fresh.outFpsIdx == 3 && !fresh.exportDetails,
               L"a new settings file starts at 보통 (640px, 20fps) with 자세히 설정 folded");
+        fresh.UseExportKind(true);
+        bool mp4High = fresh.exportPreset == 0 && fresh.scaleIdx == 0 && fresh.outFpsIdx == 0;
+        fresh.UseExportKind(false);
+        check(mp4High && fresh.exportPreset == 1 && fresh.scaleIdx == 4 && fresh.outFpsIdx == 3,
+              L"MP4 starts at 고화질 and switching back gives 움짤 its own values");
         Settings old = load(L"preset_old.ini", "[OzMaker]\r\nExportSize=0\r\nOutFps=0\r\n");
         check(old.exportPreset == 0 && old.scaleIdx == 0 && old.outFpsIdx == 0,
               L"an older file at full size keeps it and shows 고화질");
@@ -1191,11 +1479,27 @@ int App::RunSelfTest(const std::wstring& dir) {
         check(custom.exportPreset == -1, L"직접 설정 stays even when the values match a preset");
         Settings st;
         st.ApplyPreset(2, true);
-        bool video = st.scaleIdx == 4 && st.outFpsIdx == 1 && st.gifLossy == 2;
+        bool video = st.scaleIdx == 4 && st.outFpsIdx == 1 && st.gifLossy == 1;
         st.ApplyPreset(2, false);
-        check(video && st.scaleIdx == 5 && st.outFpsIdx == 4 && st.MatchPreset(false, true) == 2 &&
+        check(video && st.scaleIdx == 5 && st.outFpsIdx == 4 && st.gifLossy == 2 && st.MatchPreset(false, true) == 2 &&
                   st.MatchPreset(true, false) == -1,
               L"저용량 is 640px/30fps for MP4 and 480px/15fps with strong lossy for 움짤");
+        // Saved with MP4 shown: each kind's values land under its own keys.
+        {
+            Settings both = load(L"preset_both.ini", "");
+            both.UseExportKind(true);
+            both.exportPreset = 2;
+            both.ApplyPreset(2, true);
+            std::wstring ini = dir + L"\\preset_both.ini";
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", ini.c_str());
+            both.Save();
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", env);
+        }
+        Settings back = load(L"preset_both.ini", nullptr);
+        bool anim = back.exportPreset == 1 && back.scaleIdx == 4 && back.outFpsIdx == 3;
+        back.UseExportKind(true);
+        check(anim && back.exportPreset == 2 && back.scaleIdx == 4 && back.outFpsIdx == 1,
+              L"움짤 and MP4 values are saved apart");
     }
     // Crash reports (#24): a child run that crashes on purpose leaves a dump and a log and ends without the Windows
     // error dialog. It shares this run's OZMAKER_SETTINGS, so the report lands in this test's folder.
@@ -1326,6 +1630,81 @@ int App::RunSelfTest(const std::wstring& dir) {
         Seen fin = inspect(finished);
         vcheck(wrote && fin.plain && fin.frames == N && fin.wrong == 0 && fin.tables && fin.audio,
                L"a finished recording is a plain MP4 with every frame: " + describe(fin) + L" " + err);
+        // Cut without encoding again (#22): the frames from the keyframe before the range on, each in its place, with
+        // the sound; the editor picks it for a video saved as MP4 at 고화질 and says why when it can't.
+        {
+            std::wstring copy = dir + L"\\video_cut_copy.mp4", why;
+            auto src = mp4::CutSource::Open(finished);
+            auto vc = VideoClip::Open(finished, why);
+            bool keys = src && vc && src->Frames() == vc->Count();
+            for (size_t i = 0; keys && i < vc->Count(); ++i) keys = src->KeyBefore(i) == vc->KeyBefore(i);
+            std::atomic<bool> stop{false};
+            std::atomic<float> progress{0};
+            mp4::CutSource::Result res;
+            const uint64_t guess = src ? src->SizeOf(40, 99, true) : 0;
+            bool cut = keys && src->KeyBefore(40) == 30 && src->Cut(40, 99, true, copy, stop, progress, res, why);
+            auto out = cut ? VideoClip::Open(copy, why) : nullptr;
+            int wrong = 0;
+            if (out) {
+                auto rd = out->NewReader();
+                for (size_t k = 0; k < out->Count(); ++k) {
+                    const uint8_t* px = rd->Get(k);
+                    if (!px || ReadIndex(px, out->Width(), out->Height()) != 30 + (int)k) ++wrong;
+                }
+            }
+            const uint64_t bytes = util::FileSize(copy);
+            vcheck(out && out->Count() == 70 && wrong == 0 && out->HasAudio() && res.frames == 70 && res.audio &&
+                       std::fabs(out->Seconds() - 70 / 60.0) < 0.02 && bytes > 0 &&
+                       std::fabs((double)guess - bytes) < bytes * 0.15,
+                   util::Format(L"cut as it is: keyframes as VideoClip has them %d, %zu frames from 30, %d out of "
+                                L"place, %.3fs, audio %d, %s (guessed %s) %s",
+                                keys, out ? out->Count() : 0, wrong, out ? out->Seconds() : 0.0, out && out->HasAudio(),
+                                util::FormatBytes(bytes).c_str(), util::FormatBytes(guess).c_str(), why.c_str()));
+            // The sound stays with the picture: the tone that changes at 1 s in the source changes 0.5 s in.
+            if (out && vc) {
+                int rate = 0, outRate = 0;
+                auto before = ReadAllAudio(*vc, 0, 2.0, rate), after = ReadAllAudio(*out, 0, out->Seconds(), outRate);
+                double was = ToneSwitch(before, rate, 0.5, 440, 880), now = ToneSwitch(after, outRate, 0.1, 440, 880);
+                double want = was - vc->Ts(30) / 1e7;
+                vcheck(was > 0 && std::fabs(now - want) < 0.02,
+                       util::Format(L"the cut's sound in step: tone changes at %.3fs, expected %.3fs (%d / %d Hz)", now,
+                                    want, rate, outRate));
+            }
+
+            OpenEditor(VideoClip::Open(finished, why));
+            const wchar_t* direct = CopyBlocker();
+            const bool picked = cutSource_ && direct && !*direct;
+            std::wstring reasons;
+            auto reason = [&] {
+                const wchar_t* r = CopyBlocker();
+                reasons += std::wstring(r ? r : L"(null)") + L"/";
+            };
+            settings_.speedIdx = 2;
+            reason();
+            settings_.speedIdx = 1;
+            caption_ = L"자막";
+            reason();
+            caption_.clear();
+            crop_.right -= 16;
+            reason();
+            ResetCrop();
+            settings_.scaleIdx = 2;
+            reason();
+            settings_.scaleIdx = 0;
+            inF_ = 40;
+            outF_ = 99;
+            ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, 0);
+            job.path = dir + L"\\video_cut_editor.mp4";
+            if (const wchar_t* w = CopyBlocker(); w && !*w) job.cut = cutSource_;
+            ExportResult r = ExportSync(ex, job);
+            vcheck(picked && reasons == L"재생 속도를 바꿔서/자막을 넣어서/화면을 잘라서/크기나 프레임 레이트를 바꿔서/" &&
+                       job.cut && r.ok && r.frames == 70 && r.audio,
+                   util::Format(L"the editor cuts a video at 고화질 as it is (%d), else says why: %s; export %d, %d "
+                                L"frames, audio %d %s",
+                                picked, reasons.c_str(), r.ok, r.frames, r.audio, r.error.c_str()));
+            CloseEditor();
+            CloseClip();
+        }
 
         // A child process that crashes mid-recording; it has gone, so the next start takes its file.
         std::wstring crashed = dir + L"\\video_crashed.mp4", cutMdat = dir + L"\\video_cut_mdat.mp4",
@@ -1635,6 +2014,29 @@ int App::RunScreenshots(const std::wstring& dir) {
     shot(L"editor_target.png", 96);
     settings_.targetIdx = 0;
     fitting_ = false;
+    // 자막 (#22): the bar open, a syllable still being composed (IME) at the caret, the caption over the preview;
+    // L pressed twice, so 2× next to the time.
+    captionOpen_ = true;
+    caption_ = L"회의를 시작합니";
+    ui_.Focus(HashId("cap.text"));
+    mouse.composing = L"다";
+    Shuttle(1);
+    Shuttle(1);
+    shot(L"editor_caption.png", 96);
+    mouse.composing.clear();
+    SetPlaying(false);
+    Seek(40);
+    captionOpen_ = false;
+    caption_.clear();
+    // 재생 방향 (#22) at the end of 자세히 설정, scrolled down to it.
+    settings_.exportDetails = true;
+    settings_.directionIdx = 2;
+    shot(L"editor_direction.png", 96);  // lays the panel out: how far it scrolls
+    exportScroll_ = 10000;
+    shot(L"editor_direction.png", 96);
+    exportScroll_ = 0;
+    settings_.exportDetails = false;
+    settings_.directionIdx = 0;
     cropMode_ = true;
     crop_ = {120, 60, 840, 465};
     hasResult_ = true;
@@ -1702,12 +2104,439 @@ int App::RunScreenshots(const std::wstring& dir) {
     held_.clear();
     recentFiles_.clear();
     shot(L"edit_home_empty.png", 96);
+    // A video saved as MP4 (#22): at 고화질 it is cut as it is, from the keyframe before the range (the yellow line);
+    // at 1.5× it is encoded again, and the panel says why.
+    if (std::wstring video = dir + L"\\shot_video.mp4", err; WriteTestMp4(video, 960, 540, 180, 30, 60, err)) {
+        OpenEditor(VideoClip::Open(video, err));
+        if (thumbThread_.joinable()) thumbThread_.join();
+        thumbs_.clear();
+        for (auto& px : thumbPixels_) thumbs_.push_back(gfx_.CreateBitmap(thumbW_, thumbH_, px.data(), thumbW_ * 4));
+        playing_ = false;
+        inF_ = 75;
+        outF_ = 150;
+        playhead_ = 100;
+        if (auto rd = clip_->NewReader(); const uint8_t* px = rd->Get(playhead_)) {  // no fetcher thread here
+            UploadFrame(px);
+            shown_ = playhead_;
+        }
+        shot(L"editor_mp4_copy.png", 96);
+        settings_.speedIdx = 2;
+        std::atomic<bool> cancel{false};
+        estBytes_ = EstimateBytes(MakeJob(settings_.scaleIdx, settings_.outFpsIdx, 0), cancel);
+        estKey_ = EstimateKey();
+        estValid_ = true;
+        shot(L"editor_mp4_reencode.png", 96);
+        settings_.speedIdx = 1;
+        CloseClip();
+    } else {
+        log(L"editor_mp4_copy.png: skipped, no test video (" + err + L")");
+    }
     screen_ = Screen::Home;
     keep.reset();
     target_ = nullptr;
     if (standIn) DestroyWindow(standIn);
     log(layerErrors ? util::Format(L"RESULT: %d screen(s) with layering errors", layerErrors) : L"RESULT: all passed");
     return layerErrors ? 2 : 0;
+}
+
+// README pictures (--readme-media <dir>): the 녹화 tab, the area picker, the editor and the export panel as PNGs at
+// twice the pixels, and hero.gif, a pointer going from picking a window to copying the saved 움짤. All drawn offscreen
+// like --screenshot, over made-up windows (the game above): nothing is captured from the screen. OzMaker's own
+// encoder saves the GIF.
+int App::RunReadmeMedia(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\readme-media.log");
+    int failures = 0;
+    bool layerFailed = false;
+    const float W = 1120, H = 780;
+    double clock = util::NowSeconds();
+    double scene = 0;  // the game's clock
+    UiInput mouse;
+    ui_.KeepRects(true);
+    settings_.source = kSourceWindow;
+    settings_.output = kOutputClip;
+
+    // Made-up windows; hidden stand-ins give them handles (the preview takes its shape, 16:9, from the first).
+    std::vector<WinInfo> wins;
+    const wchar_t* titles[] = {L"데모 게임", L"여행 계획 - 메모", L"사진 보기"};
+    const wchar_t* exes[] = {L"DemoGame.exe", L"Memo.exe", L"Viewer.exe"};
+    const SIZE sizes[] = {{1280, 720}, {960, 720}, {1200, 800}};
+    for (int i = 0; i < 3; ++i) {
+        WinInfo w;
+        w.hwnd = MakeStandInWindow(inst_);
+        w.title = titles[i];
+        w.exeName = exes[i];
+        w.frame = {0, 0, sizes[i].cx, sizes[i].cy};
+        SetWindowPos(w.hwnd, nullptr, 0, 0, sizes[i].cx, sizes[i].cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        icons_[w.hwnd] = nullptr;
+        wins.push_back(w);
+    }
+    const HWND game = wins[0].hwnd;
+    std::vector<uint32_t> icon = DemoIcon();
+    icons_[game] = gfx_.CreateBitmap(32, 32, icon.data(), 32 * 4);
+
+    // The pointer (hero.gif only): an arrow, and an amber ripple where it clicks, as 클릭 강조 draws it.
+    struct Ripple {
+        float x, y;
+        double at;
+    };
+    std::vector<Ripple> ripples;
+    D2D1_POINT_2F ptr{-100, -100};
+    bool showPointer = false;
+    ComPtr<ID2D1PathGeometry> arrow;
+    {
+        ComPtr<ID2D1GeometrySink> sink;
+        gfx_.D2D()->CreatePathGeometry(&arrow);
+        arrow->Open(&sink);
+        const D2D1_POINT_2F pts[] = {{0, 16.5f}, {4, 12.6f}, {6.8f, 18.8f}, {9.4f, 17.7f}, {6.7f, 11.7f}, {11.8f, 11.7f}};
+        sink->BeginFigure({0, 0}, D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLines(pts, 6);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink->Close();
+    }
+
+    std::vector<uint8_t> px;
+    auto render = [&](float dpi) {
+        dpi_ = (UINT)dpi;
+        UINT pw = (UINT)(W * dpi / 96), ph = (UINT)(H * dpi / 96);
+        return gfx_.RenderToPixels(pw, ph, dpi, [&](ID2D1DeviceContext* dc) {
+            windows_ = wins;  // nothing here lists the real ones
+            ui_.Begin(dc, mouse, clock);
+            thumbWanted_ = false;
+            DrawFrame(Rect(0, 0, W, H));
+            ui_.End();
+            if (ui_.LayerErrors() && !layerFailed) {
+                layerFailed = true;
+                ++failures;
+                const Rect& e = ui_.FirstLayerError();
+                log(util::Format(L"FAIL layering error at %.0f,%.0f-%.0f,%.0f", e.l, e.t, e.r, e.b));
+            }
+            // The game where the live preview goes (on screen DWM draws that).
+            if (thumbWanted_ && target_) {
+                RECT dest, src;
+                PreviewLayout(dest, src);
+                std::vector<uint32_t> frame = DemoFrame(scene);
+                auto bmp = gfx_.CreateBitmap(kDemoW, kDemoH, frame.data(), kDemoW * 4);
+                const float s = Scale();
+                D2D1_RECT_F d{dest.left / s, dest.top / s, dest.right / s, dest.bottom / s};
+                for (const RECT& p : PreviewParts(dest)) {
+                    dc->PushAxisAlignedClip({p.left / s, p.top / s, p.right / s, p.bottom / s}, D2D1_ANTIALIAS_MODE_ALIASED);
+                    dc->DrawBitmap(bmp.Get(), d, 1.f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+                    dc->PopAxisAlignedClip();
+                }
+            }
+            if (showPointer) {
+                ComPtr<ID2D1SolidColorBrush> b;
+                dc->CreateSolidColorBrush(D2D1::ColorF(0xFBBF24), &b);
+                for (const Ripple& r : ripples) {
+                    float a = (float)((clock - r.at) / 0.5);
+                    if (a < 0 || a >= 1) continue;
+                    float e = 1 - (1 - a) * (1 - a) * (1 - a), rad = 12 + 22 * e;
+                    D2D1_ELLIPSE el{{r.x, r.y}, rad, rad};
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.32f * (1 - a)));
+                    dc->FillEllipse(el, b.Get());
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.95f * (1 - a * a)));
+                    dc->DrawEllipse(el, b.Get(), 3.5f);
+                }
+                if (mouse.down) {  // held: a dot under the pointer
+                    D2D1_ELLIPSE el{ptr, 9, 9};
+                    b->SetColor(D2D1::ColorF(0xFBBF24, 0.45f));
+                    dc->FillEllipse(el, b.Get());
+                }
+                dc->SetTransform(D2D1::Matrix3x2F::Scale(1.4f, 1.4f) * D2D1::Matrix3x2F::Translation(ptr.x, ptr.y));
+                b->SetColor(D2D1::ColorF(D2D1::ColorF::White));
+                dc->FillGeometry(arrow.Get(), b.Get());
+                b->SetColor(D2D1::ColorF(0x111111));
+                dc->DrawGeometry(arrow.Get(), b.Get(), 0.8f);
+                dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            }
+        }, px);
+    };
+    // A PNG of part of the window (DIPs) at twice the pixels, after a few passes so animated values settle. No
+    // pointer, nothing hovered.
+    auto still = [&](const wchar_t* name, Rect part) {
+        UiInput keep = std::exchange(mouse, {});
+        bool pointer = std::exchange(showPointer, false);
+        for (int pass = 0; pass < 10; ++pass) {
+            clock += 0.05;
+            render(192);
+        }
+        mouse = keep;
+        showPointer = pointer;
+        const int sw = (int)(W * 2);
+        RECT r{(LONG)(part.l * 2), (LONG)(part.t * 2), (LONG)(part.r * 2), (LONG)(part.b * 2)};
+        int w = r.right - r.left, h = r.bottom - r.top;
+        std::vector<uint8_t> out((size_t)w * h * 4);
+        for (int y = 0; y < h; ++y)
+            memcpy(out.data() + (size_t)y * w * 4, px.data() + ((size_t)(r.top + y) * sw + r.left) * 4, (size_t)w * 4);
+        bool ok = SavePng(gfx_.Wic(), dir + L"\\" + name, out.data(), w, h);
+        if (!ok) ++failures;
+        log(util::Format(L"%s: %s %dx%d", name, ok ? L"ok" : L"FAIL", w, h));
+    };
+    // The size estimate (and what 용량 맞추기 picks) is worked out on a thread: wait for it, so frames show it.
+    auto settle = [&] {
+        for (double until = util::NowSeconds() + 30; util::NowSeconds() < until;) {
+            UpdateEstimate();
+            Sleep(5);
+            OnEstimate();  // no window to notify here: poll for the result
+            if (!fitting_ && !estimator_.Busy() && estValid_ && estKey_ == EstimateKey()) break;
+        }
+    };
+    // What the game window showed from `from` for `seconds`, as a recording of it (30 fps, 960×540).
+    auto recordGame = [&](double from, double seconds) {
+        auto s = std::make_shared<FrameStore>();
+        std::wstring err;
+        if (!s->Open(960, 540, err)) return s;
+        int n = (int)std::lround(seconds * 30);
+        for (int i = 0; i < n; ++i) {
+            auto buf = s->Acquire();
+            DrawDemoScene(buf->data(), 960, 540, from + i / 30.0);
+            while (!s->Submit(buf, (int64_t)(i * 1e7 / 30))) Sleep(1);
+        }
+        s->Finish((int64_t)(n * 1e7 / 30));
+        return s;
+    };
+    auto openRecording = [&](std::shared_ptr<Clip> clip) {
+        OpenEditor(std::move(clip));
+        if (thumbThread_.joinable()) thumbThread_.join();  // let it finish (StopThumbnails would cancel)
+        thumbs_.clear();
+        for (auto& p : thumbPixels_) thumbs_.push_back(gfx_.CreateBitmap(thumbW_, thumbH_, p.data(), thumbW_ * 4));
+        clipName_ = L"데모 게임";
+        held_ = {{clip_, clock, clipName_}};
+        settle();
+    };
+
+    // ---- 녹화 tab: the game picked, mid-jump.
+    screen_ = Screen::Home;
+    target_ = game;
+    scene = 1.33;
+    still(L"record.png", Rect(0, 0, W, H));
+
+    // ---- The area picker over a made-up desktop with the game's window on it, 16:9 fixed.
+    monitors_ = EnumerateMonitors();
+    for (auto& m : monitors_) {
+        if (!m.primary) continue;
+        const RECT& mr = m.rect;
+        const int mw = mr.right - mr.left, mh = mr.bottom - mr.top;
+        const int gw = std::min(960, mw * 6 / 10), gh = gw * 9 / 16, gx = (mw - gw) / 2, gy = (mh - gh) / 2 - 40;
+        // The area over the right of the game, clear of its counter (the size label goes above the area).
+        const int ax = gx + 200, ay = gy + 32 + 70, aw = gw - 240;
+        POINT a{mr.left + ax, mr.top + ay}, c{mr.left + ax + aw, mr.top + ay + aw * 9 / 16};
+        // The game's window and a margin; the bar under the area stays inside it.
+        const int cx = std::max(0, gx - 40), cy = std::max(0, gy - 40);
+        const int cw = std::min(mw - cx, gw + 80), ch = std::min(mh - cy, gh + 32 + 80);
+        bool ok = gfx_.RenderToPixels(cw * 2, ch * 2, 192, [&](ID2D1DeviceContext* dc) {
+            dc->SetTransform(D2D1::Matrix3x2F::Translation((float)-cx, (float)-cy));
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, (float)mw, (float)mh), theme::Hex(0x2B4C7E));
+            p.Fill(Rect::XYWH((float)gx, (float)gy, (float)gw, 32.f + gh), theme::Hex(0xE6E8EC), 8);
+            p.Text(Rect::XYWH(gx + 14.f, (float)gy, 300.f, 32.f), L"데모 게임", 13.f, theme::Hex(0x1D2433));
+            std::vector<uint32_t> frame = DemoFrame(2.4);
+            auto bmp = gfx_.CreateBitmap(kDemoW, kDemoH, frame.data(), kDemoW * 4);
+            dc->DrawBitmap(bmp.Get(), D2D1::RectF((float)gx, gy + 32.f, (float)(gx + gw), (float)(gy + 32 + gh)), 1.f,
+                           D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+            regionPicker_.PaintTest(p, mr, a, c, RegionPicker::TestView::Adjust);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        }, px);
+        ok = ok && SavePng(gfx_.Wic(), dir + L"\\region.png", px.data(), cw * 2, ch * 2);
+        if (!ok) ++failures;
+        log(util::Format(L"region.png: %s %dx%d", ok ? L"ok" : L"FAIL", cw * 2, ch * 2));
+        break;
+    }
+
+    // ---- hero.gif, 15 frames a second. The pointer moves onto controls where the last frame laid them out. Clicks
+    // that only change what is on screen go to the app as they are; record, stop, save and copy are acted out
+    // instead, so no capture starts, nothing is written and the clipboard is left alone.
+    const double kFps = 15;
+    auto store = std::make_shared<FrameStore>();
+    std::wstring err;
+    if (!store->Open((int)W, (int)H, err)) {
+        log(L"hero.gif: FAIL " + err);
+        return 1;
+    }
+    int frames = 0;
+    double heroT = 0;
+    std::function<void()> each;  // per frame: the recording time, the playhead
+    auto frame = [&] {
+        mouse.mx = ptr.x;
+        mouse.my = ptr.y;
+        if (each) each();
+        render(96);
+        mouse.ClearEdges();
+        mouse.composing.clear();
+        auto buf = store->Acquire();
+        auto* d = reinterpret_cast<uint32_t*>(buf->data());
+        auto* s = reinterpret_cast<const uint32_t*>(px.data());
+        for (size_t i = 0; i < (size_t)(W * H); ++i) d[i] = s[i] | 0xFF000000u;
+        while (!store->Submit(buf, (int64_t)std::llround(frames * 1e7 / kFps))) Sleep(1);
+        ++frames;
+        heroT += 1 / kFps;
+        clock += 1 / kFps;
+        scene += 1 / kFps;
+    };
+    auto wait = [&](double seconds) {
+        for (double end = heroT + seconds - 1e-6; heroT < end;) frame();
+    };
+    auto moveTo = [&](float x, float y, double seconds) {
+        D2D1_POINT_2F from = ptr;
+        int n = std::max(1, (int)std::lround(seconds * kFps));
+        for (int i = 1; i <= n; ++i) {
+            float u = i / (float)n, e = u * u * (3 - 2 * u);
+            ptr = {from.x + (x - from.x) * e, from.y + (y - from.y) * e};
+            frame();
+        }
+    };
+    auto moveOnto = [&](UiId id, double seconds) {
+        if (const Rect* r = ui_.LastRect(id)) return moveTo(r->CX(), r->CY(), seconds);
+        log(util::Format(L"hero.gif: FAIL no control %08X on screen at %.1fs", id, heroT));
+        ++failures;
+    };
+    auto click = [&](bool real) {
+        ripples.push_back({ptr.x, ptr.y, clock});
+        if (!real) return frame();
+        mouse.pressed = mouse.down = true;
+        frame();
+        mouse.down = false;
+        mouse.released = true;
+        frame();
+    };
+    double playFrom = 0;
+    auto play = [&] {  // the playhead where playback would have it on this clock
+        playing_ = true;
+        playBack_ = false;
+        shuttle_ = 0;
+        const int64_t start = clip_->Ts(inF_), len = std::max<int64_t>(1, RangeEndTs() - start);
+        playTs_ = start + (int64_t)std::fmod((heroT - playFrom) * 1e7, (double)len);
+        playWall_ = util::NowSeconds();
+    };
+
+    screen_ = Screen::Home;
+    target_ = nullptr;
+    showPointer = true;
+    ptr = {600, 470};
+    scene = 0.2;
+    wait(0.3);
+    moveOnto(HashId("win", (uint32_t)(uintptr_t)game), 0.6);
+    click(true);  // picks the game: the preview comes up
+    wait(0.5);
+    moveOnto(HashId("home.rec"), 0.6);
+    wait(0.15);
+    click(false);
+    const double recFrom = scene;
+    rec_ = RecState::Recording;
+    each = [&] { recElapsedForTest_ = scene - recFrom; };
+    wait(2.0);
+    click(false);  // stop: the editor opens on the recording, playing
+    each = nullptr;
+    rec_ = RecState::Idle;
+    recElapsedForTest_ = -1;
+    openRecording(recordGame(recFrom, scene - recFrom));
+    playFrom = heroT;
+    each = play;
+    wait(0.6);
+    // The end of the range dragged in.
+    moveOnto(HashId("tl.out"), 0.5);
+    each = nullptr;
+    playing_ = false;
+    ripples.push_back({ptr.x, ptr.y, clock});
+    mouse.pressed = mouse.down = true;
+    if (const Rect* track = ui_.LastRect(HashId("tl.scrub")))
+        moveTo(track->l + track->W() * 0.7f, ptr.y, 0.7);
+    mouse.down = false;
+    mouse.released = true;
+    frame();
+    settle();
+    playFrom = heroT;
+    each = play;
+    wait(0.3);
+    // 자막, typed through the IME (each syllable shows being composed first).
+    moveOnto(HashId("tr.caption"), 0.5);
+    click(true);
+    for (wchar_t ch : std::wstring(L"보스 처치!")) {
+        if (ch >= 0xAC00 && ch <= 0xD7A3) {
+            mouse.composing = std::wstring(1, ch);
+            frame();
+        }
+        mouse.chars = std::wstring(1, ch);
+        frame();
+    }
+    mouse.keys.push_back(VK_RETURN);
+    frame();
+    settle();
+    wait(0.3);
+    moveOnto(Ui::CellId(HashId("ex.target"), 2), 0.6);
+    click(true);  // 10MB
+    settle();
+    wait(0.4);
+    // export.png now, while the panel shows the estimate (the saved file's card takes its place). The still moves the
+    // clock on half a second; nothing on screen is moving then.
+    const Rect* save = ui_.LastRect(HashId("ex.save"));
+    const float split = save ? save->l - 18 : 784;
+    still(L"export.png", Rect(split - 16, 60, W, H));
+    moveOnto(HashId("ex.save"), 0.5);
+    click(false);
+    {
+        // The real export of this range, for the size on the card; the file goes away again.
+        ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, settings_.quality[fmt_]);
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        job.path = std::wstring(tmp) + L"OzMaker_readme_result.gif";
+        Exporter ex;
+        ExportResult r = ExportSync(ex, job);
+        DeleteFileW(job.path.c_str());
+        if (!r.ok) ++failures;
+        log(util::Format(L"saved range: %s %s, %d frames", r.ok ? L"ok" : L"FAIL", util::FormatBytes(r.bytes).c_str(),
+                         r.frames));
+        lastResult_ = r;
+        lastResult_.path = settings_.outDir + L"\\OzMaker_20261103_142311.gif";
+        hasResult_ = true;
+        resultOriginal_ = false;
+        DropHeld(clip_.get());
+    }
+    wait(0.6);
+    moveOnto(HashId("res.copy"), 0.5);
+    click(false);
+    toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
+    toastError_ = false;
+    toastUntil_ = clock + 30;
+    wait(1.2);
+    each = nullptr;
+    showPointer = false;
+    store->Finish((int64_t)std::llround(frames * 1e7 / kFps));
+    {
+        ExportJob job;
+        job.clip = store;
+        job.first = 0;
+        job.last = store->Count() - 1;
+        job.crop = {0, 0, (LONG)W, (LONG)H};
+        job.outW = (int)W;
+        job.outH = (int)H;
+        job.format = Format::Gif;
+        job.quality = 90;
+        job.holdLastMs = 1000;
+        job.path = dir + L"\\hero.gif";
+        Exporter ex;
+        ExportResult r = ExportSync(ex, job);
+        if (!r.ok) ++failures;
+        log(util::Format(L"hero.gif: %s %s, %d frames, %.1fs", r.ok ? L"ok" : L"FAIL",
+                         util::FormatBytes(r.bytes).c_str(), r.frames, r.seconds));
+    }
+
+    // ---- The editor as the GIF ends: the range dragged in, the caption.
+    toastUntil_ = 0;
+    playing_ = false;
+    Seek(inF_ + (outF_ - inF_) * 2 / 5);
+    still(L"edit.png", Rect(0, 60, split, H));
+
+    held_.clear();
+    CloseClip();
+    target_ = nullptr;
+    windows_.clear();
+    for (const WinInfo& w : wins) DestroyWindow(w.hwnd);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 1 : 0;
 }
 
 namespace {
@@ -2145,6 +2974,7 @@ double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, doub
 
 // First time (s) from `after` on where tone b is louder than tone a, in 5 ms steps of 20 ms windows.
 double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double a, double b) {
+    if (rate < 200) return -1;  // no sound read
     size_t win = rate / 50, step = rate / 200;
     for (size_t i = (size_t)(after * rate); (i + win) * 2 <= st.size(); i += step)
         if (ToneLevel(st, i, win, b, rate) > ToneLevel(st, i, win, a, rate)) return (i + win / 2) / (double)rate;
@@ -2873,15 +3703,19 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     check(inF_ == 37 && outF_ == 150, util::Format(L"I/O set the range: %zu..%zu", inF_, outF_));
     check(!hasResult_, L"changing the range hides the original's card");
 
+    // MP4 at 고화질 with nothing changed is cut as it is (#22), from the keyframe before I.
+    const wchar_t* why = CopyBlocker();
+    const bool copies = cutSource_ && why && !*why;
+    const int frames = copies ? (int)(150 - cutSource_->KeyBefore(37) + 1) : 114;
     StartExport(false);
     pump(30, [&] { return !exporter_.Busy() && hasResult_; });
-    check(hasResult_ && !resultOriginal_ && lastResult_.ok && lastResult_.frames == 114 && lastResult_.audio,
-          util::Format(L"export: %s, %d frames, %.3fs, audio %d, %s", util::FileNameOf(lastResult_.path).c_str(),
-                       lastResult_.frames, lastResult_.seconds, lastResult_.audio,
-                       util::FormatBytes(lastResult_.bytes).c_str()));
+    check(hasResult_ && !resultOriginal_ && lastResult_.ok && lastResult_.frames == frames && lastResult_.audio,
+          util::Format(L"export%s: %s, %d frames, %.3fs, audio %d, %s", copies ? L" as it is" : L"",
+                       util::FileNameOf(lastResult_.path).c_str(), lastResult_.frames, lastResult_.seconds,
+                       lastResult_.audio, util::FormatBytes(lastResult_.bytes).c_str()));
     std::wstring err;
     auto out = VideoClip::Open(lastResult_.path, err);
-    check(out && out->Count() == 114 && out->HasAudio(),
+    check(out && (int)out->Count() == frames && out->HasAudio(),
           util::Format(L"exported file: %zu frames, %.3fs", out ? out->Count() : 0, out ? out->Seconds() : 0));
 
     SetPlaying(true);

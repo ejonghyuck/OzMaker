@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "App.h"
 #include "Crash.h"
+#include "Mp4Cut.h"
 #include "Resize.h"
 #include "Sound.h"
 #include "Util.h"
@@ -88,6 +89,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     auto args = SplitArgs(cmdLine);
     if (args.size() >= 2 && args[0] == L"--crash-test") return RunCrashTest(args);
     if (args.size() >= 2 && args[0] == L"--screenshot") return RunScreenshots(args[1]);
+    if (args.size() >= 2 && args[0] == L"--readme-media") return RunReadmeMedia(args[1]);
     if (args.size() >= 2 && args[0] == L"--selftest") return RunSelfTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--record-test") return RunRecordTest(cmdLine);
     if (args.size() >= 2 && args[0] == L"--analyze") return RunAnalyzeTest(cmdLine);
@@ -295,6 +297,8 @@ bool App::CreateMainWindow(int show) {
     COLORREF caption = RGB(0x0D, 0x0F, 0x13);
     DwmSetWindowAttribute(hwnd_, 35 /*DWMWA_CAPTION_COLOR, Win11*/, &caption, sizeof(caption));
     if (!gfx_.AttachWindow(hwnd_)) return false;
+    // No IME while no text field has the focus: in Korean mode it would swallow the letter shortcuts (I, O, J, K, L).
+    ImmAssociateContextEx(hwnd_, nullptr, 0);
     dropTarget_ = MakeDropTarget();
     if (FAILED(OleInitialize(nullptr)) || FAILED(RegisterDragDrop(hwnd_, dropTarget_.Get()))) {
         dropTarget_.Reset();
@@ -365,6 +369,7 @@ void App::Render() {
     gfx_.EndFrame();
     ApplyThumbnail();
     SyncAudioPreview();
+    SyncIme();
     RequestWake(ui_.WakeAt());
     if (settingsDirty_ && !input_.down) {
         settings_.Save();
@@ -375,6 +380,35 @@ void App::Render() {
     GetCursorPos(&pt);
     if (WindowFromPoint(pt) == hwnd_ && SendMessageW(hwnd_, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y)) == HTCLIENT)
         SetCursor(LoadCursorW(nullptr, ui_.Cursor()));
+}
+
+// The IME only while a text field has the focus (in Korean mode it takes the letter keys), its windows at the caret.
+void App::SyncIme() {
+    if (ui_.TakeImeReset()) {
+        // The field kept what was being composed when it let go.
+        if (HIMC imc = ImmGetContext(hwnd_)) {
+            ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            ImmReleaseContext(hwnd_, imc);
+        }
+        input_.composing.clear();
+    }
+    const bool on = ui_.TextFocused();
+    if (on != imeOn_) {
+        ImmAssociateContextEx(hwnd_, nullptr, on ? IACE_DEFAULT : 0);
+        imeOn_ = on;
+        if (!on) input_.composing.clear();
+    }
+    if (!on) return;
+    if (HIMC imc = ImmGetContext(hwnd_)) {
+        const Rect& c = ui_.CaretRect();
+        const float s = Scale();
+        RECT px{(LONG)(c.l * s), (LONG)(c.t * s), (LONG)(c.r * s), (LONG)(c.b * s)};
+        COMPOSITIONFORM cf{CFS_POINT, {px.left, px.top}, {}};
+        ImmSetCompositionWindow(imc, &cf);
+        CANDIDATEFORM cand{0, CFS_EXCLUDE, {px.left, px.bottom}, px};
+        ImmSetCandidateWindow(imc, &cand);
+        ImmReleaseContext(hwnd_, imc);
+    }
 }
 
 // DWM draws thumbnails above everything drawn in this window, so nothing of ours can go over the preview. Instead
@@ -631,6 +665,36 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             input_.alt = GetKeyState(VK_MENU) < 0;
             Invalidate();
             if (m == WM_SYSKEYDOWN) break;
+            return 0;
+        case WM_CHAR:
+            if (w >= 0x20 && w != 0x7F) {
+                input_.chars.push_back((wchar_t)w);
+                Invalidate();
+            }
+            return 0;
+        // Text fields show what the IME is composing themselves, at their caret (Ui::TextField).
+        case WM_IME_SETCONTEXT:
+            l &= ~ISC_SHOWUICOMPOSITIONWINDOW;
+            break;
+        case WM_IME_STARTCOMPOSITION:
+            return 0;
+        case WM_IME_COMPOSITION:
+            if (HIMC imc = ImmGetContext(hwnd_)) {
+                auto read = [&](DWORD what) {
+                    LONG n = ImmGetCompositionStringW(imc, what, nullptr, 0);
+                    std::wstring s(n > 0 ? n / sizeof(wchar_t) : 0, 0);
+                    if (n > 0) ImmGetCompositionStringW(imc, what, s.data(), n);
+                    return s;
+                };
+                if (l & GCS_RESULTSTR) input_.chars += read(GCS_RESULTSTR);
+                input_.composing = l & GCS_COMPSTR ? read(GCS_COMPSTR) : std::wstring();
+                ImmReleaseContext(hwnd_, imc);
+            }
+            Invalidate();
+            return 0;
+        case WM_IME_ENDCOMPOSITION:
+            input_.composing.clear();
+            Invalidate();
             return 0;
         case WM_SETCURSOR:
             if (LOWORD(l) == HTCLIENT) {
@@ -1576,6 +1640,10 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     inF_ = 0;
     outF_ = clip_->Count() - 1;
     playhead_ = 0;
+    playing_ = playBack_ = false;
+    caption_.clear();
+    captionPos_ = 0;
+    captionOpen_ = false;
     cropMode_ = false;
     cropAspect_ = 0;
     cropDrag_ = -1;
@@ -1588,7 +1656,10 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     fitCorrection_ = 1;
     // A video stays a video by default; a clip starts with the last 움짤 format.
     bool video = !clip_->SourcePath().empty();
+    cutSource_ = video ? mp4::CutSource::Open(clip_->SourcePath()) : nullptr;
+    if (cutSource_ && cutSource_->Frames() != clip_->Count()) cutSource_.reset();  // numbered differently: don't
     fmt_ = video && FormatAvailable(Format::Mp4) ? (int)Format::Mp4 : settings_.format;
+    settings_.UseExportKind(fmt_ == (int)Format::Mp4);
     if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
     exportAudio_ = true;
     AttachReaders();
@@ -1815,6 +1886,7 @@ void App::CloseClip() {
     PauseEditor();
     StopThumbnails();
     clip_.reset();
+    cutSource_.reset();
     frameBmp_.Reset();
     hasResult_ = resultOriginal_ = false;
     RefreshRecent();
@@ -1930,11 +2002,11 @@ void App::UploadFrame(const uint8_t* px) {
     }
 }
 
-// A video's sound follows the preview: only while it plays at 1x in the editor and OzMaker is in front.
+// A video's sound follows the preview: only while it plays forward at 1x in the editor and OzMaker is in front.
 void App::SyncAudioPreview() {
     auto video = std::dynamic_pointer_cast<const VideoClip>(clip_);
     bool want = video && video->HasAudio() && !previewMute_ && settings_.previewVolume > 0 && playing_ &&
-                !scrubbing_ && screen_ == Screen::Editor && kSpeedOptions[settings_.speedIdx] == 1.0 && hwnd_ &&
+                !playBack_ && !scrubbing_ && screen_ == Screen::Editor && PreviewRate() == 1.0 && hwnd_ &&
                 IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && GetForegroundWindow() == hwnd_;
     if (!want) {
         audioPreview_.Stop();
@@ -1978,46 +2050,116 @@ int64_t App::RangeEndTs() const {
 
 void App::SetPlaying(bool play) {
     if (!clip_) return;
-    if (play && playhead_ >= outF_) playhead_ = inF_;
+    if (play && !playing_) {
+        // Normal playback, the way the export goes.
+        playBack_ = PreviewBackwards();
+        if (!playBack_ && playhead_ >= outF_) playhead_ = inF_;
+        if (playBack_ && playhead_ <= inF_) playhead_ = outF_;
+    }
+    shuttle_ = 0;
     playing_ = play;
-    playWall_ = util::NowSeconds();
-    playTs_ = clip_->Ts(playhead_);
-    ++playEpoch_;
-    Invalidate();
+    RestartClock();
 }
 
 void App::Seek(size_t index) {
     if (!clip_) return;
     playhead_ = std::min(index, clip_->Count() - 1);
+    RestartClock();
+}
+
+// L plays forward, J backward, again for 2× and 4× (as in editing programs). It stops at the end of the range.
+void App::Shuttle(int dir) {
+    if (!clip_) return;
+    int s = playing_ && shuttle_ * dir > 0 ? std::clamp(shuttle_ * 2, -4, 4) : dir;
+    if (dir > 0 && playhead_ >= outF_) playhead_ = inF_;
+    if (dir < 0 && playhead_ <= inF_) playhead_ = outF_;
+    playing_ = true;
+    playBack_ = dir < 0;
+    shuttle_ = s;
+    RestartClock();
+}
+
+void App::ResetRange() {
+    if (!clip_) return;
+    inF_ = 0;
+    outF_ = clip_->Count() - 1;
+    hasResult_ = false;
+    Toast(L"구간을 처음으로 되돌렸습니다");
+}
+
+void App::RestartClock() {
     playWall_ = util::NowSeconds();
-    playTs_ = clip_->Ts(playhead_);
+    // Backwards a frame starts at its end.
+    const size_t i = playhead_;
+    playTs_ = !playBack_ ? clip_->Ts(i) : (i + 1 < clip_->Count() ? clip_->Ts(i + 1) : clip_->EndTs()) - 1;
     ++playEpoch_;
     Invalidate();
 }
 
+bool App::PreviewBackwards() const { return fmt_ != (int)Format::Mp4 && settings_.directionIdx == 1; }
+
+void App::FollowDirection() {
+    if (!clip_ || shuttle_) return;
+    const bool boomerang = fmt_ != (int)Format::Mp4 && settings_.directionIdx == 2;
+    if (!boomerang) playBack_ = PreviewBackwards();
+    RestartClock();
+}
+
 size_t App::PlayheadFromClock() {
-    double speed = kSpeedOptions[settings_.speedIdx];
+    const double rate = PreviewRate();
+    const bool boomerang = !shuttle_ && fmt_ != (int)Format::Mp4 && settings_.directionIdx == 2;
+    const bool once = kLoopOptions[settings_.loopIdx] == 1;
     int64_t start = clip_->Ts(inF_), end = RangeEndTs();
     int64_t len = std::max<int64_t>(1, end - start);
     double now = util::NowSeconds();
-    int64_t t = playTs_ + (int64_t)((now - playWall_) * 1e7 * speed);
-    if (t < start) t = start;
-    if (t >= end) {
-        if (kLoopOptions[settings_.loopIdx] != 1) {
-            t = start + (t - start) % len;
-            // Restart the clock at the loop point (the sound restarts with it).
-            playTs_ = t;
-            playWall_ = now;
-            ++playEpoch_;
+    int64_t step = (int64_t)((now - playWall_) * 1e7 * rate);
+    int64_t t = playBack_ ? playTs_ - step : playTs_ + step;
+    // Restart the clock at a loop or turn (the sound restarts with it).
+    auto restart = [&](int64_t at) {
+        playTs_ = at;
+        playWall_ = now;
+        ++playEpoch_;
+    };
+    auto stop = [&](int64_t at) {
+        t = at;
+        playing_ = false;
+        shuttle_ = 0;
+    };
+    if (!playBack_ && t < start) {
+        t = start;  // the range moved past the playhead
+        restart(t);
+    } else if (playBack_ && t >= end) {
+        t = end - 1;
+        restart(t);
+    } else if (!playBack_ && t >= end) {
+        if (shuttle_ || (once && !boomerang)) {
+            stop(end - 1);
+        } else if (boomerang) {
+            t = std::max(start, end - 1 - (t - end) % len);
+            playBack_ = true;
+            restart(t);
         } else {
-            t = end - 1;
-            playing_ = false;
+            t = start + (t - start) % len;
+            restart(t);
+        }
+    } else if (playBack_ && t < start) {
+        if (shuttle_ || once) {
+            stop(start);
+        } else if (boomerang) {
+            t = std::min(end - 1, start + (start - t) % len);
+            playBack_ = false;
+            restart(t);
+        } else {
+            t = end - 1 - (start - t - 1) % len;
+            restart(t);
         }
     }
+    t = std::clamp(t, start, end - 1);
     size_t idx = std::clamp(clip_->IndexAt(t), inF_, outF_);
     if (playing_) {
-        int64_t nextTs = idx + 1 <= outF_ ? clip_->Ts(idx + 1) : end;
-        RequestWake(now + std::max(0.002, (nextTs - t) / 1e7 / speed));
+        // Until the next frame comes up, the way the clock runs.
+        int64_t left = playBack_ ? t - clip_->Ts(idx) + 1 : (idx + 1 <= outF_ ? clip_->Ts(idx + 1) : end) - t;
+        RequestWake(now + std::max(0.002, left / 1e7 / rate));
     }
     return idx;
 }
@@ -2069,6 +2211,17 @@ bool App::ExportAudio() const {
     auto* video = dynamic_cast<const VideoClip*>(clip_.get());
     return fmt_ == (int)Format::Mp4 && exportAudio_ && video && video->HasAudio() && video->AudioExportable() &&
            kSpeedOptions[settings_.speedIdx] == 1.0;
+}
+
+const wchar_t* App::CopyBlocker() const {
+    if (!clip_ || !cutSource_ || fmt_ != (int)Format::Mp4) return nullptr;
+    if (settings_.targetIdx) return L"용량에 맞추려고";
+    if (settings_.scaleIdx != 0 || settings_.outFpsIdx != 0) return L"크기나 프레임 레이트를 바꿔서";
+    if (crop_.left != 0 || crop_.top != 0 || crop_.right != clip_->Width() || crop_.bottom != clip_->Height())
+        return L"화면을 잘라서";
+    if (kSpeedOptions[settings_.speedIdx] != 1.0) return L"재생 속도를 바꿔서";
+    if (!caption_.empty()) return L"자막을 넣어서";
+    return L"";
 }
 
 VideoConfig App::VideoSettings(int fps) const {
@@ -2137,6 +2290,7 @@ void App::StartExport(bool saveAs) {
     }
     ExportJob job = MakeJob(settings_.scaleIdx, settings_.outFpsIdx, f == Format::Mp4 ? 0 : settings_.quality[fmt_]);
     job.path = path;
+    if (const wchar_t* why = CopyBlocker(); why && !*why) job.cut = cutSource_;
     settings_.Save();
     hasResult_ = resultOriginal_ = false;
     exportEstimate_ = estValid_ && estKey_ == EstimateKey() ? estBytes_ : 0;
@@ -2182,6 +2336,9 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
     job.format = (Format)fmt_;
     job.plays = kLoopOptions[settings_.loopIdx];
     job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
+    job.direction = job.format == Format::Mp4 ? 0 : settings_.directionIdx;
+    job.caption = caption_;
+    job.captionPos = captionPos_;
     if (job.format == Format::Mp4) {
         job.video = VideoSettings((int)std::lround(job.fpsLimit));
         if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
@@ -2195,8 +2352,10 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
 }
 
 std::wstring App::ContentKey() const {
-    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top,
-                        crop_.right, crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx, settings_.gifLossy);
+    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top,
+                        crop_.right, crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx, settings_.gifLossy,
+                        settings_.directionIdx) +
+           util::Format(L" %d ", captionPos_) + caption_;
 }
 
 std::wstring App::EstimateKey() const {

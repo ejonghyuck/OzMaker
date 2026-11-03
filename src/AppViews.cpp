@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "App.h"
+#include "Caption.h"
 #include "Crash.h"
+#include "Mp4Cut.h"
 #include "Util.h"
 #include "Version.h"
 
@@ -165,7 +167,7 @@ void App::DrawHeader(Rect r) {
     if (rec_ != RecState::Recording) {
         if (screen_ != Screen::Settings) DrawTabs(r);
     } else {
-        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(capture_.Elapsed(), true);
+        std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(RecElapsed(), true);
         const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
         Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
         ui_.Fill(pill, WithAlpha(tint, 0.16f), 15);
@@ -1013,7 +1015,7 @@ void App::DrawCapturePanel(Rect r) {
     } else {
         ui_.Fill(Rect::Centered(btn.CX() - 70, btn.CY(), 14, 14), Rec, 3);
         std::wstring t2 = rec_ == RecState::Countdown ? L"카운트다운 취소"
-                                                 : L"녹화 중지  " + util::FormatClock(capture_.Elapsed(), true);
+                                                 : L"녹화 중지  " + util::FormatClock(RecElapsed(), true);
         TextStyle st = Bold();
         st.tabular = true;
         ui_.Text(Rect(btn.CX() - 52, btn.t, btn.r, btn.b), t2, 16.f, White, st);
@@ -1045,11 +1047,16 @@ void App::DrawEditor(Rect r) {
     left.CutTop(10);
     Rect tl = left.CutBottom(84);
     left.CutBottom(8);
+    Rect cb;
+    if (captionOpen_) {
+        cb = left.CutBottom(36);
+        left.CutBottom(8);
+    }
     Rect tr = left.CutBottom(44);
     left.CutBottom(10);
 
-    // Keyboard shortcuts
-    const UiInput& in = ui_.In();
+    // Keyboard shortcuts, unless the caption is being typed
+    const UiInput& in = ui_.TextFocused() ? UiInput() : ui_.In();
     size_t count = clip_->Count();
     if (in.Key(VK_SPACE)) SetPlaying(!playing_);
     if (in.Key(VK_LEFT) && playhead_ > 0) {
@@ -1062,15 +1069,21 @@ void App::DrawEditor(Rect r) {
     }
     if (in.Key(VK_HOME)) Seek(inF_);
     if (in.Key(VK_END)) Seek(outF_);
-    if (in.Key('I')) {
+    const bool plain = !in.ctrl && !in.alt;  // a letter on its own
+    if (plain && in.Key('I')) {
         inF_ = std::min(playhead_, outF_);
         hasResult_ = false;
         Seek(inF_);
     }
-    if (in.Key('O')) {
+    if (plain && in.Key('O')) {
         outF_ = std::max(playhead_, inF_);
         hasResult_ = false;
     }
+    // J, K, L as in editing programs: backward, stop, forward, and again for 2× and 4×. R: the whole clip again.
+    if (plain && in.Key('L')) Shuttle(1);
+    if (plain && in.Key('J')) Shuttle(-1);
+    if (plain && in.Key('K')) SetPlaying(false);
+    if (plain && in.Key('R')) ResetRange();
     if (in.Key(VK_ESCAPE)) cropMode_ = false;
     if (in.Key(VK_DELETE) && CanDiscard()) ConfirmDiscard();
 
@@ -1079,8 +1092,24 @@ void App::DrawEditor(Rect r) {
 
     DrawPreview(left);
     DrawTransport(tr);
+    if (captionOpen_) DrawCaptionBar(cb);  // after the 자막 button, which gives it the focus
     DrawTimeline(tl);
     DrawExportPanel(right);
+}
+
+void App::DrawCaptionBar(Rect r) {
+    Rect close = r.CutRight(34);
+    r.CutRight(6);
+    Rect pos = r.CutRight(120);
+    r.CutRight(8);
+    if (ui_.TextField(HashId("cap.text"), r, caption_, L"자막을 입력하세요 (한 줄)", 60)) hasResult_ = false;
+    if (ui_.Segmented(HashId("cap.pos"), pos, {L"아래", L"위"}, captionPos_)) hasResult_ = false;
+    if (ui_.IconButton(HashId("cap.clear"), Rect::Centered(close.CX(), close.CY(), 34, 34), icon::Close, L"자막 빼기",
+                       true, 12.f)) {
+        caption_.clear();
+        captionOpen_ = false;
+        hasResult_ = false;
+    }
 }
 
 std::wstring App::ClipTitle() const {
@@ -1357,6 +1386,12 @@ void App::DrawPreview(Rect r) {
         SetPlaying(!playing_);
     }
 
+    // The caption over what gets saved, drawn the way the export draws it.
+    if (!caption_.empty() && frameBmp_) {
+        ui_.Painted(cr);
+        caption::Draw(gfx_.DC(), gfx_.DWrite(), caption_, captionPos_, cr);
+    }
+
     if (!fullCrop || cropMode_) {
         D2D1_COLOR_F dim = WithAlpha(Black, 0.6f);
         ui_.Fill(Rect(dst.l, dst.t, dst.r, cr.t), dim);
@@ -1438,14 +1473,36 @@ void App::DrawTransport(Rect r) {
                         util::FormatClock(clip_->Seconds(), true);
     TextStyle st;
     st.tabular = true;
-    ui_.Text(r.CutLeft(150), time, 13.f, TextDim, st);
+    Rect timeR = r.CutLeft(150);
+    ui_.Text(timeR, time, 13.f, TextDim, st);
+    // J / L faster than 1× or backwards, right after the time.
+    if (playing_ && shuttle_ && shuttle_ != 1) {
+        std::wstring s = util::Format(L"%s %d×", shuttle_ < 0 ? L"◀" : L"▶", std::abs(shuttle_));
+        float bw = ui_.Measure(s, 12.f, kSemibold) + 14;
+        Rect badge = Rect::XYWH(std::round(timeR.l + ui_.Measure(time, 13.f) + 8), timeR.CY() - 11, bw, 22);
+        ui_.Fill(badge, WithAlpha(Accent, 0.18f), 6);
+        TextStyle bs = Bold(AlignCenter);
+        bs.tabular = true;
+        ui_.Text(badge, s, 12.f, AccentHi, bs);
+    }
 
-    // Crop controls on the right.
+    // Crop controls on the right, 자막 next to them (out of the way while cropping).
     Rect cropBtn = r.CutRight(92);
     if (ui_.Button(HashId("tr.crop"), Rect::Centered(cropBtn.CX(), cropBtn.CY(), 92, 36), L"자르기",
                    cropMode_ ? BtnStyle::Primary : BtnStyle::Secondary, icon::Crop, true, 13.f)) {
         cropMode_ = !cropMode_;
         if (cropMode_) SetPlaying(false);
+    }
+    if (!cropMode_) {
+        r.CutRight(8);
+        Rect capBtn = r.CutRight(84);
+        UiId id = HashId("tr.caption");
+        if (ui_.Button(id, Rect::Centered(capBtn.CX(), capBtn.CY(), 84, 36), L"자막",
+                       captionOpen_ ? BtnStyle::Primary : BtnStyle::Secondary, icon::Font, true, 13.f)) {
+            captionOpen_ = !captionOpen_;
+            if (captionOpen_) ui_.Focus(HashId("cap.text"));
+        }
+        if (!captionOpen_ && !caption_.empty()) ui_.Tooltip(id, capBtn, L"자막: " + caption_);
     }
     if (cropMode_) {
         r.CutRight(8);
@@ -1475,12 +1532,22 @@ void App::DrawTimeline(Rect r) {
     auto T = [&](float x) { return (int64_t)((double)std::clamp((x - track.l) / track.W(), 0.f, 1.f) * total); };
 
     double selStart = clip_->Ts(inF_) / 1e7, selEnd = RangeEndTs() / 1e7;
+    // A video cut without encoding again starts at the keyframe before the range.
+    const wchar_t* copyBlocker = CopyBlocker();
+    const size_t key = copyBlocker && !*copyBlocker ? cutSource_->KeyBefore(inF_) : inF_;
     TextStyle st;
     st.tabular = true;
-    ui_.Text(labels, L"구간  " + util::FormatClock(selStart, true) + L" – " + util::FormatClock(selEnd, true), 12.f,
-             TextDim, st);
+    std::wstring range = L"구간  " + util::FormatClock(selStart, true) + L" – " + util::FormatClock(selEnd, true);
+    std::wstring note = key < inF_ ? L" · 시작은 키프레임 " + util::FormatClock(clip_->Ts(key) / 1e7, true) +
+                                         L"에 맞춰집니다"
+                                   : std::wstring();
+    std::wstring keys = util::Format(L"%.1f초 · I / O 구간 · J / K / L 재생 · R 처음으로", selEnd - selStart);
+    const float rangeW = ui_.Measure(range, 12.f) + 2, noteW = note.empty() ? 0 : ui_.Measure(note, 12.f) + 2;
+    if (rangeW + noteW + ui_.Measure(keys, 12.f) + 16 > labels.W()) keys = util::Format(L"%.1f초", selEnd - selStart);
+    ui_.Text(labels, range, 12.f, TextDim, st);
+    if (!note.empty()) ui_.Text(Rect(labels.l + rangeW, labels.t, labels.r, labels.b), note, 12.f, Warning, st);
     st.h = AlignEnd;
-    ui_.Text(labels, util::Format(L"%.1f초 · I / O 키로 구간 지정", selEnd - selStart), 12.f, TextFaint, st);
+    ui_.Text(labels, keys, 12.f, TextFaint, st);
 
     ui_.Fill(track, Surface2, 8);
     ui_.PushClip(track);
@@ -1543,6 +1610,10 @@ void App::DrawTimeline(Rect r) {
 
     Rect sel(x0, track.t, x1, track.b);
     ui_.Stroke(sel.Inset(1), Accent, 6, 2.f);
+    if (key < inF_) {
+        float kx = X(clip_->Ts(key));
+        ui_.Line(kx, track.t, kx, track.b, Warning, 2.f);
+    }
     for (Rect h : {hIn, hOut}) {
         ui_.Fill(h, Accent, 4);
         ui_.Line(h.CX(), h.CY() - 8, h.CX(), h.CY() + 8, WithAlpha(White, 0.85f), 1.5f);
@@ -1570,14 +1641,15 @@ void App::DrawExportPanel(Rect r) {
     int ow = 0, oh = 0;
     OutputSize(ow, oh);
     double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
+    const int direction = mp4 ? 0 : settings_.directionIdx;
     PlanSummary& pc = planCache_;
     if (pc.clip != clip_.get() || pc.count != clip_->Count() || pc.first != inF_ || pc.last != outF_ ||
-        pc.fps != fpsLimit || pc.speed != speed || pc.mp4 != mp4) {
-        pc = {clip_.get(), clip_->Count(), inF_, outF_, fpsLimit, speed, mp4};
+        pc.fps != fpsLimit || pc.speed != speed || pc.mp4 != mp4 || pc.direction != direction) {
+        pc = {clip_.get(), clip_->Count(), inF_, outF_, fpsLimit, speed, mp4, direction};
         if (mp4) {
             pc.frames = PlanVideoFrames(*clip_, inF_, outF_, fpsLimit, speed).size();
         } else {
-            auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed);
+            auto plan = PlanFrames(*clip_, inF_, outF_, fpsLimit, speed, direction);
             for (auto& p : plan) pc.ms += p.durationMs;
             pc.frames = plan.size();
         }
@@ -1591,7 +1663,10 @@ void App::DrawExportPanel(Rect r) {
         outFps = outSec > 0 ? outFrames / outSec : 0;
         if (settings_.holdLast) outSec += kHoldLastMs / 1000.0;
     }
-    if (!busy) UpdateEstimate();
+    // A video cut as it is: its size is what it holds, no estimate needed.
+    const wchar_t* copyBlocker = CopyBlocker();
+    const bool copying = copyBlocker && !*copyBlocker;
+    if (!busy && !copying) UpdateEstimate();
     const uint64_t target = (uint64_t)kTargetMB[settings_.targetIdx] * 1'000'000;
 
     // Bottom: what will be written and the actions, always in view.
@@ -1630,8 +1705,10 @@ void App::DrawExportPanel(Rect r) {
         changed = true;
         hasResult_ = false;
         if (fmt_ != (int)Format::Mp4) settings_.format = fmt_;  // the 움짤 format the next clip starts with
-        // A preset means the same in every format: its values for this one.
+        // 움짤 and MP4 each keep their own 화질.
+        settings_.UseExportKind(fmt_ == (int)Format::Mp4);
         if (settings_.exportPreset >= 0) settings_.ApplyPreset(settings_.exportPreset, fmt_ == (int)Format::Mp4);
+        FollowDirection();  // MP4 always plays forward
     }
     if (mp4) ProbeEncoders();
     std::wstring blurb = (disabled & (1u << fmt_)) ? L"이 빌드에는 포함되어 있지 않습니다"
@@ -1665,10 +1742,15 @@ void App::DrawExportPanel(Rect r) {
         static const wchar_t* const kPresetHint[] = {L"원본 크기 그대로입니다. 용량이 큽니다.",
                                                      L"메신저로 보내기 좋은 크기입니다.",
                                                      L"용량이 가장 작습니다. 화면이 조금 거칠 수 있습니다."};
-        hintText(fit          ? L"용량 맞추기가 크기와 프레임 레이트를 고릅니다."
-                 : preset < 0 ? L"‘자세히 설정’에서 고른 값으로 저장합니다."
-                              : kPresetHint[preset],
-                 TextFaint);
+        std::wstring hint = fit          ? L"용량 맞추기가 크기와 프레임 레이트를 고릅니다."
+                            : preset < 0 ? L"‘자세히 설정’에서 고른 값으로 저장합니다."
+                                         : kPresetHint[preset];
+        // A video saved as MP4: whether it is cut as it is, and if not, why.
+        if (copying)
+            hint = L"인코딩 없이 자릅니다. 빠르고 화질이 그대로입니다.";
+        else if (copyBlocker)
+            hint = std::wstring(copyBlocker) + L" 다시 인코딩합니다.";
+        hintText(hint.c_str(), copying ? Success : TextFaint);
         in.CutTop(8);
     }
 
@@ -1738,6 +1820,7 @@ void App::DrawExportPanel(Rect r) {
         part(util::Format(L"%d×%d", ow, oh));
         part(util::Format(L"%.0ffps", outFps));
         part(util::Format(L"%g×", speed));
+        if (direction) part(direction == 1 ? L"거꾸로" : L"부메랑");
         if (!mp4) part(kLoopNames[settings_.loopIdx]);
         if (!mp4 && settings_.holdLast) part(L"끝에서 멈춤");
         ui_.Text(t, sum, 11.5f, TextFaint);
@@ -1803,10 +1886,21 @@ void App::DrawExportPanel(Rect r) {
             size_t ph = playing_ ? PlayheadFromClock() : playhead_;
             std::swap(prevSpeed, settings_.speedIdx);
             playhead_ = ph;
-            SetPlaying(playing_);
+            RestartClock();
         }
         in.CutTop(8);
         if (!mp4) {
+            // The preview plays the same way.
+            label(L"재생 방향", {});
+            if (ui_.Segmented(HashId("ex.dir"), in.CutTop(32), {L"그대로", L"거꾸로", L"부메랑"},
+                              settings_.directionIdx)) {
+                changed = true;
+                FollowDirection();
+            }
+            static const wchar_t* const kDirectionHint[] = {
+                L"", L"끝에서 처음으로 재생합니다.", L"앞으로 갔다가 되돌아옵니다. 길이가 2배가 됩니다."};
+            if (settings_.directionIdx) hintText(kDirectionHint[settings_.directionIdx], TextFaint);
+            in.CutTop(8);
             Rect row = in.CutTop(32);
             ui_.Text(row, L"반복", 12.5f, TextDim);
             changed |= ui_.Segmented(HashId("ex.loop"), row.CutRight(std::min(186.f, row.W() - 60)),
@@ -1828,7 +1922,15 @@ void App::DrawExportPanel(Rect r) {
         settingsDirty_ = true;
     }
 
-    if (!showResult) {
+    if (!showResult && copying) {
+        // From the keyframe the cut starts at, the size the samples take.
+        double sec = (RangeEndTs() - clip_->Ts(cutSource_->KeyBefore(inF_))) / 1e7;
+        uint64_t bytes = cutSource_->SizeOf(inF_, outF_, ExportAudio());
+        std::wstring sum = util::Format(L"%d×%d · %.0ffps · %.1f초 · %s", clip_->Width(), clip_->Height(), outFps, sec,
+                                        ExportAudio() ? L"소리 포함" : L"소리 없음");
+        if (bytes) sum += L" · 약 " + util::FormatBytes(bytes);
+        ui_.Text(summary, sum, 12.f, TextDim, Align(AlignCenter));
+    } else if (!showResult) {
         std::wstring sum = mp4 ? util::Format(L"%d×%d · %.0ffps · %.1f초 · %s", ow, oh, outFps, outSec,
                                               ExportAudio() ? L"소리 포함" : L"소리 없음")
                                : util::Format(L"%d×%d · %.0ffps · %.1f초", ow, oh, outFps, outSec);

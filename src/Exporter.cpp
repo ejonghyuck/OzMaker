@@ -1,10 +1,13 @@
 #include "pch.h"
 #include "Exporter.h"
+#include "Caption.h"
+#include "Mp4Cut.h"
 #include "Resize.h"
 #include "Util.h"
 #include "VideoClip.h"
 
-std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, double fpsLimit, double speed) {
+std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, double fpsLimit, double speed,
+                                     int direction) {
     std::vector<PlannedFrame> out;
     size_t count = s.Count();
     if (count == 0 || first > last || first >= count) return out;
@@ -27,6 +30,14 @@ std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, d
         int64_t end = k + 1 < sel.size() ? s.Ts(sel[k + 1]) : rangeEnd;
         double ms = std::max<int64_t>(0, end - s.Ts(sel[k])) / 1e4 / speed;
         out.push_back({sel[k], ms});
+    }
+    // Each frame keeps its own duration either way.
+    if (direction == 1) {
+        std::reverse(out.begin(), out.end());
+    } else if (direction == 2 && out.size() > 2) {
+        // Back again without either end twice in a row, so the loop runs on smoothly.
+        out.reserve(out.size() * 2 - 2);
+        for (size_t k = out.size() - 2; k > 0; --k) out.push_back(out[k]);
     }
     return out;
 }
@@ -61,7 +72,7 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
         double audio = job.audio.enabled ? job.audio.bitrate : 0;
         return (uint64_t)((video + audio) * sec / 8 * 1.01) + 4096;  // + container
     }
-    auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed);
+    auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed, job.direction);
     const size_t n = plan.size();
     if (n == 0 || !FormatAvailable(job.format)) return 0;
     wchar_t dir[MAX_PATH];
@@ -71,6 +82,8 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
     auto reader = job.clip->NewReader();
     AreaResizer resizer;
     std::vector<uint8_t> frame((size_t)job.outW * job.outH * 4);
+    caption::Overlay cap;
+    cap.Make(job.caption, job.captionPos, job.outW, job.outH);
     int cx = job.crop.left, cy = job.crop.top;
     int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
     // Bytes of plan[a, b) as a file of its own.
@@ -93,6 +106,7 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
                 break;
             }
             resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
+            cap.Blend(frame.data());
             ok = enc->Add(frame.data(), plan[k].durationMs, err);
         }
         ok = ok && enc->End(err);
@@ -170,7 +184,8 @@ void Estimator::Run() {
         double lastBytes = 0, lastWork = 0;
         for (size_t i = 0; i < jobs.size() && !cancel_; ++i) {
             const ExportJob& j = jobs[i];
-            double work = (double)j.outW * j.outH * PlanFrames(*j.clip, j.first, j.last, j.fpsLimit, j.speed).size();
+            double work =
+                (double)j.outW * j.outH * PlanFrames(*j.clip, j.first, j.last, j.fpsLimit, j.speed, j.direction).size();
             if (target && lastWork > 0 && i + 1 < jobs.size() && lastBytes * work / lastWork > target * 1.6) continue;
             uint64_t bytes = EstimateBytes(j, cancel_);
             if (cancel_ || !bytes) break;
@@ -219,7 +234,9 @@ void Exporter::Run(ExportJob job) {
     ExportResult res;
     res.path = job.path;
     std::wstring tmp = job.path + L".part";
-    bool ok = job.format == Format::Mp4 ? RunMp4(job, tmp, res) : RunImage(job, tmp, res);
+    bool ok = job.cut                     ? RunCut(job, tmp, res)
+              : job.format == Format::Mp4 ? RunMp4(job, tmp, res)
+                                          : RunImage(job, tmp, res);
     if (ok) {
         ok = MoveFileExW(tmp.c_str(), job.path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
         if (!ok) res.error = L"파일을 저장할 수 없습니다: " + job.path;
@@ -234,7 +251,7 @@ void Exporter::Run(ExportJob job) {
 }
 
 bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportResult& res) {
-    auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed);
+    auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed, job.direction);
     auto enc = CreateEncoder(job.format);
     if (plan.empty()) {
         res.error = L"내보낼 프레임이 없습니다.";
@@ -255,6 +272,8 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     auto reader = job.clip->NewReader();
     AreaResizer resizer;
     std::vector<uint8_t> frame((size_t)job.outW * job.outH * 4);
+    caption::Overlay cap;
+    cap.Make(job.caption, job.captionPos, job.outW, job.outH);
     int cx = job.crop.left, cy = job.crop.top;
     int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
     bool ok = true;
@@ -271,6 +290,7 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
             break;
         }
         resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), job.outW, job.outH);
+        cap.Blend(frame.data());
         double ms = plan[k].durationMs + (k + 1 == plan.size() ? job.holdLastMs : 0);
         ok = enc->Add(frame.data(), ms, res.error);
         res.seconds += ms / 1000.0;
@@ -280,6 +300,25 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     enc.reset();  // closes any open file handle before the rename
     res.frames = (int)plan.size();
     return ok;
+}
+
+// Copies the range out of the video as it is. Should that fail (a file this can't take after all), it is encoded.
+bool Exporter::RunCut(const ExportJob& job, const std::wstring& tmp, ExportResult& res) {
+    mp4::CutSource::Result cut;
+    std::wstring err;
+    if (job.cut->Cut(job.first, job.last, job.audio.enabled, tmp, cancel_, progress_, cut, err)) {
+        res.frames = (int)cut.frames;
+        res.seconds = cut.seconds;
+        res.audio = cut.audio;
+        return true;
+    }
+    if (cancel_) {
+        res.cancelled = true;
+        return false;
+    }
+    DeleteFileW(tmp.c_str());
+    progress_ = 0;
+    return RunMp4(job, tmp, res);
 }
 
 // Re-encodes the range at a constant frame rate: frames are cropped/scaled on the CPU (same path as the image
@@ -335,6 +374,8 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
     auto reader = job.clip->NewReader();
     AreaResizer resizer;
     std::vector<uint8_t> frame((size_t)W * H * 4);
+    caption::Overlay cap;
+    cap.Make(job.caption, job.captionPos, W, H);
     std::vector<int16_t> pcm;
     int64_t audioPushed = 0;
     int cx = job.crop.left, cy = job.crop.top;
@@ -354,6 +395,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
                 return false;
             }
             resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H);
+            cap.Blend(frame.data());
             ctx->UpdateSubresource(tex.Get(), 0, nullptr, frame.data(), W * 4, 0);
             uploaded = plan[k];
         }

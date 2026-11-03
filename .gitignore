@@ -5,3 +5,4 @@ vcpkg_installed/
 .vs/
 *.user
 *.aps
+docs/images/*.log

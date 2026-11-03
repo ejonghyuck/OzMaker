@@ -101,7 +101,15 @@ struct Settings {
     int targetIdx = 0;  // kTargetMB
     bool holdLast = false;
     int exportPreset = 1;        // kExportPresets; -1 = 직접 설정 (the values were picked by hand)
+    // 움짤 and MP4 keep their own 화질 (exportPreset, scaleIdx, outFpsIdx). Those fields hold the kind the editor
+    // shows (exportVideo); the other kind's wait in `stashed` until the editor switches to it (UseExportKind).
+    struct ExportKnobs {
+        int preset, scaleIdx, outFpsIdx;
+    };
+    bool exportVideo = false;
+    ExportKnobs stashed{0, 0, 0};  // MP4 starts at 고화질: a video cut at full size isn't encoded again
     bool exportDetails = false;  // the export panel's 자세히 설정 is open
+    int directionIdx = 0;        // 움짤: 0 그대로, 1 거꾸로, 2 부메랑
     std::wstring nameTemplate = kNameTemplates[0];  // {날짜}/{date}, {창 이름}/{window}
 
     std::vector<std::wstring> recent;  // saved and opened files, newest first
@@ -110,8 +118,10 @@ struct Settings {
     void AddRecent(const std::wstring& path);
     void Load();
     void Save() const;
-    // Sets the size, frame rate and GIF lossy level to kExportPresets[i] (exportPreset itself stays).
+    // Sets the size, frame rate and (움짤) GIF lossy level to kExportPresets[i] (exportPreset itself stays).
     void ApplyPreset(int i, bool video);
+    // Makes exportPreset, scaleIdx and outFpsIdx those of 움짤 or of MP4.
+    void UseExportKind(bool video);
     // The preset the size and frame rate (and for GIF the lossy level) match, -1 if none.
     int MatchPreset(bool video, bool gif) const;
 
