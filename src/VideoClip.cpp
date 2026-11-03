@@ -338,18 +338,18 @@ bool ReadSampleTables(const std::wstring& path, std::vector<SampleEntry>& out) {
 // Why a video can't be decoded, by its compression format.
 std::wstring NoDecoderMessage(const GUID& subtype) {
     if (subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES)
-        return L"HEVC(H.265) 영상입니다. Microsoft Store의 'HEVC 비디오 확장'을 설치하면 열 수 있습니다.";
+        return tr(L"HEVC(H.265) 영상입니다. Microsoft Store의 'HEVC 비디오 확장'을 설치하면 열 수 있습니다.");
     if (subtype == MFVideoFormat_VP90)
-        return L"VP9 영상입니다. Microsoft Store의 'VP9 비디오 확장'을 설치하면 열 수 있습니다.";
+        return tr(L"VP9 영상입니다. Microsoft Store의 'VP9 비디오 확장'을 설치하면 열 수 있습니다.");
     if (subtype == MFVideoFormat_AV1)
-        return L"AV1 영상입니다. Microsoft Store의 'AV1 비디오 확장'을 설치하면 열 수 있습니다.";
+        return tr(L"AV1 영상입니다. Microsoft Store의 'AV1 비디오 확장'을 설치하면 열 수 있습니다.");
     // The MPEG-4 source puts a sample entry type it doesn't know into Data1, first letter in the high byte.
     wchar_t cc[5] = {};
     for (int i = 0; i < 4; ++i) {
         wchar_t ch = (wchar_t)((subtype.Data1 >> (24 - 8 * i)) & 0xFF);
         cc[i] = ch >= 0x20 && ch < 0x7F ? ch : L'?';
     }
-    return std::wstring(L"이 영상 형식(") + cc + L")을 재생할 코덱이 이 PC에 없습니다.";
+    return std::wstring(tr(L"이 영상 형식(")) + cc + tr(L")을 재생할 코덱이 이 PC에 없습니다.");
 }
 
 }  // namespace
@@ -358,12 +358,12 @@ std::shared_ptr<VideoClip> VideoClip::Open(const std::wstring& path, std::wstrin
     EnsureMediaFoundation();
     ComPtr<IMFSourceReader> rd;
     if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &rd))) {
-        err = L"동영상 파일을 열 수 없습니다.";
+        err = tr(L"동영상 파일을 열 수 없습니다.");
         return nullptr;
     }
     ComPtr<IMFMediaType> native;
     if (FAILED(rd->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) {
-        err = L"영상이 들어 있지 않은 파일입니다.";
+        err = tr(L"영상이 들어 있지 않은 파일입니다.");
         return nullptr;
     }
     auto c = std::make_shared<VideoClip>();
@@ -416,7 +416,7 @@ std::shared_ptr<VideoClip> VideoClip::Open(const std::wstring& path, std::wstrin
         es.push_back({ts, dur, MFGetAttributeUINT32(s.Get(), MFSampleExtension_CleanPoint, 0) != 0});
     }
     if (es.empty() || w == 0 || h == 0) {
-        err = L"영상 프레임을 읽을 수 없습니다.";
+        err = tr(L"영상 프레임을 읽을 수 없습니다.");
         return nullptr;
     }
     // Asking for decoded frames loads the decoder: without one the editor would only show a blank picture.

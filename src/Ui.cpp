@@ -156,7 +156,7 @@ void Painter::PopClip() { rt_->PopAxisAlignedClip(); }
 
 void Painter::Logo(const Rect& r) {
     if (!logoBrush_) {
-        D2D1_GRADIENT_STOP stops[] = {{0.f, Accent}, {1.f, Accent2}};
+        D2D1_GRADIENT_STOP stops[] = {{0.f, Dark().Accent}, {1.f, Dark().Accent2}};  // the brand's, in any theme
         ComPtr<ID2D1GradientStopCollection> coll;
         rt_->CreateGradientStopCollection(stops, 2, &coll);
         rt_->CreateLinearGradientBrush({}, coll.Get(), &logoBrush_);
@@ -198,6 +198,152 @@ void Ui::Begin(ID2D1RenderTarget* rt, const UiInput& in, double now) {
     natives_.clear();
     floatDepth_ = layerErrors_ = 0;
     focusDrawn_ = false;
+    KeyboardInput();
+}
+
+// Tab, and the keys meant for the focused control, before the page sees them. The last frame's nodes say what is
+// there to move to.
+void Ui::KeyboardInput() {
+    nodes_.clear();
+    nodeAt_.clear();
+    nextName_.clear();
+    step_ = 0;
+    if (in_.pressed) ring_ = false;
+    auto take = [&](UINT vk) {
+        auto it = std::find(in_.keys.begin(), in_.keys.end(), vk);
+        if (it == in_.keys.end()) return false;
+        in_.keys.erase(it);
+        return true;
+    };
+    auto inRow = [](const UiNode& n) { return n.role == Role::Choice || n.role == Role::Tab; };
+    auto stop = [&](const UiNode& n) {
+        // Scrolled out of its view is still a stop: the view scrolls to it (KeepInView).
+        if (n.role == Role::Group || n.blocked || !n.enabled || n.full.Empty()) return false;
+        if (!inRow(n) || n.on || n.id == kbd_) return true;
+        // A row is one stop: its chosen cell, or its first when none is chosen.
+        for (const UiNode& o : shown_)
+            if (o.group == n.group && (o.on || o.id == kbd_)) return false;
+        return n.pos == 0;
+    };
+    if (!in_.ctrl && !in_.alt && take(VK_TAB)) {
+        std::vector<const UiNode*> order;
+        int at = -1;
+        for (const UiNode& n : shown_) {
+            if (n.id == kbd_) at = (int)order.size();
+            if (stop(n) || n.id == kbd_) order.push_back(&n);
+        }
+        // From where it was, which may not be a stop now (disabled, under a question): Tab goes to the one after it,
+        // Shift+Tab to the one before.
+        if (at >= 0 && !stop(*order[at])) order.erase(order.begin() + at), --at;
+        else if (at >= 0 && in_.shift) --at;
+        const int n = (int)order.size();
+        if (n > 0) {
+            const int next = in_.shift ? (at < 0 ? n - 1 : (at + n) % n) : (at + 1) % n;
+            const UiNode& to = *order[next];
+            if (focus_ && focus_ != to.id) blurField_ = true;
+            kbd_ = to.id;
+            ring_ = focusMoved_ = scrollTo_ = true;
+            if (to.role == Role::Edit) Focus(to.id), blurField_ = false;
+        }
+        return;
+    }
+    if (focus_ || !ring_ || !kbd_) return;  // a text field takes its own keys
+    auto it = shownAt_.find(kbd_);
+    if (it == shownAt_.end()) return;
+    const UiNode& n = shown_[it->second];
+    if (n.blocked) return;  // under a question: Enter and Esc are its answers
+    if (in_.Key(VK_ESCAPE)) {
+        ring_ = false;  // lets go of the keyboard; the page still gets Esc
+        return;
+    }
+    if (n.role == Role::Slider) {
+        if (!n.settable) return;  // the page's own keys (the editor's arrows and Space)
+        if (take(VK_LEFT) || take(VK_DOWN)) step_ = -1;
+        else if (take(VK_RIGHT) || take(VK_UP)) step_ = 1;
+        else if (take(VK_HOME)) step_ = -1000;
+        else if (take(VK_END)) step_ = 1000;
+    } else if (inRow(n)) {
+        const int d = (take(VK_LEFT) || take(VK_UP)) ? -1 : (take(VK_RIGHT) || take(VK_DOWN)) ? 1 : 0;
+        if (d) {
+            std::vector<const UiNode*> row;
+            int at = 0;
+            for (const UiNode& o : shown_)
+                if (o.group == n.group && inRow(o)) {
+                    if (o.id == kbd_) at = (int)row.size();
+                    row.push_back(&o);
+                }
+            for (int k = 1; k < (int)row.size(); ++k) {
+                const UiNode& o = *row[(at + d * k + (int)row.size() * k) % row.size()];
+                if (!o.enabled) continue;
+                kbd_ = press_ = o.id;  // the chosen cell follows the focus
+                focusMoved_ = scrollTo_ = true;
+                break;
+            }
+        }
+    }
+    if (n.role == Role::Edit) {
+        if (take(VK_RETURN)) Focus(kbd_);  // back into the field it let go of
+    } else if (n.role != Role::Slider && (take(VK_SPACE) || take(VK_RETURN))) {
+        press_ = kbd_;
+    }
+}
+
+UiNode& Ui::Node(UiId id, const Rect& r, Role role, bool enabled, std::wstring_view name) {
+    auto [it, fresh] = nodeAt_.try_emplace(id, nodes_.size());
+    if (fresh) {
+        UiNode n;
+        n.id = id;
+        n.role = role;
+        n.blocked = blocked_;
+        n.name = name.empty() ? std::exchange(nextName_, {}) : std::wstring(name);
+        nodes_.push_back(std::move(n));
+    }
+    UiNode& n = nodes_[it->second];
+    n.full = r;
+    n.view = clips_.empty() ? Rect() : clips_.back();
+    n.r = clips_.empty() ? r : r.Intersect(clips_.back());
+    if (n.r.Empty()) n.r = {};
+    n.enabled = enabled;
+    return n;
+}
+
+UiNode& Ui::Declare(UiId id, const Rect& r, Role role, std::wstring_view name, bool enabled) {
+    UiNode& n = Node(id, r, role, enabled, name);
+    n.role = role;
+    if (!name.empty()) n.name = name;
+    return n;
+}
+
+void Ui::KeepInView(const Rect& view, float& scroll) {
+    const UiNode* n = scrollTo_ ? Shown(kbd_) : nullptr;
+    if (!n || n->view.l != view.l || n->view.t != view.t || n->view.r != view.r || n->view.b != view.b) return;
+    scrollTo_ = false;
+    const float m = 8;  // room around it
+    if (n->full.t < view.t + m) scroll -= view.t + m - n->full.t;
+    else if (n->full.b > view.b - m) scroll += std::min(n->full.b - (view.b - m), n->full.t - (view.t + m));
+}
+
+UiNode* Ui::Describe(UiId id, std::wstring_view name, Role role) {
+    auto it = nodeAt_.find(id);
+    if (it == nodeAt_.end()) return nullptr;
+    UiNode& n = nodes_[it->second];
+    n.name = name;
+    n.role = role;
+    return &n;
+}
+
+const UiNode* Ui::Shown(UiId id) const {
+    auto it = shownAt_.find(id);
+    return it == shownAt_.end() ? nullptr : &shown_[it->second];
+}
+
+void Ui::SetKeyboardFocus(UiId id, bool ring) {
+    if (kbd_ != id) focusMoved_ = true;
+    kbd_ = id;
+    ring_ = ring;
+    const UiNode* n = Shown(id);
+    if (n && n->role == Role::Edit) Focus(id);
+    else if (focus_) blurField_ = true;
 }
 
 void Ui::End() {
@@ -209,7 +355,7 @@ void Ui::End() {
         if (r.r > sz.width - 4) r = r.Offset(sz.width - 4 - r.r, 0);
         if (r.l < 4) r = r.Offset(4 - r.l, 0);
         if (r.b > sz.height - 4) r = r.Offset(0, -(r.H() + tipAnchor_.H() + 12));
-        Fill(r, Hex(0x2B303B), 6);
+        Fill(r, P.Tip, 6);
         Stroke(r.Inset(0.5f), BorderStrong, 6);
         TextStyle st;
         st.h = AlignCenter;
@@ -222,6 +368,30 @@ void Ui::End() {
         imeReset_ = !in_.composing.empty();
         focus_ = 0;
     }
+    // The keyboard focus: gone with its control (another screen), into a question or a popover once one covers it,
+    // and a ring around it after the keyboard moved it (a text field shows its own).
+    auto it = nodeAt_.find(kbd_);
+    if (kbd_ && it == nodeAt_.end()) {
+        kbd_ = 0;
+    } else if (kbd_ && nodes_[it->second].blocked) {
+        for (const UiNode& n : nodes_)
+            if (!n.blocked && n.enabled && n.role != Role::Group && !n.r.Empty() && (n.role != Role::Choice || n.on)) {
+                kbd_ = n.id;
+                focusMoved_ = true;
+                it = nodeAt_.find(kbd_);
+                break;
+            }
+    }
+    if (ring_ && kbd_ && !focus_ && it != nodeAt_.end() && !nodes_[it->second].r.Empty()) {
+        const Rect r = nodes_[it->second].r.Inset(-3.f);
+        BeginFloat();
+        Stroke(r, P.Focus, std::min(12.f, r.H() / 2), 2.f);
+        EndFloat();
+    }
+    shown_.swap(nodes_);
+    shownAt_.swap(nodeAt_);
+    press_ = setId_ = 0;  // meant for this frame; a control that was not drawn takes none
+    blurField_ = scrollTo_ = false;
 }
 
 void Ui::BeginFloat() {
@@ -256,11 +426,17 @@ bool Ui::Hover(const Rect& r) const {
 
 bool Ui::Click(UiId id, const Rect& r, bool enabled) {
     if (keepRects_) rects_[id] = r;
+    const bool blocked = Node(id, r, Role::Button, enabled).blocked;  // keeps the role a widget gave it
     bool h = enabled && Hover(r);
     if (h) cursor_ = IDC_HAND;
     if (h && in_.pressed && !pressTaken_) {
         active_ = id;
         pressTaken_ = true;
+        if (kbd_ != id) kbd_ = id, focusMoved_ = true;  // the focus goes where the click was
+    }
+    if (press_ == id) {
+        press_ = 0;
+        if (enabled && !blocked) return true;
     }
     return active_ == id && in_.released && h;
 }
@@ -269,7 +445,7 @@ float Ui::AnimFrom(UiId id, float target, float initial, float speed) {
     auto [it, inserted] = anim_.try_emplace(id, initial);
     float& v = it->second;
     if (v != target) {
-        float k = 1.f - std::exp(-speed * dt_);
+        float k = motion_ ? 1.f - std::exp(-speed * dt_) : 1.f;  // with Windows' animations off it is there at once
         v += (target - v) * k;
         if (std::fabs(target - v) < 0.002f)
             v = target;
@@ -283,6 +459,7 @@ float Ui::Anim(UiId id, float target, float speed) { return AnimFrom(id, target,
 
 bool Ui::Button(UiId id, const Rect& r, std::wstring_view label, BtnStyle style, wchar_t icon, bool enabled,
                 float fs) {
+    Node(id, r, Role::Button, enabled, label);
     bool clicked = Click(id, r, enabled);
     bool hot = enabled && Hover(r);
     bool down = enabled && active_ == id && in_.down;
@@ -290,15 +467,16 @@ bool Ui::Button(UiId id, const Rect& r, std::wstring_view label, BtnStyle style,
 
     D2D1_COLOR_F bg{}, fg{}, border{};
     switch (style) {
-        case BtnStyle::Primary: bg = Mix(Accent, AccentHi, h); fg = White; break;
-        case BtnStyle::Danger: bg = Mix(Rec, RecHi, h); fg = White; break;
+        case BtnStyle::Primary: bg = Mix(AccentFill, AccentFillHi, h); fg = OnFill; break;
+        case BtnStyle::Danger: bg = Mix(RecFill, RecFillHi, h); fg = OnFill; break;
         case BtnStyle::Secondary: bg = Mix(Surface2, Surface3, h); fg = TextColor; border = Border; break;
         case BtnStyle::Ghost: bg = WithAlpha(Surface3, h); fg = Mix(TextDim, TextColor, h); break;
     }
+    if (Contrast()) border = Border;  // every control outlined
     if (!enabled) {
         bg = style == BtnStyle::Ghost ? Clear : Surface2;
-        fg = TextFaint;
-        border = Clear;
+        fg = P.Disabled;
+        border = Contrast() ? P.Disabled : Clear;
     }
     if (down) bg = Mix(bg, Black, 0.12f);
     float rad = std::min(9.f, r.H() / 2);
@@ -320,13 +498,17 @@ bool Ui::Button(UiId id, const Rect& r, std::wstring_view label, BtnStyle style,
 }
 
 bool Ui::IconButton(UiId id, const Rect& r, wchar_t glyph, std::wstring_view tip, bool enabled, float size) {
+    Node(id, r, Role::Button, enabled, tip);
     bool clicked = Click(id, r, enabled);
     bool hot = enabled && Hover(r);
     float h = Anim(id, hot ? 1.f : 0.f);
     bool down = enabled && active_ == id && in_.down;
-    D2D1_COLOR_F bg = WithAlpha(down ? BorderStrong : Surface3, h);
-    Fill(r, bg, std::min(8.f, r.H() / 2));
-    Icon(r, glyph, size, enabled ? Mix(TextDim, TextColor, h) : TextFaint);
+    if (Contrast()) {
+        if (h > 0.5f) Stroke(r.Inset(0.5f), Border, std::min(8.f, r.H() / 2));
+    } else {
+        Fill(r, WithAlpha(down ? BorderStrong : Surface3, h), std::min(8.f, r.H() / 2));
+    }
+    Icon(r, glyph, size, enabled ? Mix(TextDim, TextColor, h) : P.Disabled);
     if (!tip.empty()) Tooltip(id, r, tip);
     return clicked;
 }
@@ -335,14 +517,18 @@ bool Ui::Segmented(UiId id, const Rect& r, std::initializer_list<std::wstring_vi
                    uint32_t disabledMask) {
     int n = (int)items.size();
     if (n == 0) return false;
+    Node(id, r, Role::Group, true);
     Fill(r, Surface2, 9);
+    if (Contrast()) Stroke(r.Inset(0.5f), Border, 9);
     const float pad = 3;
     float iw = (r.W() - pad * 2) / n;
     if (sel >= 0 && sel < n) {
         float pos = AnimFrom(id, (float)sel, (float)sel, 20.f);
         Rect pill = Rect::XYWH(r.l + pad + pos * iw, r.t + pad, iw, r.H() - pad * 2);
-        Fill(pill, Hex(0x2C3240), 7);
-        Stroke(pill.Inset(0.5f), Hex(0x3A4252), 7);
+        // In a contrast theme a chosen cell that is off is outlined in GrayText: GrayText on Highlight can't be read.
+        const bool off = Contrast() && (disabledMask & (1u << sel));
+        Fill(pill, off ? Surface2 : P.Pill, 7);
+        Stroke(pill.Inset(0.5f), off ? P.Disabled : P.PillLine, 7);
     }
     bool changed = false;
     int i = 0;
@@ -350,78 +536,98 @@ bool Ui::Segmented(UiId id, const Rect& r, std::initializer_list<std::wstring_vi
         Rect cell = Rect::XYWH(r.l + pad + i * iw, r.t + pad, iw, r.H() - pad * 2);
         UiId cid = CellId(id, i);
         bool en = !(disabledMask & (1u << i));
+        UiNode& node = Node(cid, cell, Role::Choice, en, s);
+        node.pos = i;
+        node.count = n;
+        node.group = id;
         if (Click(cid, cell, en) && sel != i) {
             sel = i;
             changed = true;
         }
         float h = Anim(cid, (en && Hover(cell)) ? 1.f : 0.f);
-        D2D1_COLOR_F fg = !en ? WithAlpha(TextFaint, 0.6f) : (i == sel ? TextColor : Mix(TextDim, TextColor, h));
+        D2D1_COLOR_F fg = !en         ? (Contrast() ? P.Disabled : WithAlpha(TextFaint, 0.6f))
+                          : i == sel ? (Contrast() ? OnFill : TextColor)
+                                     : Mix(TextDim, TextColor, h);
         TextStyle st;
         st.h = AlignCenter;
         st.weight = i == sel ? kSemibold : DWRITE_FONT_WEIGHT_NORMAL;
         Text(cell, s, 13.f, fg, st);
         ++i;
     }
+    for (i = 0; i < n; ++i) nodes_[nodeAt_[CellId(id, i)]].on = i == sel;
     return changed;
 }
 
 bool Ui::Slider(UiId id, const Rect& r, float& v, float lo, float hi) {
     bool hov = Hover(r);
+    UiNode& node = Node(id, r, Role::Slider, true);
     Click(id, r);
     bool changed = false;
-    if (active_ == id && in_.down) {
-        float t = std::clamp((in_.mx - r.l) / std::max(1.f, r.W()), 0.f, 1.f);
-        float nv = lo + t * (hi - lo);
-        if (nv != v) {
-            v = nv;
-            changed = true;
-        }
+    float nv = v;
+    if (active_ == id && in_.down) nv = lo + std::clamp((in_.mx - r.l) / std::max(1.f, r.W()), 0.f, 1.f) * (hi - lo);
+    if (kbd_ == id && step_) nv = std::clamp(v + step_ * (hi - lo) / 20, lo, hi);  // 20 steps end to end
+    if (setId_ == id) nv = std::clamp(setValue_, lo, hi);
+    if (nv != v && !node.blocked) {
+        v = nv;
+        changed = true;
     }
+    node.value = v, node.lo = lo, node.hi = hi;
+    node.settable = true;
     if (hov) cursor_ = IDC_HAND;
     float t = std::clamp((v - lo) / (hi - lo), 0.f, 1.f);
     float cy = r.CY();
-    Fill(Rect(r.l, cy - 2, r.r, cy + 2), Surface3, 2);
+    Fill(Rect(r.l, cy - 2, r.r, cy + 2), Contrast() ? TextColor : Surface3, 2);
     Fill(Rect(r.l, cy - 2, r.l + t * r.W(), cy + 2), Accent, 2);
     float h = Anim(id, (hov || active_ == id) ? 1.f : 0.f);
     float kx = r.l + t * r.W();
     if (h > 0) Circle(kx, cy, 7 + 5 * h, WithAlpha(Accent, 0.25f * h));
-    Circle(kx, cy, 7, White);
+    Circle(kx, cy, 7, P.Knob);
+    if (P.light) Ring(kx, cy, 7.5f, BorderStrong, 1.f);  // a white knob on a white panel
     return changed;
 }
 
 bool Ui::Toggle(UiId id, const Rect& r, bool& v) {
     bool changed = false;
+    Node(id, r, Role::Toggle, true);
     if (Click(id, r)) {
         v = !v;
         changed = true;
     }
+    nodes_[nodeAt_[id]].on = v;
     float t = AnimFrom(id, v ? 1.f : 0.f, v ? 1.f : 0.f, 18.f);
-    Fill(r, Mix(Surface3, Accent, t), r.H() / 2);
+    Fill(r, Mix(P.ToggleOff, Accent, t), r.H() / 2);
+    if (Contrast() && t < 1) Stroke(r.Inset(0.5f), Border, r.H() / 2);
     float kr = r.H() / 2 - 3;
     float kx = r.l + r.H() / 2 + t * (r.W() - r.H());
-    Circle(kx, r.CY(), kr, White);
+    Circle(kx, r.CY(), kr, Contrast() ? Mix(P.Knob, OnFill, t) : P.Knob);
     return changed;
 }
 
 bool Ui::ToggleRow(UiId id, const Rect& r, std::wstring_view label, bool& v, std::wstring_view sub, bool enabled) {
     bool changed = false;
     UiId rowId = id ^ 0x5bd1e995u;
+    Node(rowId, r, Role::Toggle, enabled, label);
     if (Click(rowId, r, enabled)) {
         v = !v;
         changed = true;
     }
+    nodes_[nodeAt_[rowId]].on = v;
     bool on = v && enabled;
     float h = Anim(rowId, enabled && Hover(r) ? 1.f : 0.f);
     Fill(r, WithAlpha(Surface2, h), 8);
+    if (Contrast()) Stroke(r.Inset(0.5f), enabled ? Border : P.Disabled, 8);
     Rect sw = Rect::XYWH(r.r - 10 - 36, r.CY() - 10, 36, 20);
     float t = AnimFrom(id, on ? 1.f : 0.f, on ? 1.f : 0.f, 18.f);
-    Fill(sw, WithAlpha(Mix(Surface3, Accent, t), enabled ? 1.f : 0.5f), 10);
-    Circle(sw.l + 10 + t * 16, sw.CY(), 7, WithAlpha(White, enabled ? 1.f : 0.4f));
+    Fill(sw, WithAlpha(Mix(P.ToggleOff, Accent, t), enabled ? 1.f : 0.5f), 10);
+    if (Contrast() && t < 1) Stroke(sw.Inset(0.5f), enabled ? Border : P.Disabled, 10);
+    const D2D1_COLOR_F knob = Contrast() ? (enabled ? Mix(P.Knob, OnFill, t) : P.Disabled) : P.Knob;
+    Circle(sw.l + 10 + t * 16, sw.CY(), 7, WithAlpha(knob, enabled || Contrast() ? 1.f : 0.4f));
     Rect tr = Rect(r.l + 10, r.t, sw.l - 8, r.b);
+    const D2D1_COLOR_F fg = enabled ? TextColor : P.Disabled;
     if (sub.empty()) {
-        Text(tr, label, 13.f, enabled ? TextColor : TextFaint);
+        Text(tr, label, 13.f, fg);
     } else {
-        Text(Rect(tr.l, tr.t + 5, tr.r, tr.CY() + 1), label, 13.f, enabled ? TextColor : TextFaint);
+        Text(Rect(tr.l, tr.t + 5, tr.r, tr.CY() + 1), label, 13.f, fg);
         Text(Rect(tr.l, tr.CY() - 1, tr.r, tr.b - 5), sub, 11.5f, TextFaint);
     }
     return changed;
@@ -429,9 +635,25 @@ bool Ui::ToggleRow(UiId id, const Rect& r, std::wstring_view label, bool& v, std
 
 void Ui::Focus(UiId id) {
     focus_ = id;
+    focusDrawn_ = true;  // kept through this frame's End: a field first drawn next frame still gets it
     caret_ = anchor_ = SIZE_MAX;  // the end, once the text is known
     scrollX_ = 0;
     caretMoved_ = now_;
+}
+
+bool Ui::InsertText(UiId id, std::wstring& text, std::wstring_view s, size_t maxLen) {
+    size_t a = text.size(), b = a;
+    if (caretOf_ == id) {
+        a = std::min({caret_, anchor_, text.size()});
+        b = std::min(std::max(caret_, anchor_), text.size());
+    }
+    if (text.size() - (b - a) + s.size() > maxLen) return false;  // half a token helps no one
+    text.replace(a, b - a, s);
+    focus_ = caretOf_ = id;
+    focusDrawn_ = true;  // the field was drawn before the button: keep the focus through End, as Focus does
+    caret_ = anchor_ = a + s.size();
+    caretMoved_ = now_;
+    return true;
 }
 
 namespace {
@@ -498,11 +720,13 @@ bool Ui::TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view
         return std::min(text.size(), (size_t)m.textPosition + (trailing ? m.length : 0));
     };
 
+    Node(id, r, Role::Edit, true, placeholder);
     bool focused = focus_ == id, changed = false;
     if (focused) {
         focusDrawn_ = true;
         caret_ = std::min(caret_, text.size());
         anchor_ = std::min(anchor_, text.size());
+        caretOf_ = id;
     }
     const bool hot = Hover(r);
     if (hot) cursor_ = IDC_IBEAM;
@@ -537,13 +761,18 @@ bool Ui::TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view
         focus_ = 0;
         focused = false;
     };
+    if (focused && blurField_) {  // Tab took the focus elsewhere
+        blurField_ = false;
+        blur();
+    }
 
     if (!blocked_ && in_.pressed) {
         if (hot && !pressTaken_) {
             pressTaken_ = true;
             active_ = id;
+            if (kbd_ != id) kbd_ = id, focusMoved_ = true;
             if (!focused) {
-                focus_ = id;
+                focus_ = caretOf_ = id;
                 focused = focusDrawn_ = true;
                 scrollX_ = 0;
             }
@@ -656,6 +885,7 @@ bool Ui::TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view
             Line(inner.l + x0 - sx, y, inner.l + x1 - sx, y, TextColor, 1.f);
         }
     }
+    nodes_[nodeAt_[id]].text = text;
     caretRect_ = {};
     if (focused) {
         float x = std::round(inner.l + caretX - sx);
@@ -690,6 +920,7 @@ void Ui::Tooltip(UiId id, const Rect& r, std::wstring_view text) {
 
 void Ui::ProgressBar(const Rect& r, float t, D2D1_COLOR_F c) {
     Fill(r, Surface3, r.H() / 2);
+    if (Contrast()) Stroke(r.Inset(0.5f), Border, r.H() / 2);
     t = std::clamp(t, 0.f, 1.f);
     if (t > 0) Fill(Rect(r.l, r.t, r.l + std::max(r.H(), r.W() * t), r.b), c, r.H() / 2);
 }

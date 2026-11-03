@@ -32,6 +32,7 @@ double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double
 std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double seconds, int& rate);
 bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
                   bool fragmented = false, bool crash = false);
+bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got);
 int ReadIndex(const uint8_t* p, int w, int h);
 
 struct TopBox {
@@ -106,6 +107,13 @@ int GifLoopCount(const std::wstring& path) {
 HWND MakeStandInWindow(HINSTANCE inst) {
     return CreateWindowExW(0, L"STATIC", L"OzMaker Test Window", WS_POPUP, 0, 0, 800, 450, nullptr, nullptr, inst,
                            nullptr);
+}
+
+// A hidden window that answers UI Automation from an Access (GWLP_USERDATA), for the screen reader test.
+LRESULT CALLBACK AccessTestProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_GETOBJECT && static_cast<long>(l) == static_cast<long>(UiaRootObjectId))
+        if (auto* a = reinterpret_cast<Access*>(GetWindowLongPtrW(h, GWLP_USERDATA))) return a->OnGetObject(w, l);
+    return DefWindowProcW(h, m, w, l);
 }
 
 // Eight blocks of saturated colour (nothing in the UI is that colour): a preview of it shows where each part of the
@@ -1076,6 +1084,80 @@ int App::RunSelfTest(const std::wstring& dir) {
             DeleteFileW(mp4.c_str());
             DeleteFileW(gif.c_str());
         }
+        // A failure (an Alert) stays until it is closed, in a float like any toast. Its button opens the settings
+        // tab that fixes it; a plain toast still goes by itself.
+        {
+            filesOpen_ = false;
+            screen_ = Screen::Home;
+            const int tabWas = settings_.settingsTab;
+            settings_.settingsTab = kTabGeneral;
+            ui_.KeepRects(true);
+            auto press = [&](UiId id) {
+                const Rect* b = ui_.LastRect(id);
+                if (!b) return false;
+                in.mx = b->CX(), in.my = b->CY();
+                in.pressed = in.down = true;
+                frames(1);
+                in.pressed = in.down = false;
+                in.released = true;
+                frames(1);
+                in.released = false;
+                return true;
+            };
+            Alert(L"영상 인코더를 시작할 수 없습니다. (0x8007000E) 하드웨어 인코딩을 끄거나 해상도를 낮춰 보세요.",
+                  kTabVideo);
+            frames(3);
+            clock += 60;  // long past the time any toast stays
+            frames(2);
+            const bool stays = clock < toastUntil_ && ui_.LastRect(HashId("toast.act")) && ui_.LayerErrors() == 0;
+            const bool opened = press(HashId("toast.act")) && screen_ == Screen::Settings &&
+                                settings_.settingsTab == kTabVideo && clock >= toastUntil_;
+            screen_ = Screen::Home;
+            Alert(L"내보내기에 실패했습니다.");
+            frames(3);
+            const bool closed = press(HashId("toast.close")) && clock >= toastUntil_;
+            // Home's record button lies under the alert: the clicks were the alert's only.
+            const bool pageUntouched = rec_ == RecState::Idle;
+            Toast(L"파일을 복사했습니다.", true);
+            const bool goes = !toastSticky_ && toastUntil_ < clock + 60;
+            good = stays && opened && closed && pageUntouched && goes;
+            log(util::Format(L"alert: %s stays past a toast's time %d, its button opens 설정 › 동영상 %d, closes %d, "
+                             L"the page under it untouched %d, a plain error toast still goes %d",
+                             good ? L"ok" : L"FAIL", stays, opened, closed, pageUntouched, goes));
+            if (!good) ++failures;
+
+            // 설정 › 일반 › 파일 이름 › 직접 입력: picking it opens the field with the caret in it; a token's button
+            // puts the token where the caret was (here the start) and gives the field the focus back.
+            const std::wstring nameWas = settings_.nameTemplate;
+            screen_ = Screen::Settings;
+            settings_.settingsTab = kTabGeneral;
+            settingsScroll_ = 0;
+            settings_.nameTemplate = L"_{날짜}";
+            nameCustom_ = true;
+            ui_.Focus(HashId("set.nameText"));
+            frames(2);
+            const bool fieldShown = ui_.TextFocused();  // a field not drawn loses the focus
+            in.keys = {VK_HOME};
+            frames(1);
+            in.keys.clear();
+            const bool pressed = press(HashId("set.nameTok", kTokWindow));
+            const std::wstring pattern = settings_.nameTemplate;
+            const bool inserted = pressed && pattern == L"{창 이름}_{날짜}" && ui_.TextFocused();
+            nameCustom_ = false;
+            settings_.nameTemplate = kNameTemplates[0];
+            frames(2);
+            const bool presetCloses = !ui_.TextFocused();
+            good = fieldShown && inserted && presetCloses;
+            log(util::Format(L"file name field: %s 직접 입력 shows it focused %d, a token goes in at the caret %d, "
+                             L"a preset hides it %d",
+                             good ? L"ok" : L"FAIL", fieldShown, inserted, presetCloses));
+            if (!inserted) log(L"  pattern: " + pattern);
+            if (!good) ++failures;
+            settings_.nameTemplate = nameWas;
+            ui_.KeepRects(false);
+            settings_.settingsTab = tabWas;
+            screen_ = Screen::Home;
+        }
         filesOpen_ = false;
         toastUntil_ = 0;
         recentFiles_.clear();
@@ -1083,6 +1165,38 @@ int App::RunSelfTest(const std::wstring& dir) {
         DestroyWindow(standIn);
     }
     failures += UpdaterChecks(dir + L"\\update", log);
+
+    // File names (설정 › 일반 › 파일 이름): the tokens in either language, filled once (a window title that looks like
+    // a token stays one), characters a name can't hold, an empty pattern, and {번호} past the numbers in the folder.
+    {
+        SYSTEMTIME t{};
+        t.wYear = 2026, t.wMonth = 11, t.wDay = 3, t.wHour = 15, t.wMinute = 24, t.wSecond = 50;
+        const bool tokens =
+            FillName(L"{창 이름} {연}-{월}-{일} {시}.{분}.{초}", L"데모 게임", t, 1) == L"데모 게임 2026-11-03 15.24.50" &&
+            FillName(L"{window}_{date}_{number}", L"데모 게임", t, 7) == L"데모 게임_20261103_152450_007";
+        const bool once = FillName(L"{창 이름}", L"{date}", t, 1) == L"{date}";
+        const bool unsafe = FillName(L"클립: {창 이름}?", L"a/b", t, 1) == L"클립_ a_b_";
+        const bool empty = FillName(L"", L"데모 게임", t, 1) == L"OzMaker_20261103_152450";
+        const std::wstring outWas = settings_.outDir, nameWas = settings_.nameTemplate;
+        settings_.outDir = dir + L"\\names";
+        util::EnsureDir(settings_.outDir);
+        const wchar_t* made[] = {L"\\클립_001.gif", L"\\클립_002.mp4"};
+        for (const wchar_t* f : made) {
+            HANDLE h = CreateFileW((settings_.outDir + f).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        }
+        settings_.nameTemplate = L"클립_{번호}";
+        const bool number = FileStem(L"데모 게임") == L"클립_003" && FileStem(L"데모 게임", false) == L"클립_001";
+        for (const wchar_t* f : made) DeleteFileW((settings_.outDir + f).c_str());
+        RemoveDirectoryW(settings_.outDir.c_str());
+        settings_.outDir = outWas;
+        settings_.nameTemplate = nameWas;
+        const bool good = tokens && once && unsafe && empty && number;
+        log(util::Format(L"file names: %s tokens %d, filled once %d, unsafe characters %d, empty %d, {번호} past the "
+                         L"folder's %d",
+                         good ? L"ok" : L"FAIL", tokens, once, unsafe, empty, number));
+        if (!good) ++failures;
+    }
 
     // Mic mixing (#21), on made-up streams: frame n of each input adds up (the mic with its gain) once both have
     // it, an input left out never holds the other back, Flush pads the shorter one, loud sums clip.
@@ -1396,6 +1510,283 @@ int App::RunSelfTest(const std::wstring& dir) {
             ++failures;
             log(L"text field: FAIL no render target");
         }
+    }
+    // Keyboard and screen readers (#26), on a few controls of each kind. Tab and Shift+Tab go through them in drawing
+    // order, a row of choices as one stop at its chosen cell; Space and Enter press, the arrow keys pick along a row
+    // (past a disabled cell) or move a slider; a text field takes the keys while it has the focus. The ring shows
+    // only once the keyboard moved the focus, in a float; a click moves the focus without it; a question takes the
+    // focus over. Then UI Automation, as a screen reader uses it, on a hidden window of its own showing them.
+    {
+        ComPtr<IWICImagingFactory> wic;
+        ComPtr<IWICBitmap> bmp;
+        ComPtr<ID2D1RenderTarget> rt;
+        bool drew = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                               IID_PPV_ARGS(&wic))) &&
+                    SUCCEEDED(wic->CreateBitmap(400, 260, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp)) &&
+                    SUCCEEDED(gfx_.D2D()->CreateWicBitmapRenderTarget(bmp.Get(), D2D1::RenderTargetProperties(), &rt));
+        Ui ui;
+        UiInput in;
+        double now = 1;
+        int sel = 0, pressedB = 0, asked = 0;
+        std::atomic<int> pressedA{0};
+        bool on = false, question = false, aOff = false;
+        float vol = 50;
+        std::wstring text;
+        const UiId idA = HashId("kb.a"), idRow = HashId("kb.row"), idToggle = HashId("kb.toggle"),
+                   idVol = HashId("kb.vol"), idField = HashId("kb.field"), idB = HashId("kb.b"), idQ = HashId("kb.q");
+        auto frame = [&](std::vector<UINT> keys = {}, bool shift = false) {
+            if (!drew) return;
+            in.keys = std::move(keys);
+            in.shift = shift;
+            rt->BeginDraw();
+            ui.Begin(rt.Get(), in, now += 0.05);
+            ui.SetInputBlocked(question);
+            pressedA += ui.Button(idA, Rect(10, 10, 110, 40), L"단추 A", BtnStyle::Secondary, 0, !aOff);
+            ui.Name(L"줄");
+            ui.Segmented(idRow, Rect(10, 50, 310, 86), {L"하나", L"둘", L"셋"}, sel, 0b010);
+            ui.Name(L"토글");
+            ui.Toggle(idToggle, Rect(10, 96, 54, 120), on);
+            ui.Name(L"음량");
+            ui.Slider(idVol, Rect(10, 130, 210, 150), vol, 0.f, 100.f);
+            ui.TextField(idField, Rect(10, 160, 210, 196), text, L"입력", 20);
+            pressedB += ui.Button(idB, Rect(10, 206, 110, 236), L"단추 B", BtnStyle::Primary);
+            if (question) {
+                ui.SetInputBlocked(false);
+                ui.BeginFloat();
+                asked += ui.Button(idQ, Rect(200, 206, 300, 236), L"예", BtnStyle::Primary);
+                ui.EndFloat();
+            }
+            ui.End();
+            drew &= SUCCEEDED(rt->EndDraw());
+            in.ClearEdges();
+            in.shift = false;
+        };
+        frame();
+        frame({VK_TAB});
+        const bool first = ui.KeyboardFocus() == idA && ui.FocusRing() && ui.Floats().size() == 1;
+        aOff = true;  // where the focus is turns off: Tab goes on to the one after it
+        frame();
+        frame({VK_TAB});
+        aOff = false;
+        const bool row = ui.KeyboardFocus() == Ui::CellId(idRow, 0);
+        frame({VK_RIGHT});
+        const bool picked = sel == 2 && ui.KeyboardFocus() == Ui::CellId(idRow, 2);
+        frame({VK_TAB});
+        frame({VK_SPACE});
+        const bool toggled = on && ui.KeyboardFocus() == idToggle;
+        frame({VK_TAB});
+        frame({VK_RIGHT});
+        const float stepped = vol;
+        frame({VK_END});
+        const bool slid = stepped == 55 && vol == 100;
+        frame({VK_TAB});
+        const bool field = ui.TextFocused() && ui.KeyboardFocus() == idField && ui.Floats().empty();
+        in.chars = L"a b";
+        frame({'A', VK_SPACE, 'B'});
+        frame({VK_TAB});
+        const bool typed = !ui.TextFocused() && ui.KeyboardFocus() == idB && text == L"a b";
+        frame({VK_RETURN});
+        const bool entered = pressedB == 1;
+        frame({VK_TAB}, true);
+        const bool back = ui.TextFocused() && ui.KeyboardFocus() == idField;
+        frame({VK_TAB}, true);
+        frame({VK_TAB}, true);
+        frame({VK_TAB}, true);
+        const bool backRow = ui.KeyboardFocus() == Ui::CellId(idRow, 2) && !ui.TextFocused() && sel == 2;
+        frame({VK_ESCAPE});
+        const bool let = !ui.FocusRing() && ui.KeyboardFocus() == Ui::CellId(idRow, 2);
+        frame({VK_TAB});
+        in.mx = 50;
+        in.my = 25;
+        in.pressed = in.down = true;
+        frame();
+        in.down = false;
+        in.released = true;
+        frame();
+        const bool clicked = pressedA == 1 && ui.KeyboardFocus() == idA && !ui.FocusRing();
+        // The nodes a screen reader is told about.
+        const UiNode *nA = ui.Shown(idA), *nRow = ui.Shown(idRow), *nCell = ui.Shown(Ui::CellId(idRow, 2)),
+                     *nToggle = ui.Shown(idToggle), *nVol = ui.Shown(idVol), *nField = ui.Shown(idField);
+        const bool named = nA && nA->name == L"단추 A" && nA->role == Role::Button && nRow && nRow->name == L"줄" &&
+                           nRow->role == Role::Group && nCell && nCell->name == L"셋" && nCell->role == Role::Choice &&
+                           nCell->pos == 2 && nCell->count == 3 && nCell->group == idRow && nCell->on && nToggle &&
+                           nToggle->name == L"토글" && nToggle->role == Role::Toggle && nToggle->on && nVol &&
+                           nVol->name == L"음량" && nVol->value == 100 && nField && nField->role == Role::Edit &&
+                           nField->name == L"입력" && nField->text == L"a b";
+        frame({VK_TAB});
+        question = true;
+        frame();
+        const bool takenOver = ui.KeyboardFocus() == idQ;
+        frame({VK_RETURN});
+        const bool answered = asked == 1 && pressedA == 1 && pressedB == 1;
+        question = false;
+        frame();
+        bool ok = drew && first && row && picked && toggled && slid && field && typed && entered && back && backRow &&
+                  let && clicked && named && takenOver && answered;
+        if (!ok) ++failures;
+        log(util::Format(L"keyboard: %s first stop with a ring %d, on past a disabled one to a row %d, arrows past a "
+                         L"disabled cell %d, Space toggles %d, arrows and End on a slider %d (%.0f, %.0f), a field "
+                         L"takes the keys %d, typed and left %d, Enter presses %d, Shift+Tab back %d and on %d, Esc "
+                         L"lets go %d, a click moves it without the ring %d, named %d, a question takes it %d, "
+                         L"answered %d",
+                         ok ? L"ok  " : L"FAIL", first, row, picked, toggled, slid, stepped, vol, field, typed,
+                         entered, back, backRow, let, clicked, named, takenOver, answered));
+
+        // UI Automation: a client on a thread of its own (MTA), as a screen reader is; this thread draws a frame
+        // every 30 ms and answers it meanwhile, as the app does.
+        sel = 0;
+        on = false;
+        vol = 50;
+        const int pressedBefore = pressedA;
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = AccessTestProc;
+        wc.hInstance = inst_;
+        wc.lpszClassName = L"OzMakerAccessTest";
+        RegisterClassW(&wc);
+        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"OzMaker Access Test", WS_POPUP, 100, 100,
+                                    400, 260, nullptr, nullptr, inst_, nullptr);
+        Access access;
+        access.Attach(hwnd, &ui, [] { return 1.f; }, [] {});
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&access);
+        frame();
+        std::atomic<bool> done{false};
+        std::wstring seen;  // what the client found, for the log
+        bool tree = false, kinds = false, place = false, box = false, invoked = false, toggledU = false,
+             selected = false, set = false, value = false, focused = false;
+        std::thread client([&] {
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+                done = true;
+                return;
+            }
+            {
+                ComPtr<IUIAutomation> uia;
+                ComPtr<IUIAutomationElement> root;
+                ComPtr<IUIAutomationCondition> all;
+                ComPtr<IUIAutomationElementArray> found;
+                if (SUCCEEDED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                                               IID_PPV_ARGS(&uia))) &&
+                    SUCCEEDED(uia->ElementFromHandle(hwnd, &root)) && SUCCEEDED(uia->CreateTrueCondition(&all)) &&
+                    SUCCEEDED(root->FindAll(TreeScope_Descendants, all.Get(), &found)) && found) {
+                    std::map<std::wstring, ComPtr<IUIAutomationElement>> byName;
+                    std::map<std::wstring, CONTROLTYPEID> type;
+                    int n = 0;
+                    found->get_Length(&n);
+                    for (int i = 0; i < n; ++i) {
+                        ComPtr<IUIAutomationElement> e;
+                        BSTR name = nullptr;
+                        CONTROLTYPEID t = 0;
+                        if (FAILED(found->GetElement(i, &e)) || FAILED(e->get_CurrentName(&name))) continue;
+                        e->get_CurrentControlType(&t);
+                        std::wstring s = name ? name : L"";
+                        SysFreeString(name);
+                        seen += (seen.empty() ? L"" : L", ") + s;
+                        byName[s] = e;
+                        type[s] = t;
+                    }
+                    tree = n == 9;  // 단추 A, 줄 (하나 둘 셋), 토글, 음량, 입력, 단추 B
+                    kinds = type[L"단추 A"] == UIA_ButtonControlTypeId && type[L"줄"] == UIA_GroupControlTypeId &&
+                            type[L"셋"] == UIA_RadioButtonControlTypeId && type[L"토글"] == UIA_ButtonControlTypeId &&
+                            type[L"음량"] == UIA_SliderControlTypeId && type[L"입력"] == UIA_EditControlTypeId;
+                    auto get = [&](const wchar_t* name) {
+                        auto it = byName.find(name);
+                        return it == byName.end() ? nullptr : it->second.Get();
+                    };
+                    // Waits for the next frames to show what was done.
+                    auto until = [&](const std::function<bool()>& f) {
+                        for (int k = 0; k < 100; ++k) {
+                            if (f()) return true;
+                            Sleep(20);
+                        }
+                        return false;
+                    };
+                    if (auto* e = get(L"셋")) {
+                        VARIANT pos{}, size{};
+                        e->GetCurrentPropertyValue(UIA_PositionInSetPropertyId, &pos);
+                        e->GetCurrentPropertyValue(UIA_SizeOfSetPropertyId, &size);
+                        ComPtr<IUIAutomationTreeWalker> walk;
+                        ComPtr<IUIAutomationElement> parent;
+                        BSTR pn = nullptr;
+                        uia->get_RawViewWalker(&walk);
+                        if (walk) walk->GetParentElement(e, &parent);
+                        if (parent) parent->get_CurrentName(&pn);
+                        place = pos.vt == VT_I4 && pos.lVal == 3 && size.vt == VT_I4 && size.lVal == 3 && pn &&
+                                std::wstring(pn) == L"줄";
+                        SysFreeString(pn);
+                    }
+                    if (auto* e = get(L"단추 A")) {
+                        RECT r{};
+                        e->get_CurrentBoundingRectangle(&r);
+                        box = r.left == 110 && r.top == 110 && r.right == 210 && r.bottom == 140;
+                        ComPtr<IUIAutomationInvokePattern> p;
+                        e->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&p));
+                        invoked = p && SUCCEEDED(p->Invoke()) && until([&] { return pressedA == pressedBefore + 1; });
+                    }
+                    if (auto* e = get(L"토글")) {
+                        ComPtr<IUIAutomationTogglePattern> p;
+                        e->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&p));
+                        toggledU = p && SUCCEEDED(p->Toggle()) && until([&] {
+                                       ToggleState s = ToggleState_Off;
+                                       return SUCCEEDED(p->get_CurrentToggleState(&s)) && s == ToggleState_On;
+                                   });
+                    }
+                    if (auto* e = get(L"셋")) {
+                        ComPtr<IUIAutomationSelectionItemPattern> p;
+                        e->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_PPV_ARGS(&p));
+                        selected = p && SUCCEEDED(p->Select()) && until([&] {
+                                       BOOL s = FALSE;
+                                       return SUCCEEDED(p->get_CurrentIsSelected(&s)) && s;
+                                   });
+                    }
+                    if (auto* e = get(L"음량")) {
+                        ComPtr<IUIAutomationRangeValuePattern> p;
+                        e->GetCurrentPatternAs(UIA_RangeValuePatternId, IID_PPV_ARGS(&p));
+                        set = p && SUCCEEDED(p->SetValue(30)) && until([&] {
+                                  double v = 0;
+                                  return SUCCEEDED(p->get_CurrentValue(&v)) && v == 30;
+                              });
+                    }
+                    if (auto* e = get(L"입력")) {
+                        ComPtr<IUIAutomationValuePattern> p;
+                        BSTR v = nullptr;
+                        e->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&p));
+                        value = p && SUCCEEDED(p->get_CurrentValue(&v)) && v && std::wstring(v) == L"a b";
+                        SysFreeString(v);
+                    }
+                    if (auto* e = get(L"단추 B")) focused = SUCCEEDED(e->SetFocus());
+                }
+            }
+            CoUninitialize();
+            done = true;
+        });
+        const double deadline = util::NowSeconds() + 30;
+        while (!done && util::NowSeconds() < deadline) {
+            MsgWaitForMultipleObjectsEx(0, nullptr, 30, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            frame();
+        }
+        if (!done) {
+            // Stuck in a call: it would write here after this is gone, so the test ends now.
+            log(L"screen reader: FAIL no answer in 30 s");
+            ExitProcess(1);
+        }
+        client.join();
+        frame();
+        focused &= ui.KeyboardFocus() == idB;
+        access.Detach();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
+        ok = done && tree && kinds && place && box && invoked && toggledU && selected && set && value && focused &&
+             sel == 2 && on && vol == 30;
+        if (!ok) ++failures;
+        log(util::Format(L"screen reader: %s the controls %d, their kinds %d, a cell's place in its row %d, where one "
+                         L"is %d; Invoke %d, Toggle %d, Select %d, a slider set %d, a field's text %d, the focus "
+                         L"set %d (%s)",
+                         ok ? L"ok  " : L"FAIL", tree, kinds, place, box, invoked, toggledU, selected, set, value,
+                         focused, seen.c_str()));
     }
     // The caption over an export (#22): white with a dark outline, at the bottom or the top, nothing elsewhere.
     for (int pos : {caption::kBottom, caption::kTop}) {
@@ -1773,6 +2164,72 @@ int App::RunSelfTest(const std::wstring& dir) {
         vcheck(mp4::Unfragment(cutMoof, why) && util::FileSize(cutMoof) == size && inspect(cutMoof).plain,
                L"converting a plain MP4 again changes nothing");
     }
+
+    // HEVC while recording: Windows' fragmented MP4 sink refuses HEVC, so it has to be written as a plain MP4. These
+    // are the settings that failed for a user (0.6.1–0.6.3: "AAC 인코더를 시작할 수 없습니다").
+    if (!HasVideoProcessor() || (Mp4Writer::FindEncoder(true, true).empty() && Mp4Writer::FindEncoder(true, false).empty())) {
+        log(L"HEVC recording: skipped (no HEVC encoder or GPU video processor)");
+    } else {
+        VideoConfig v;
+        v.width = 2474;
+        v.height = 1392;
+        v.fps = 30;
+        v.hevc = true;
+        v.cbr = true;
+        v.gopFrames = 150;
+        v.fragmented = true;  // what recording asks for
+        std::wstring err, got;
+        const bool ok = ProbeMp4(dir + L"\\hevc.mp4", v, true, err, got);
+        log(util::Format(L"HEVC recording: %s · %s", ok ? L"ok" : L"FAIL", (ok ? got : err + L" · " + got).c_str()));
+        if (!ok) ++failures;
+        DeleteFileW((dir + L"\\hevc.mp4").c_str());
+    }
+
+    // 대비 (#26): text is 4.5:1 or more on each panel it sits on, and so is the ink on each fill, in each palette.
+    {
+        using Named = std::pair<const D2D1_COLOR_F*, const wchar_t*>;
+        const std::pair<const wchar_t*, theme::Palette> palettes[] = {
+            {L"dark", theme::Dark()}, {L"light", theme::Light()}, {L"contrast", theme::HighContrastBlack()}};
+        for (const auto& [name, p] : palettes) {
+            double worst = 100;
+            std::wstring at;
+            auto need = [&](const Named& fg, const Named& bg) {
+                double r = theme::ContrastRatio(*fg.first, *bg.first);
+                if (r < worst) worst = r, at = std::wstring(fg.second) + L" on " + bg.second;
+            };
+            const Named panels[] = {{&p.Bg, L"Bg"}, {&p.Surface, L"Surface"}, {&p.Surface2, L"Surface2"},
+                                    {&p.Surface3, L"Surface3"}};
+            const Named inks[] = {{&p.TextColor, L"TextColor"}, {&p.TextDim, L"TextDim"},   {&p.TextFaint, L"TextFaint"},
+                                  {&p.AccentHi, L"AccentHi"},   {&p.Link, L"Link"},         {&p.Success, L"Success"},
+                                  {&p.Warning, L"Warning"}};
+            for (const Named& bg : panels)
+                for (const Named& fg : inks) need(fg, bg);
+            for (const Named& bg : {panels[0], panels[1], panels[2]}) need({&p.Rec, L"Rec"}, bg);
+            for (const Named& fill : {Named{&p.AccentFill, L"AccentFill"}, Named{&p.AccentFillHi, L"AccentFillHi"},
+                                      Named{&p.RecFill, L"RecFill"}, Named{&p.RecFillHi, L"RecFillHi"},
+                                      Named{&p.Badge, L"Badge"}})
+                need({&p.OnFill, L"OnFill"}, fill);
+            for (const Named& fill : {Named{&p.UpdateFill, L"UpdateFill"}, Named{&p.UpdateFillHi, L"UpdateFillHi"}})
+                need({&p.UpdateInk, L"UpdateInk"}, fill);
+            const bool ok = worst >= 4.5;
+            log(util::Format(L"contrast %s: %s, lowest %.2f:1 (%s)", name, ok ? L"ok" : L"FAIL", worst, at.c_str()));
+            if (!ok) ++failures;
+        }
+    }
+
+    // English (#26): each format string keeps its fields in the same order, and a lookup finds the text.
+    {
+        auto bad = MismatchedTranslations();
+        SetLanguage(Lang::English);
+        const bool found = wcscmp(tr(L"녹화"), L"Record") == 0 && wcscmp(tr(L"16:9"), L"16:9") == 0;
+        const bool none = MissingTranslations().empty();
+        SetLanguage(Lang::Korean);
+        const bool ok = bad.empty() && found && none && wcscmp(tr(L"녹화"), L"녹화") == 0;
+        log(util::Format(L"English: %s, %zu texts, %zu with other fields", ok ? L"ok" : L"FAIL", TranslationCount(),
+                         bad.size()));
+        for (const std::wstring& k : bad) log(L"  fields differ: " + k);
+        if (!ok) ++failures;
+    }
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -1813,11 +2270,19 @@ void App::DrawPreviewStandIn(ID2D1DeviceContext* dc) {
     }
 }
 
-int App::RunScreenshots(const std::wstring& dir) {
+int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\screenshots.log");
+    // The same shots whatever Windows is set to: dark and Korean unless asked for another look.
+    settings_.theme = look == L"light" ? kThemeLight : kThemeDark;
+    settings_.language = look == L"en" ? kLangEnglish : kLangKorean;
+    contrastForTest_ = look == L"contrast";
+    ApplyLanguage();
+    ApplyTheme();
+    if (!look.empty()) log(L"look: " + look);
     int layerErrors = 0;
+    size_t controls = 0, shots = 0;  // named for screen readers
     const float W = 1120, H = 780;
     double clock = util::NowSeconds();
     UiInput mouse;  // where the pointer is in the next shot
@@ -1837,6 +2302,21 @@ int App::RunScreenshots(const std::wstring& dir) {
                     log(util::Format(L"FAIL %s: %d layering error(s), first at %.0f,%.0f-%.0f,%.0f", name.c_str(),
                                      ui_.LayerErrors(), e.l, e.t, e.r, e.b));
                     ++layerErrors;
+                }
+                // Every control a screen reader can reach has a name (#26).
+                if (pass == 9) {
+                    std::wstring unnamed;
+                    controls += ui_.Nodes().size();
+                    ++shots;
+                    for (const UiNode& n : ui_.Nodes())
+                        if (n.name.empty() && !n.full.Empty()) {
+                            const Rect& r = n.full;
+                            unnamed += util::Format(L" %08x at %.0f,%.0f-%.0f,%.0f", n.id, r.l, r.t, r.r, r.b);
+                        }
+                    if (!unnamed.empty()) {
+                        log(L"FAIL " + name + L": controls without a name:" + unnamed);
+                        ++layerErrors;
+                    }
                 }
                 DrawPreviewStandIn(dc);
             });
@@ -1958,6 +2438,31 @@ int App::RunScreenshots(const std::wstring& dir) {
         micTestShow_ = i == kTabAudio ? 0.6f : -1;  // the mic check running, on a made-up level
         shot(tabShots[i], 96);
     }
+    {
+        // 파일 이름 › 직접 입력: the field, the token buttons and the line under them, then a pattern with a
+        // character a file name can't hold.
+        const std::wstring nameWas = settings_.nameTemplate;
+        const bool en = Language() == Lang::English;
+        settings_.settingsTab = kTabGeneral;
+        settingsScroll_ = 0;
+        nameCustom_ = true;
+        settings_.nameTemplate = en ? L"{window} {year}-{month}-{day} {hour}.{minute}.{second}"
+                                    : L"{창 이름} {연}-{월}-{일} {시}.{분}.{초}";
+        shot(L"settings_filename.png", 96);
+        settings_.nameTemplate = en ? L"Clip: {window}_{number}" : L"클립: {창 이름}_{번호}";
+        shot(L"settings_filename_warn.png", 96);
+        nameCustom_ = false;
+        settings_.nameTemplate = nameWas;
+    }
+    {
+        // 동영상 › 코덱 on HEVC: its line says a crash leaves no recording (H.264 on a PC without HEVC).
+        const int codecWas = settings_.vCodec;
+        settings_.settingsTab = kTabVideo;
+        settingsScroll_ = 0;
+        settings_.vCodec = 1;
+        shot(L"settings_video_hevc.png", 96);
+        settings_.vCodec = codecWas;
+    }
     settings_.settingsTab = kTabAudio;  // the mic rows at the bottom, testing, with the playback switch
     settingsScroll_ = 10000;
     micTestShow_ = 0.6f;
@@ -1978,6 +2483,32 @@ int App::RunScreenshots(const std::wstring& dir) {
         if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
         shot(L"settings_about_crash.png", 96);
         DeleteFileW(fake.c_str());
+    }
+    {
+        // The keyboard (#26): the ring where Tab took the focus, the page scrolled to show it.
+        auto press = [&](const std::wstring& name, int tabs) {
+            for (int k = 0; k < tabs; ++k) {
+                UiInput in = mouse;
+                in.keys = {VK_TAB};
+                clock += 0.05;
+                gfx_.RenderToPng((dir + L"\\" + name).c_str(), (UINT)W, (UINT)H, 96, [&](ID2D1DeviceContext* dc) {
+                    ui_.Begin(dc, in, clock);
+                    thumbWanted_ = false;
+                    DrawFrame(Rect(0, 0, W, H));
+                    ui_.End();
+                });
+            }
+            shot(name, 96);
+        };
+        settings_.settingsTab = kTabRecord;
+        settingsScroll_ = 0;
+        shot(L"settings_keyboard.png", 96);
+        press(L"settings_keyboard.png", 9);
+        screen_ = Screen::Home;
+        shot(L"home_keyboard.png", 96);
+        press(L"home_keyboard.png", 4);
+        ui_.SetKeyboardFocus(0, false);
+        screen_ = Screen::Settings;
     }
     settings_.settingsTab = kTabGeneral;
 
@@ -2046,11 +2577,12 @@ int App::RunScreenshots(const std::wstring& dir) {
     toast_ = L"파일을 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요";
     toastUntil_ = clock + 60;
     shot(L"editor_toast.png", 96);
-    toast_ = L"동영상 인코더를 시작하지 못했습니다(0x8007000E). 설정 › 동영상에서 하드웨어 인코딩을 끄거나 해상도를 "
-             L"낮춰 보세요. 그래픽 드라이버를 최신으로 업데이트하면 해결되는 경우도 많습니다.";
-    toastError_ = true;
+    // A failure: it stays until closed, with the settings tab that fixes it (what StartRecording reports).
+    Alert(L"영상 인코더를 시작할 수 없습니다. (0x8007000E) 하드웨어 인코딩을 끄거나 해상도를 낮춰 보세요. 그래픽 "
+          L"드라이버를 업데이트하면 해결되는 경우도 많습니다.",
+          kTabVideo);
     shot(L"editor_toast_long.png", 96);
-    toastError_ = false;
+    toastError_ = toastSticky_ = false;
     toastUntil_ = 0;
     // Questions inside the window instead of MessageBox.
     ConfirmDiscard();
@@ -2135,7 +2667,16 @@ int App::RunScreenshots(const std::wstring& dir) {
     keep.reset();
     target_ = nullptr;
     if (standIn) DestroyWindow(standIn);
-    log(layerErrors ? util::Format(L"RESULT: %d screen(s) with layering errors", layerErrors) : L"RESULT: all passed");
+    log(util::Format(L"screen reader: %zu controls in %zu shots, each with a name unless a line above says so",
+                     controls, shots));
+    // In English, every text shown has its English (tr looked each up).
+    for (const std::wstring& s : MissingTranslations()) {
+        log(L"FAIL no English for: " + s);
+        ++layerErrors;
+    }
+    log(layerErrors ? util::Format(L"RESULT: %d problem(s): layering errors, unnamed controls or missing English",
+                                   layerErrors)
+                    : L"RESULT: all passed");
     return layerErrors ? 2 : 0;
 }
 
@@ -3048,6 +3589,49 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
     return w.Finish(err);
 }
 
+// An MP4 in these settings, a second long. got: the encoder it took and what was tried before.
+bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got) {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<ID3D11Multithread> mt;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                 D3D11_SDK_VERSION, &dev, nullptr, &ctx)) ||
+        FAILED(ctx.As(&mt))) {
+        err = L"no device";
+        return false;
+    }
+    mt->SetMultithreadProtected(TRUE);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = v.width;
+    td.Height = v.height;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> tex;
+    dev->CreateTexture2D(&td, nullptr, &tex);
+    AudioConfig a;
+    a.enabled = sound;
+    Mp4Writer w;
+    const bool opened = w.Open(path, v, a, dev.Get(), err);
+    got = opened ? w.EncoderName() + (w.HardwareEncoder() ? L" (hardware)" : L" (software)") : L"";
+    if (!w.Tried().empty()) got += L" after " + w.Tried();
+    if (!opened) return false;
+    std::vector<int16_t> pcm((size_t)a.sampleRate / v.fps * 2);
+    for (int k = 0; k < v.fps; ++k) {
+        ComPtr<IMFSample> s;
+        for (int tries = 0; !(s = w.Convert(tex.Get())) && tries < 2500; ++tries) Sleep(2);
+        if (sound) w.PushAudio(pcm.data(), pcm.size() / 2);
+        if (!s || !w.WriteVideo(s.Get(), (int64_t)k * 10'000'000 / v.fps, 10'000'000 / v.fps)) {
+            err = L"write failed";
+            w.Abort();
+            return false;
+        }
+    }
+    return w.Finish(err);
+}
+
 // A copy of an MP4 whose video track says to show it turned clockwise by cw degrees, the way phones mark portrait
 // video: the display matrix and size in the track header (tkhd) change, the pictures stay as they are.
 bool WriteRotatedCopy(const std::wstring& src, const std::wstring& dst, int cw) {
@@ -3398,11 +3982,9 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
     lastVideo_.path = src;  // as if just recorded: 삭제 shows
     shot(L"editor_video_saved.png");
     // The notice at the start after a crash mid-recording (#24).
-    toast_ = L"지난번에 OzMaker가 비정상 종료되었습니다. 녹화하던 동영상을 되살렸습니다 · OzMaker_20261102_142311.mp4.";
-    toastUntil_ = clock + 60;
-    toastError_ = true;
+    Alert(L"지난번에 OzMaker가 비정상 종료되었습니다. 녹화하던 동영상을 되살렸습니다 · OzMaker_20261102_142311.mp4.");
     shot(L"editor_video_recovered.png");
-    toastError_ = false;
+    toastError_ = toastSticky_ = false;
     toastUntil_ = 0;
     settings_.speedIdx = 3;
     hasResult_ = false;
@@ -3417,6 +3999,48 @@ int App::RunVideoTest(const std::wstring& dir, int W, int H) {
 
 // Region picker on the primary monitor, driven with posted messages: drag, move, resize, ratio, keys, the
 // toolbar's countdown, save and record, and opening on the area picked before.
+// The 동영상 settings a user reported failing (HEVC · CBR · 5 s keyframes at 2474×1392, "AAC 인코더를 시작할 수
+// 없습니다"), then each with one thing changed: which encoder takes each, and where the ones that fail stop.
+int App::RunEncoderTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\encoder-test.log");
+    VideoConfig base;
+    base.width = 2474;
+    base.height = 1392;
+    base.fps = 30;
+    base.hevc = true;
+    base.cbr = true;
+    base.gopFrames = 150;
+    base.fragmented = true;  // as while recording
+    const std::pair<const wchar_t*, std::function<void(VideoConfig&, bool&)>> cases[] = {
+        {L"as reported", [](VideoConfig&, bool&) {}},
+        {L"H.264", [](VideoConfig& v, bool&) { v.hevc = false; }},
+        {L"VBR", [](VideoConfig& v, bool&) { v.cbr = false; }},
+        {L"keyframes 2 s", [](VideoConfig& v, bool&) { v.gopFrames = 60; }},
+        {L"2480x1392 (width a multiple of 16)", [](VideoConfig& v, bool&) { v.width = 2480; }},
+        {L"1920x1080", [](VideoConfig& v, bool&) { v.width = 1920, v.height = 1080; }},
+        {L"no sound", [](VideoConfig&, bool& sound) { sound = false; }},
+        {L"not fragmented", [](VideoConfig& v, bool&) { v.fragmented = false; }},
+        {L"software only", [](VideoConfig& v, bool&) { v.hardware = false; }},
+    };
+    int failures = 0;
+    for (const auto& [name, change] : cases) {
+        VideoConfig v = base;
+        bool sound = true;
+        change(v, sound);
+        std::wstring err, got;
+        const bool ok = ProbeMp4(dir + L"\\probe.mp4", v, sound, err, got);
+        log(util::Format(L"%s: %s · %s %dx%d %s, keyframes %d · %s", name, ok ? L"ok" : L"FAIL",
+                         v.hevc ? L"HEVC" : L"H.264", v.width, v.height, v.cbr ? L"CBR" : L"VBR", v.gopFrames,
+                         (ok ? got : err + L" · " + got).c_str()));
+        if (!ok) ++failures;
+    }
+    DeleteFileW((dir + L"\\probe.mp4").c_str());
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
 int App::RunRegionTest(const std::wstring& dir) {
     util::EnsureDir(dir);
     Log log(dir + L"\\region.log");
@@ -3537,7 +4161,7 @@ int App::RunRegionTest(const std::wstring& dir) {
     key(VK_ESCAPE);
     check(done && res == PickResult::Cancel && !regionPicker_.Active(), L"Esc cancels");
 
-    // The toolbar: its countdown menu, then "저장만" keeps the area without recording.
+    // The toolbar: its countdown menu, then "영역만 저장" keeps the area without recording.
     start();
     drag(200, 150, 1000, 600);
     click(regionPicker_.ToolbarButton(RegionPicker::kBarCountdown));

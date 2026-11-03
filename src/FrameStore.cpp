@@ -86,7 +86,7 @@ bool FrameStore::Open(int width, int height, std::wstring& err) {
     DWORD written = 0;
     if (file_ == INVALID_HANDLE_VALUE || journal_ == INVALID_HANDLE_VALUE ||
         !WriteFile(journal_, &hdr, sizeof(hdr), &written, nullptr) || written != sizeof(hdr)) {
-        err = L"임시 파일을 만들 수 없습니다.";
+        err = tr(L"임시 파일을 만들 수 없습니다.");
         return false;  // the destructor closes and deletes what was made
     }
     journalOffset_ = sizeof(hdr);

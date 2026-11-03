@@ -15,6 +15,14 @@ float ScaleForRect(const RECT& r) {
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
     return dx / 96.f;
 }
+
+// Overlays look the same over any program, whatever the theme (dark), except in a contrast theme: its colors then.
+D2D1_COLOR_F Panel(float a) { return Contrast() ? Bg : Hex(0x111318, a); }  // the pills and the countdown
+D2D1_COLOR_F Bar() { return Contrast() ? Bg : Hex(0x15181E, 0.97f); }      // the region bar and its menu
+D2D1_COLOR_F Ink() { return Contrast() ? TextColor : White; }                // text on them
+D2D1_COLOR_F Edge(float a) { return Contrast() ? Border : WithAlpha(White, a); }
+D2D1_COLOR_F Chosen() { return Contrast() ? Accent : Hex(0x2C3240); }  // a chosen button on the bar
+D2D1_COLOR_F Hot() { return Contrast() ? Bg : Hex(0x252A34); }         // under the pointer
 }  // namespace
 
 // ---------------------------------------------------------------- LayeredWindow
@@ -309,29 +317,31 @@ void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover) {
 
 void RecOverlay::Paint(Painter& p) {
     {
+        theme::Use colors(theme::OverlayPalette());
         if (mode_ == Mode::Countdown) {
-            p.Circle(66, 66, 62, Hex(0x111318, 0.88f));
-            p.Ring(66, 66, 62, WithAlpha(White, 0.10f), 1.f);
+            p.Circle(66, 66, 62, Panel(0.88f));
+            p.Ring(66, 66, 62, Edge(0.10f), 1.f);
             TextStyle st;
             st.h = AlignCenter;
             st.weight = kBold;
-            p.Text(Rect(0, 0, 132, 124), std::to_wstring(countdown_), 58.f, White, st);
+            p.Text(Rect(0, 0, 132, 124), std::to_wstring(countdown_), 58.f, Ink(), st);
             TextStyle sub;
             sub.h = AlignCenter;
-            p.Text(Rect(0, 86, 132, 112), L"녹화 준비", 12.f, TextDim, sub);
+            p.Text(Rect(0, 86, 132, 112), tr(L"녹화 준비"), 12.f, TextDim, sub);
             return;
         }
         Rect r(0.5f, 0.5f, kPillW - 0.5f, kPillH - 0.5f);
-        p.Fill(r, Hex(0x111318, 0.92f), 20);
-        p.Stroke(r, WithAlpha(paused_ ? Warning : White, paused_ ? 0.35f : 0.09f), 20);
+        p.Fill(r, Panel(0.92f), 20);
+        p.Stroke(r, paused_ ? WithAlpha(Warning, Contrast() ? 1.f : 0.35f) : Edge(0.09f), 20);
         TextStyle label;
         label.weight = kBold;
         if (paused_) {
             p.Fill(Rect::XYWH(14, 14, 3.5f, 12), Warning, 1);
             p.Fill(Rect::XYWH(20.5f, 14, 3.5f, 12), Warning, 1);
-            p.Text(Rect(32, 0, 90, 40), L"일시정지", 11.5f, Warning, label);
+            p.Text(Rect(32, 0, 90, 40), tr(L"일시정지"), 11.5f, Warning, label);
         } else {
-            float pulse = 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6);
+            // Steady with Windows' animations off.
+            float pulse = motion_ ? 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6) : 1.f;
             p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
             p.Circle(19, 20, 5, Rec);
             p.Text(Rect(32, 0, 90, 40), L"REC", 11.5f, Rec, label);
@@ -340,11 +350,14 @@ void RecOverlay::Paint(Painter& p) {
         tm.weight = kSemibold;
         tm.tabular = true;
         p.Text(Rect(paused_ ? 88.f : 66.f, 0, kPillW - 68, 40), util::FormatClock(elapsed_, true), 15.f,
-               paused_ ? TextDim : White, tm);
+               paused_ ? TextDim : Ink(), tm);
         // Pause / resume, then stop.
         Rect pr = PauseRect();
-        p.Circle(pr.CX(), pr.CY(), 14, WithAlpha(White, hover_ == 1 ? 0.22f : 0.10f));
-        D2D1_COLOR_F ink = hover_ == 1 ? White : Hex(0xE6E8EE);
+        if (Contrast())
+            p.Ring(pr.CX(), pr.CY(), 13.5f, Border, hover_ == 1 ? 2.f : 1.f);
+        else
+            p.Circle(pr.CX(), pr.CY(), 14, WithAlpha(White, hover_ == 1 ? 0.22f : 0.10f));
+        D2D1_COLOR_F ink = Contrast() ? TextColor : hover_ == 1 ? White : Hex(0xE6E8EE);
         if (paused_) {
             p.Icon(pr.Offset(1, 0), 0xE768 /*Play*/, 11.f, ink);
         } else {
@@ -352,8 +365,11 @@ void RecOverlay::Paint(Painter& p) {
             p.Fill(Rect::XYWH(pr.CX() + 1.5f, pr.CY() - 5.5f, 3, 11), ink, 1);
         }
         Rect sr = StopRect();
-        p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hover_ == 2 ? 0.22f : 0.10f));
-        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), hover_ == 2 ? White : Hex(0xE6E8EE), 2);
+        if (Contrast())
+            p.Ring(sr.CX(), sr.CY(), 13.5f, Border, hover_ == 2 ? 2.f : 1.f);
+        else
+            p.Circle(sr.CX(), sr.CY(), 14, WithAlpha(White, hover_ == 2 ? 0.22f : 0.10f));
+        p.Fill(Rect::Centered(sr.CX(), sr.CY(), 10, 10), Contrast() ? TextColor : hover_ == 2 ? White : Hex(0xE6E8EE), 2);
     }
 }
 
@@ -472,6 +488,7 @@ void PickerOverlay::Redraw() {
                     (r.bottom - virt_.top) / scale);
     };
     win_.Render(virt_, scale, true, [&](Painter& p) {
+        theme::Use colors(theme::OverlayPalette());
         const D2D1_COLOR_F dim = Hex(0x05060A, 0.50f);
         Rect all(0, 0, vw, vh);
         if (hover_ < 0) {
@@ -494,23 +511,23 @@ void PickerOverlay::Redraw() {
             p.Fill(label, Accent, 8);
             TextStyle ts;
             ts.weight = kSemibold;
-            p.Text(Rect(label.l + 12, label.t, label.r - dw - 22, label.b), w.title, 13.f, White, ts);
-            p.Text(Rect(label.r - dw - 12, label.t, label.r - 8, label.b), dims, 12.f, WithAlpha(White, 0.8f));
+            p.Text(Rect(label.l + 12, label.t, label.r - dw - 22, label.b), w.title, 13.f, OnFill, ts);
+            p.Text(Rect(label.r - dw - 12, label.t, label.r - 8, label.b), dims, 12.f, WithAlpha(OnFill, 0.8f));
         }
         // Instruction pill on the monitor under the cursor.
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromPoint(cursor_, MONITOR_DEFAULTTONEAREST), &mi);
         Rect mon = toDip(mi.rcWork);
-        std::wstring msg = L"녹화할 창을 클릭하세요";
-        std::wstring hint = L"Esc · 취소";
+        std::wstring msg = tr(L"녹화할 창을 클릭하세요");
+        std::wstring hint = tr(L"Esc · 취소");
         float mw = p.Measure(msg, 14.f, kSemibold) + p.Measure(hint, 12.f) + 56;
         Rect pill = Rect::XYWH(mon.CX() - mw / 2, mon.t + 24, mw, 40);
-        p.Fill(pill, Hex(0x111318, 0.95f), 20);
-        p.Stroke(pill.Inset(0.5f), WithAlpha(White, 0.1f), 20);
+        p.Fill(pill, Panel(0.95f), 20);
+        p.Stroke(pill.Inset(0.5f), Edge(0.1f), 20);
         p.Crosshair(pill.l + 22, pill.CY(), 16, Accent);
         TextStyle ts;
         ts.weight = kSemibold;
-        p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), msg, 14.f, White, ts);
+        p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), msg, 14.f, Ink(), ts);
         TextStyle hs;
         hs.h = AlignEnd;
         p.Text(Rect(pill.l, pill.t, pill.r - 16, pill.b), hint, 12.f, TextDim, hs);
@@ -903,7 +920,7 @@ RegionPicker::Layout RegionPicker::Arrange(float scale) const {
         if (!dragging_ && !adjusting_)
             L.title = cands_[hover_].title;
         else if (adjusting_ && EqualRect(&sel_, &lastArea_))
-            L.title = L"직전 영역";
+            L.title = tr(L"직전 영역");
         L.tw = L.title.empty() ? 0 : std::min(320.f, m.Measure(L.title, 13.f, kSemibold)) + 12;
         float lw = L.tw + m.Measure(L.dims, 13.f, kSemibold) + 24;
         L.label = Rect::XYWH(r.l, r.t - 36, lw, 30);
@@ -914,7 +931,7 @@ RegionPicker::Layout RegionPicker::Arrange(float scale) const {
             // record.
             Rect mon = toDip(anchorMon_);
             const float bh = 34, rw = 54, gap = 13;
-            const float cdw = 74, cw = 56, sw = 72, ow = 80;
+            const float cdw = 74, cw = 56, sw = std::max(72.f, m.Measure(tr(L"영역만 저장"), 12.5f) + 28), ow = 80;
             float tw = 6 + rw * 5 + gap + cdw + gap + cw + 6 + sw + 6 + ow + 6;
             float ty = r.b + 12;
             if (ty + bh + 12 > mon.b) ty = std::max(r.t + 12, r.b - bh - 12);
@@ -946,10 +963,10 @@ RegionPicker::Layout RegionPicker::Arrange(float scale) const {
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(MonitorFromPoint(cursor_, MONITOR_DEFAULTTONEAREST), &mi);
     Rect mon = toDip(mi.rcWork);
-    L.msg = !adjusting_                       ? L"드래그해서 녹화할 영역을 지정하세요"
-            : EqualRect(&sel_, &lastArea_) ? L"직전 영역입니다 · 밖에서 드래그하면 새로 지정합니다"
-                                           : L"끌어서 옮기거나 모서리로 크기를 조절하세요";
-    L.hint = adjusting_ ? L"Enter · 녹화   Esc · 취소" : L"클릭 · 창 전체   Esc · 취소";
+    L.msg = !adjusting_                       ? tr(L"드래그해서 녹화할 영역을 지정하세요")
+            : EqualRect(&sel_, &lastArea_) ? tr(L"직전 영역입니다 · 밖에서 드래그하면 새로 지정합니다")
+                                           : tr(L"끌어서 옮기거나 모서리로 크기를 조절하세요");
+    L.hint = adjusting_ ? tr(L"Enter · 녹화   Esc · 취소") : tr(L"클릭 · 창 전체   Esc · 취소");
     float mw = m.Measure(L.msg, 14.f, kSemibold) + m.Measure(L.hint, 12.f) + 64;
     L.pill = Rect::XYWH(mon.CX() - mw / 2, mon.t + 24, mw, 40);
     return L;
@@ -988,6 +1005,7 @@ void RegionPicker::PaintTest(Painter& p, const RECT& screen, POINT anchor, POINT
 // clip: the part being redrawn; what lies outside it is skipped (the target clips the rest).
 void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
     auto meets = [&](const Rect& a) { return !a.Inset(-2).Intersect(clip).Empty(); };
+    theme::Use colors(theme::OverlayPalette());
     const D2D1_COLOR_F dim = Hex(0x05060A, 0.55f);
     Rect all(0, 0, L.vw, L.vh);
     if (!L.hole) {
@@ -1023,20 +1041,20 @@ void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
             ts.tabular = true;
             const Rect& label = L.label;
             p.Fill(label, Accent, 8);
-            if (!L.title.empty()) p.Text(Rect(label.l + 12, label.t, label.l + L.tw, label.b), L.title, 13.f, White, ts);
+            if (!L.title.empty()) p.Text(Rect(label.l + 12, label.t, label.l + L.tw, label.b), L.title, 13.f, OnFill, ts);
             p.Text(Rect(label.l + 12 + L.tw, label.t, label.r - 8, label.b), L.dims, 13.f,
-                   L.title.empty() ? White : WithAlpha(White, 0.8f), ts);
+                   L.title.empty() ? OnFill : WithAlpha(OnFill, 0.8f), ts);
         }
 
         if (L.adjust && meets(Rect(L.bar.l, L.bar.t, L.bar.r, L.bar.b + 3))) {
             const Rect& bar = L.bar;
-            p.Fill(bar.Offset(0, 3), Hex(0x000000, 0.35f), 12);
-            p.Fill(bar, Hex(0x15181E, 0.97f), 12);
-            p.Stroke(bar.Inset(0.5f), WithAlpha(White, 0.1f), 12);
+            p.Fill(bar.Offset(0, 3), WithAlpha(Shadow, 0.35f), 12);
+            p.Fill(bar, Bar(), 12);
+            p.Stroke(bar.Inset(0.5f), Edge(0.1f), 12);
             // Dividers: ratios | countdown | the ways out.
             for (int i : {(int)kBarCountdown, (int)kBarCancel}) {
                 float x = std::round(L.slots[i].l - 6.5f) + 0.5f;
-                p.Line(x, bar.t + 14, x, bar.b - 14, WithAlpha(White, 0.1f), 1.f);
+                p.Line(x, bar.t + 14, x, bar.b - 14, Edge(0.1f), 1.f);
             }
             TextStyle cs;
             cs.h = AlignCenter;
@@ -1048,33 +1066,35 @@ void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
                 bool hot = op_ < 0 && b.Contains(L.cx, L.cy);
                 bool on = i == ratio_ || (i == kBarCountdown && L.menu);
                 if (i == kBarRecord)
-                    p.Fill(b, hot ? RecHi : Rec, 8);
+                    p.Fill(b, hot ? RecFillHi : RecFill, 8);
                 else if (on)
-                    p.Fill(b, Hex(0x2C3240), 8);
+                    p.Fill(b, Chosen(), 8);
                 else if (hot)
-                    p.Fill(b, Hex(0x252A34), 8);
-                const D2D1_COLOR_F fg = i == kBarRecord || on || hot ? White : TextDim;
+                    p.Fill(b, Hot(), 8);
+                if (Contrast() && hot && !on && i != kBarRecord) p.Stroke(b.Inset(0.5f), Border, 8);
+                const D2D1_COLOR_F fg = i == kBarRecord || (on && Contrast()) ? OnFill : on || hot ? Ink() : TextDim;
                 if (i == kBarCountdown || i == kBarRecord) {
                     // A mark, then the word, centred together.
-                    const wchar_t* text = i == kBarRecord ? L"녹화" : kCountdowns[countdown_];
+                    const wchar_t* text = i == kBarRecord ? tr(L"녹화") : tr(kCountdowns[countdown_]);
                     float w = p.Measure(text, 12.5f, kSemibold), x = b.CX() - (w + 18) / 2;
                     if (i == kBarCountdown) {
-                        p.Stroke(b.Inset(0.5f), WithAlpha(White, on ? 0 : 0.12f), 8);
+                        p.Stroke(b.Inset(0.5f), on ? Clear : Edge(0.12f), 8);
                         p.Icon(Rect::XYWH(x - 1, b.t, 15, b.H()), icon::Timer, 12.f, fg);
                     } else {
-                        p.Circle(x + 5, b.CY(), 4.5f, White);
+                        p.Circle(x + 5, b.CY(), 4.5f, OnFill);
                     }
                     p.Text(Rect(x + 18, b.t, x + 18 + w + 4, b.b), text, 12.5f, fg, ls);
                 } else {
-                    p.Text(b, i < 5 ? kRatios[i].label : i == kBarCancel ? L"취소" : L"저장만", 12.5f, fg, cs);
+                    p.Text(b, i < 5 ? tr(kRatios[i].label) : i == kBarCancel ? tr(L"취소") : tr(L"영역만 저장"), 12.5f, fg,
+                           cs);
                 }
             }
         }
         if (L.menu && meets(Rect(L.menuBox.l, L.menuBox.t, L.menuBox.r, L.menuBox.b + 3))) {
             const Rect& box = L.menuBox;
-            p.Fill(box.Offset(0, 3), Hex(0x000000, 0.35f), 12);
-            p.Fill(box, Hex(0x15181E, 0.97f), 12);
-            p.Stroke(box.Inset(0.5f), WithAlpha(White, 0.1f), 12);
+            p.Fill(box.Offset(0, 3), WithAlpha(Shadow, 0.35f), 12);
+            p.Fill(box, Bar(), 12);
+            p.Stroke(box.Inset(0.5f), Edge(0.1f), 12);
             TextStyle cs;
             cs.h = AlignCenter;
             cs.weight = kSemibold;
@@ -1082,10 +1102,12 @@ void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
                 const Rect& b = L.slots[kBarMenu + i];
                 bool hot = op_ < 0 && b.Contains(L.cx, L.cy);
                 if (i == countdown_)
-                    p.Fill(b, Hex(0x2C3240), 8);
+                    p.Fill(b, Chosen(), 8);
                 else if (hot)
-                    p.Fill(b, Hex(0x252A34), 8);
-                p.Text(b, kCountdowns[i], 12.5f, i == countdown_ || hot ? White : TextDim, cs);
+                    p.Fill(b, Hot(), 8);
+                if (Contrast() && hot && i != countdown_) p.Stroke(b.Inset(0.5f), Border, 8);
+                p.Text(b, tr(kCountdowns[i]), 12.5f,
+                       i == countdown_ && Contrast() ? OnFill : i == countdown_ || hot ? Ink() : TextDim, cs);
             }
         }
     }
@@ -1097,12 +1119,12 @@ void RegionPicker::Paint(Painter& p, const Layout& L, const Rect& clip) {
 
     if (meets(L.pill)) {
         const Rect& pill = L.pill;
-        p.Fill(pill, Hex(0x111318, 0.95f), 20);
-        p.Stroke(pill.Inset(0.5f), WithAlpha(White, 0.1f), 20);
+        p.Fill(pill, Panel(0.95f), 20);
+        p.Stroke(pill.Inset(0.5f), Edge(0.1f), 20);
         p.Stroke(Rect::Centered(pill.l + 22, pill.CY(), 14, 11), Accent, 2, 1.6f);
         TextStyle ts;
         ts.weight = kSemibold;
-        p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), L.msg, 14.f, White, ts);
+        p.Text(Rect(pill.l + 38, pill.t, pill.r, pill.b), L.msg, 14.f, Ink(), ts);
         TextStyle hs;
         hs.h = AlignEnd;
         p.Text(Rect(pill.l, pill.t, pill.r - 16, pill.b), L.hint, 12.f, TextDim, hs);

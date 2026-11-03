@@ -239,7 +239,7 @@ void Exporter::Run(ExportJob job) {
                                           : RunImage(job, tmp, res);
     if (ok) {
         ok = MoveFileExW(tmp.c_str(), job.path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
-        if (!ok) res.error = L"파일을 저장할 수 없습니다: " + job.path;
+        if (!ok) res.error = tr(L"파일을 저장할 수 없습니다: ") + job.path;
     }
     res.ok = ok;
     if (!ok) DeleteFileW(tmp.c_str());
@@ -254,11 +254,11 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     auto plan = PlanFrames(*job.clip, job.first, job.last, job.fpsLimit, job.speed, job.direction);
     auto enc = CreateEncoder(job.format);
     if (plan.empty()) {
-        res.error = L"내보낼 프레임이 없습니다.";
+        res.error = tr(L"내보낼 프레임이 없습니다.");
         return false;
     }
     if (!enc) {
-        res.error = std::wstring(FormatName(job.format)) + L" 인코더가 이 빌드에 포함되어 있지 않습니다.";
+        res.error = std::wstring(FormatName(job.format)) + tr(L" 인코더가 이 빌드에 포함되어 있지 않습니다.");
         return false;
     }
     EncoderParams p;
@@ -285,7 +285,7 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
         }
         const uint8_t* px = reader->Get(plan[k].index);
         if (!px) {
-            res.error = L"녹화 데이터를 읽을 수 없습니다.";
+            res.error = tr(L"녹화 데이터를 읽을 수 없습니다.");
             ok = false;
             break;
         }
@@ -328,7 +328,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
     const int fps = std::clamp((int)std::lround(rate), 1, 120);
     auto plan = PlanVideoFrames(*job.clip, job.first, job.last, fps, job.speed);
     if (plan.empty()) {
-        res.error = L"내보낼 프레임이 없습니다.";
+        res.error = tr(L"내보낼 프레임이 없습니다.");
         return false;
     }
     const int W = job.outW & ~1, H = job.outH & ~1;
@@ -339,7 +339,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
                                  &dev, nullptr, &ctx)) ||
         FAILED(ctx.As(&mt))) {
-        res.error = L"동영상 인코딩에 쓸 그래픽 장치를 만들 수 없습니다.";
+        res.error = tr(L"동영상 인코딩에 쓸 그래픽 장치를 만들 수 없습니다.");
         return false;
     }
     mt->SetMultithreadProtected(TRUE);  // the encoder shares the device
@@ -353,7 +353,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex))) {
-        res.error = L"동영상 인코딩에 쓸 그래픽 메모리가 부족합니다.";
+        res.error = tr(L"동영상 인코딩에 쓸 그래픽 메모리가 부족합니다.");
         return false;
     }
 
@@ -390,7 +390,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
         if (plan[k] != uploaded) {
             const uint8_t* px = reader->Get(plan[k]);
             if (!px) {
-                res.error = L"영상 프레임을 읽을 수 없습니다.";
+                res.error = tr(L"영상 프레임을 읽을 수 없습니다.");
                 w.Abort();
                 return false;
             }
@@ -417,7 +417,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
             }
         }
         if (!s || !w.WriteVideo(s.Get(), t0, t1 - t0)) {
-            res.error = L"동영상 인코더가 프레임을 받지 못했습니다.";
+            res.error = tr(L"동영상 인코더가 프레임을 받지 못했습니다.");
             w.Abort();
             return false;
         }

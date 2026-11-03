@@ -10,8 +10,24 @@ inline constexpr ExportSize kExportSizes[] = {{100, 0}, {75, 0}, {50, 0}, {33, 0
 inline constexpr int kLoopOptions[] = {0, 1, 3};  // times a 움짤 plays, 0 = forever
 inline constexpr int kTargetMB[] = {0, 5, 10, 15, 20};  // "용량 맞추기", 0 = off
 inline constexpr double kHoldLastMs = 1000;       // "끝에서 멈춤": the last frame stays this much longer
-// File name patterns offered in the settings; settings.ini may hold any other.
+// File name patterns offered in the settings; '직접 입력' there takes any other.
 inline constexpr const wchar_t* kNameTemplates[] = {L"OzMaker_{날짜}", L"{창 이름}_{날짜}", L"{날짜}"};
+// The tokens of a pattern, Korean and English: either works whatever the UI's language. {날짜} is date and time.
+enum NameToken { kTokDate, kTokYear, kTokMonth, kTokDay, kTokHour, kTokMinute, kTokSecond, kTokWindow, kTokNumber,
+                 kTokCount };
+inline constexpr const wchar_t* kNameTokens[kTokCount][2] = {
+    {L"{날짜}", L"{date}"},  {L"{연}", L"{year}"},    {L"{월}", L"{month}"},       {L"{일}", L"{day}"},     {L"{시}", L"{hour}"},
+    {L"{분}", L"{minute}"}, {L"{초}", L"{second}"}, {L"{창 이름}", L"{window}"}, {L"{번호}", L"{number}"}};
+// The token at p[i] (-1: none), and its length.
+inline int NameTokenAt(std::wstring_view p, size_t i, size_t& len) {
+    for (int k = 0; k < kTokCount; ++k)
+        for (std::wstring_view t : kNameTokens[k])
+            if (p.compare(i, t.size(), t) == 0) {
+                len = t.size();
+                return k;
+            }
+    return -1;
+}
 inline constexpr int kOutFpsOptions[] = {0, 30, 25, 20, 15, 10};  // 0 = as recorded
 inline constexpr double kSpeedOptions[] = {0.5, 1.0, 1.5, 2.0};
 // 화질 in the export panel (고화질, 보통, 저용량): the size (kExportSizes) and frame rate (kOutFpsOptions) for 움짤 and
@@ -41,6 +57,8 @@ enum Output { kOutputClip = 0, kOutputVideo = 1 };
 enum CaptureMode { kCaptureAuto = 0, kCaptureWindow = 1, kCaptureDisplay = 2 };
 enum OverlayMode { kOverlayAlways = 0, kOverlayExceptFullscreen = 1, kOverlayNever = 2 };
 enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout, kTabCount };
+enum ThemeChoice { kThemeSystem = 0, kThemeDark, kThemeLight };
+enum LanguageChoice { kLangSystem = 0, kLangKorean, kLangEnglish };
 
 struct Settings {
     // what and how
@@ -61,6 +79,8 @@ struct Settings {
     bool sounds = true;
     bool closeToTray = true;
     bool autoUpdate = true;  // check GitHub for a new version (#31)
+    int theme = kThemeSystem;    // 시스템 follows Windows' light or dark mode (#26)
+    int language = kLangSystem;  // 시스템: Korean when Windows shows Korean, else English
     bool trayHintShown = false;
     int settingsTab = kTabGeneral;  // the settings tab viewed last
     RECT window{};  // main window's restored position (workspace pixels); empty = centre on the primary monitor

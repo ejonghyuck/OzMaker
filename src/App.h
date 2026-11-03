@@ -1,4 +1,5 @@
 #pragma once
+#include "Access.h"
 #include "AudioPreview.h"
 #include "Capture.h"
 #include "Exporter.h"
@@ -56,6 +57,9 @@ private:
     void HideMain();
     void RememberPlacement();  // into settings_, for the next start
     void Toast(std::wstring text, bool error = false);
+    // A failure the user may not have seen happen (recording, saving, exporting): it stays until closed, and can
+    // offer the settings tab that fixes it.
+    void Alert(std::wstring text, int settingsTab = -1);
     void SyncIme();
     // The live window preview (DWM thumbnails, which DWM draws above everything in this window).
     void ApplyThumbnail();
@@ -98,8 +102,9 @@ private:
     void DrawDropCue(Rect client);
     void DrawUpdateButton(Rect& right);
     void DrawUpdatePopover(Rect client);
-    void SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
-                    const std::function<void(Rect)>& control);
+    // A row of the settings; `below` more of it under the title and control is returned, for the caller to fill.
+    Rect SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
+                    const std::function<void(Rect)>& control, float below = 0);
     void SettingSection(Rect& area, std::wstring_view title);
     ID2D1Bitmap* IconFor(const WinInfo& w);
 
@@ -131,13 +136,15 @@ private:
     void CheckLimits();
     std::wstring RecordingDir() const;  // where the recording grows: the MP4's folder, or the clip's temp file
     bool NotifyQuietly() const;  // a fullscreen app is in front of a hotkey recording
-    void ReportError(const std::wstring& title, const std::wstring& text);
+    void ReportError(const std::wstring& title, const std::wstring& text, int settingsTab = -1);
     bool UseMonitorCapture(HWND target) const;
     void ProbeEncoders();
     std::wstring VideoSummary() const;
     std::wstring AudioSummary(int source) const;
     std::wstring MicDeviceName() const;
     bool MicMenu(const Rect& anchor);
+    std::wstring LanguageName(int choice) const;  // a LanguageChoice
+    bool LanguageMenu(const Rect& anchor);
 
     // ---- files: opening videos, recent files, recordings not exported yet
     void OpenMediaFile(const std::wstring& path);
@@ -208,7 +215,10 @@ private:
     const wchar_t* CopyBlocker() const;
     VideoConfig VideoSettings(int fps) const;
     std::wstring ExportName(Format f) const;
-    std::wstring FileStem(const std::wstring& what) const;  // settings_.nameTemplate filled in
+    // settings_.nameTemplate filled in for a clip of `what` (a window's title, "화면 1"); without findNumber, {번호}
+    // is 001 without looking in the save folder (the settings' example).
+    std::wstring FileStem(const std::wstring& what, bool findNumber = true) const;
+    static std::wstring FillName(std::wstring_view pattern, const std::wstring& what, const SYSTEMTIME& t, int number);
     void StartExport(bool saveAs);
     void OnExportDone();
     void StartThumbnails();
@@ -223,6 +233,10 @@ private:
     std::wstring HotkeyLabel() const;  // the record hotkey, or a note that there is none
     void TrayAdd();
     void TrayUpdate();
+    // The colors (설정 › 일반 › 테마, Windows' light or dark mode and its contrast theme) and Windows' animation
+    // setting, with the title bar to match; again whenever Windows' settings change.
+    void ApplyTheme();
+    void ApplyLanguage();  // 설정 › 일반 › 언어
     void TrayRemove();
     void TrayMenu();
     void TrayBalloon(const std::wstring& title, const std::wstring& text);
@@ -234,12 +248,14 @@ private:
     void RestartIntoUpdate();  // swap the exe and restart into it
 
     // ---- test helpers (SelfTest)
-    int RunScreenshots(const std::wstring& dir);
+    // look: "" (dark, Korean), "light", "contrast" (High Contrast Black) or "en" (English).
+    int RunScreenshots(const std::wstring& dir, const std::wstring& look);
     int RunSelfTest(const std::wstring& dir);
     int RunCrashTest(const std::vector<std::wstring>& args);
     int RunRecordTest(const std::wstring& args);
     int RunAnalyzeTest(const std::wstring& args);
     int RunVideoTest(const std::wstring& dir, int w, int h);
+    int RunEncoderTest(const std::wstring& dir);
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
@@ -255,6 +271,7 @@ private:
     UINT dpi_ = 96;
     Gfx gfx_;
     Ui ui_;
+    Access access_;  // what screen readers see of ui_
     UiInput input_;
     bool dirty_ = true, tracking_ = false, quitting_ = false;
     bool imeOn_ = false;  // the window has an IME context (a text field has the focus)
@@ -384,6 +401,7 @@ private:
     uint64_t fitTargetForTest_ = 0;  // self-test: a target below the smallest preset
     bool testDeleteFiles_ = false;   // self-test: 삭제 deletes its copy outright, not into the Recycle Bin
     bool portableForTest_ = false;   // screenshots: the settings as a portable copy shows them
+    bool contrastForTest_ = false;   // screenshots: as in Windows' "High Contrast Black"
     double recElapsedForTest_ = -1;  // README pictures: the time a made-up recording shows (-1: the real one)
     double RecElapsed() const { return recElapsedForTest_ >= 0 ? recElapsedForTest_ : capture_.Elapsed(); }
 
@@ -398,7 +416,10 @@ private:
 
     std::wstring toast_;
     bool toastError_ = false;
+    bool toastSticky_ = false;  // an Alert: stays until closed
+    int toastTab_ = -1;         // an Alert's "… 설정 열기" button: the settings tab it opens (-1: none)
     double toastUntil_ = 0;
+    Rect toastRect_;  // where the toast was drawn last frame: the page takes no input under an Alert
 
     int capturingHotkey_ = 0;  // the hotkey being chosen in the settings
     bool hotkeyOk_ = true, pauseHotkeyOk_ = true;
@@ -418,6 +439,7 @@ private:
     float micTestShow_ = -1;         // screenshots: a made-up level, no device opened
     bool testWindowsOnly_ = false;  // test runs list only "OzMaker Test Window": other titles are the user's business
     float settingsScroll_ = 0, settingsContentH_ = 0;
+    bool nameCustom_ = false;  // 파일 이름 › 직접 입력 picked, even while the pattern is one of the three
     float exportScroll_ = 0, exportContentH_ = 0;
     // The export panel's frame count and length, kept while the range, rate and speed stay: working them out walks
     // every frame of the range, and the panel is drawn many times a second.

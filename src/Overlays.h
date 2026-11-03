@@ -46,6 +46,7 @@ public:
     void PaintTest(Painter& p, double elapsed, bool paused, int hover);
     void Hide();
     bool Visible() const { return mode_ != Mode::None; }
+    void SetMotion(bool on) { motion_ = on; }  // Windows' animations: off, the REC dot stays still
 
 private:
     enum class Mode { None, Countdown, Pill };
@@ -69,7 +70,7 @@ private:
     size_t frames_ = 0;
     int countdown_ = 0;
     int hover_ = 0;  // ButtonAt under the mouse
-    bool tracking_ = false, paused_ = false;
+    bool tracking_ = false, paused_ = false, motion_ = true;
     std::function<void()> onStop_, onPause_;
     HWND frame_[4] = {};
 };
