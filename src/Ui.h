@@ -63,6 +63,8 @@ public:
 
     void Fill(const Rect& r, D2D1_COLOR_F c, float radius = 0);
     void Stroke(const Rect& r, D2D1_COLOR_F c, float radius = 0, float width = 1);
+    // Dashed outline: dashes and gaps in pixels.
+    void StrokeDashed(const Rect& r, D2D1_COLOR_F c, float radius, float width, float dash, float gap);
     void Line(float x0, float y0, float x1, float y1, D2D1_COLOR_F c, float w = 1);
     void Circle(float cx, float cy, float r, D2D1_COLOR_F c);
     void Ring(float cx, float cy, float r, D2D1_COLOR_F c, float w);
@@ -83,6 +85,8 @@ private:
     ID2D1RenderTarget* rt_ = nullptr;
     ComPtr<ID2D1SolidColorBrush> brush_;
     ComPtr<ID2D1LinearGradientBrush> logoBrush_;
+    ComPtr<ID2D1StrokeStyle> dashStyle_;
+    float dash_[2]{};  // the pattern dashStyle_ was made for, in stroke widths
 };
 
 struct UiInput {

@@ -75,6 +75,11 @@ void App::DrawFrame(Rect client) {
     ui_.BeginFloat();
     DrawToast(client);
     ui_.EndFloat();
+    if (dragKind_ != DragKind::None) {
+        ui_.BeginFloat();
+        DrawDropCue(client);
+        ui_.EndFloat();
+    }
 }
 
 void App::DrawQuestion(Rect client) {
@@ -145,31 +150,21 @@ void App::DrawHeader(Rect r) {
         if (ui_.Button(HashId("hdr.back"), Rect::Centered(b.CX(), b.CY(), 110, 36), L"돌아가기", BtnStyle::Ghost,
                        icon::Back) ||
             ui_.In().Key(VK_ESCAPE)) {
-            screen_ = settingsReturn_ == Screen::Editor && clip_ ? Screen::Editor : Screen::Home;
             SetCapturingHotkey(0);
-            if (screen_ == Screen::Home) RefreshWindows();
+            if (settingsReturn_ == Screen::Editor) {
+                ResumeEditor();
+            } else {
+                screen_ = Screen::Home;
+                RefreshWindows();
+            }
         }
     }
     DrawUpdateButton(right);
-    if (screen_ == Screen::Editor) {
-        Rect b = right.CutRight(120);
-        bool en = !exporter_.Busy();
-        if (ui_.Button(HashId("hdr.new"), Rect::Centered(b.CX(), b.CY(), 120, 36), L"새 녹화", BtnStyle::Ghost,
-                       icon::Back, en))
-            CloseEditor();
-        right.CutRight(8);
-        DrawFilesButton(right);
-    } else if (screen_ == Screen::Home) {
-        if (clip_) {
-            Rect b = right.CutRight(150);
-            if (ui_.Button(HashId("hdr.resume"), Rect::Centered(b.CX(), b.CY(), 150, 36), L"이전 녹화 편집",
-                           BtnStyle::Secondary, icon::Next))
-                ResumeEditor();
-            right.CutRight(8);
-        }
-        DrawFilesButton(right);
-    }
-    if (rec_ == RecState::Recording) {
+    if (screen_ != Screen::Settings) DrawFilesButton(right);
+    // The tabs, and in their place while recording, how long it has been going.
+    if (rec_ != RecState::Recording) {
+        if (screen_ != Screen::Settings) DrawTabs(r);
+    } else {
         std::wstring t = (recPaused_ ? L"일시정지  " : L"REC  ") + util::FormatClock(capture_.Elapsed(), true);
         const D2D1_COLOR_F tint = recPaused_ ? Warning : Rec;
         Rect pill = Rect::Centered(r.CX(), r.CY(), recPaused_ ? 148.f : 120.f, 30);
@@ -185,6 +180,46 @@ void App::DrawHeader(Rect r) {
         ui_.Text(Rect(pill.l + 28, pill.t, pill.r, pill.b), t, 12.5f, recPaused_ ? Warning : RecHi, st);
     }
     ui_.Line(r.l, r.b - 0.5f, r.r, r.b - 0.5f, Border, 1.f);
+}
+
+void App::DrawTabs(Rect r) {
+    const float tabW = 120, tabH = 30, pad = 3, gap = 2;
+    Rect box = Rect::Centered(r.CX(), r.CY(), tabW * 2 + gap + pad * 2, tabH + pad * 2);
+    ui_.Fill(box, Surface, 11);
+    ui_.Stroke(box.Inset(0.5f), Border, 11);
+    // Not while a countdown runs or a file is being saved: the editor has to stay as it is for that.
+    const bool en = rec_ == RecState::Idle && !exporter_.Busy();
+    for (int i = 0; i < 2; ++i) {
+        const Screen tab = i == 0 ? Screen::Home : Screen::Editor;
+        const wchar_t* label = i == 0 ? L"녹화" : L"편집";
+        Rect t = Rect::XYWH(box.l + pad + i * (tabW + gap), box.t + pad, tabW, tabH);
+        const UiId id = HashId("hdr.tab", (uint32_t)i);
+        const bool on = screen_ == tab;
+        const bool clicked = ui_.Click(id, t, en && !on);
+        const float hv = ui_.Anim(id, en && !on && ui_.Hover(t) ? 1.f : 0.f);
+        if (on) {
+            ui_.Fill(t, Surface3, 8);
+            ui_.Stroke(t.Inset(0.5f), BorderStrong, 8);
+        }
+        const D2D1_COLOR_F fg = on ? TextColor : en ? Mix(TextDim, TextColor, hv) : TextFaint;
+        const float lw = ui_.Measure(label, 13.f, kSemibold), iw = 14, x = std::round(t.CX() - (iw + 7 + lw) / 2);
+        if (i == 0)
+            ui_.Circle(x + iw / 2, t.CY(), 4.5f, fg);
+        else
+            ui_.Icon(Rect::XYWH(x, t.t, iw, t.H()), icon::Cut, 13.f, fg);
+        ui_.Text(Rect(x + iw + 7, t.t, t.r, t.b), label, 13.f, fg, Bold());
+        if (i == 1 && clip_) {
+            // A file is open in the 편집 tab, waiting there.
+            if (!on) ui_.Circle(t.r - 19, t.t + 10, 3.f, AccentHi);
+            ui_.Tooltip(id, t, L"열린 파일: " + ClipTitle());
+        }
+        if (clicked) {
+            if (i == 0)
+                CloseEditor();
+            else
+                ResumeEditor();
+        }
+    }
 }
 
 void App::DrawToast(Rect client) {
@@ -218,18 +253,37 @@ void App::DrawToast(Rect client) {
 // ---------------------------------------------------------------- files
 
 void App::DrawFilesButton(Rect& right) {
-    Rect b = right.CutRight(104);
-    filesBtn_ = Rect::Centered(b.CX(), b.CY(), 104, 36);
-    bool en = rec_ == RecState::Idle && !exporter_.Busy();
-    if (ui_.Button(HashId("hdr.files"), filesBtn_, L"파일", filesOpen_ ? BtnStyle::Secondary : BtnStyle::Ghost,
-                   icon::OpenFile, en)) {
+    // The count: recordings that would be lost on exit.
+    const std::wstring count = held_.empty() ? L"" : std::to_wstring(held_.size());
+    const float cw = count.empty() ? 0 : std::max(18.f, ui_.Measure(count, 11.f, kBold) + 10);
+    const float w = 28 + 13 + 8 + ui_.Measure(L"최근 파일", 13.f, kSemibold) + (cw ? cw + 8 : 0);
+    Rect b = right.CutRight(w);
+    filesBtn_ = Rect::Centered(b.CX(), b.CY(), w, 36);
+    const bool en = rec_ == RecState::Idle && !exporter_.Busy();
+    Rect label = filesBtn_;
+    if (cw) label.r -= cw + 8;
+    const UiId id = HashId("hdr.files");
+    const bool clicked = ui_.Click(id, filesBtn_, en);
+    const float hv = ui_.Anim(id, en && ui_.Hover(filesBtn_) ? 1.f : 0.f);
+    ui_.Fill(filesBtn_, filesOpen_ ? Surface2 : WithAlpha(Surface3, hv), 9);
+    if (filesOpen_) ui_.Stroke(filesBtn_.Inset(0.5f), Border, 9);
+    const D2D1_COLOR_F fg = !en ? TextFaint : filesOpen_ ? TextColor : Mix(TextDim, TextColor, hv);
+    ui_.Icon(Rect::XYWH(filesBtn_.l + 14, filesBtn_.t, 13, filesBtn_.H()), icon::OpenFile, 13.f, fg);
+    ui_.Text(Rect(filesBtn_.l + 35, filesBtn_.t, label.r, filesBtn_.b), L"최근 파일", 13.f, fg, Bold());
+    if (cw) {
+        Rect c = Rect::XYWH(filesBtn_.r - 14 - cw, filesBtn_.CY() - 9, cw, 18);
+        ui_.Fill(c, en ? Accent2 : Surface3, 9);
+        TextStyle st = Bold(AlignCenter);
+        st.weight = kBold;
+        ui_.Text(c, count, 11.f, en ? White : TextFaint, st);
+        ui_.Tooltip(id, filesBtn_, util::Format(L"저장하지 않은 녹화 %zu개", held_.size()));
+    }
+    if (clicked) {
         filesOpen_ = true;
         updateOpen_ = false;
         filesScroll_ = 0;
         RefreshRecent();
     }
-    // Recordings that would be lost on exit.
-    if (!held_.empty()) ui_.Circle(filesBtn_.r - 12, filesBtn_.t + 9, 4.f, Accent2);
 }
 
 // A green round button, shown once a new version is downloaded and ready (or out, when it can't be put in place
@@ -345,7 +399,7 @@ void App::DrawFilesPopover(Rect client) {
         ui_.Icon(ic, glyph, 15.f, tint);
         Rect text = Rect(ic.r + 12, r.t, r.r - 8 - buttons * 34, r.b);
         ui_.Text(Rect(text.l, r.t + 7, text.r, r.CY() + 2), name, 13.f, TextColor, Bold());
-        ui_.Text(Rect(text.l, r.CY() + 1, text.r, r.b - 7), sub, 11.5f, TextFaint);
+        ui_.Text(Rect(text.l, r.CY() + 1, text.r, r.b - 7), sub, 12.f, TextFaint);
         // Buttons first: they take the press before the row does.
         for (int k = 0; k < buttons; ++k) onButton(k, Rect::XYWH(r.r - 8 - (buttons - k) * 34, r.CY() - 15, 30, 30));
         return ui_.Click(id, r);
@@ -366,21 +420,11 @@ void App::DrawFilesPopover(Rect client) {
                                 drop = ui_.IconButton(HashId("files.drop", (uint32_t)i), b, icon::Delete, L"버리기");
                             });
             if (drop) {
-                if (current) {
-                    StopThumbnails();
-                    clip_.reset();
-                    hasResult_ = false;
-                }
-                DropHeld(h.clip.get());
-                Invalidate();
+                ConfirmDropHeld(i);
                 break;
             }
             if (open) {
-                filesOpen_ = false;
-                auto clip = h.clip;
-                clipName_ = h.name;
-                if (clip != clip_) OpenEditor(clip);
-                else ResumeEditor();
+                OpenHeld(i);
                 break;
             }
         }
@@ -430,8 +474,8 @@ void App::DrawFilesPopover(Rect client) {
     ui_.Line(foot.l, foot.t + 0.5f, foot.r, foot.t + 0.5f, Border);
     Rect fb = foot.Inset(2, 12);
     Rect btn = fb.CutLeft(140);
-    if (ui_.Button(HashId("files.open"), btn, L"파일 열기…", BtnStyle::Secondary, icon::OpenFile)) BrowseForVideo();
-    ui_.Text(fb.Inset(14, 0), L"동영상을 창에 끌어다 놓아도 열립니다", 11.5f, TextFaint, Align(AlignEnd));
+    if (ui_.Button(HashId("files.open"), btn, L"동영상 열기…", BtnStyle::Secondary, icon::OpenFile)) BrowseForVideo();
+    ui_.Text(fb.Inset(14, 0), L"전체 목록은 편집 탭에 있습니다", 12.f, TextFaint, Align(AlignEnd));
 }
 
 // ---------------------------------------------------------------- home
@@ -493,7 +537,7 @@ void App::DrawWindowList(Rect in) {
 
     in.CutTop(10);
     Rect hint = in.CutBottom(22);
-    ui_.Text(hint, L"더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
+    ui_.Text(hint, L"창을 더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
     in.CutBottom(6);
 
     Rect list = in;
@@ -559,7 +603,7 @@ void App::DrawMonitorList(Rect in) {
         monitors_ = EnumerateMonitors();
     in.CutTop(10);
     Rect hint = in.CutBottom(22);
-    ui_.Text(hint, L"더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
+    ui_.Text(hint, L"화면을 더블클릭하면 바로 녹화합니다", 12.f, TextFaint, Align(AlignCenter, AlignEnd));
     in.CutBottom(6);
 
     const MonitorDesc* sel = FindMonitor(monitors_, settings_.monitor);
@@ -698,14 +742,33 @@ void App::DrawCapturePreview(Rect preview) {
     Rect view = preview;
     if (card) view.b = VideoCardRect(preview).t;
     std::wstring hk = HotkeyLabel();
-    auto placeholder = [&](std::wstring_view title, std::wstring_view body) {
-        float cy = view.CY();
+    auto placeholder = [&](std::wstring_view title, std::wstring_view body, bool editHint) {
+        // The line about the 편집 tab only where it fits under the rest.
+        const std::wstring_view a = L"갖고 있는 동영상은 ", link = L"편집", b = L" 탭에서 엽니다. 창에 끌어다 놓아도 됩니다.";
+        const float wa = ui_.Measure(a, 13.f), wl = ui_.Measure(link, 13.f, kBold), wb = ui_.Measure(b, 13.f);
+        const float hintW = wa + wl + wb + 32;
+        editHint = editHint && hintW <= view.W() - 20 && view.H() >= 230;
+        float cy = view.CY() - (editHint ? 26 : 0);
         ui_.Ring(view.CX(), cy - 44, 30, WithAlpha(Accent, 0.35f), 2.f);
         ui_.Crosshair(view.CX(), cy - 44, 30, Accent);
         ui_.Text(Rect(view.l, cy - 4, view.r, cy + 22), title, 16.f, TextColor, Bold(AlignCenter));
         TextStyle st = Align(AlignCenter, AlignStart);
         st.wrap = true;
-        ui_.Text(Rect(view.l + 30, cy + 30, view.r - 30, cy + 80), body, 12.5f, TextDim, st);
+        ui_.Text(Rect(view.l + 30, cy + 30, view.r - 30, cy + 80), body, 13.f, TextDim, st);
+        if (!editHint) return;
+        Rect pill = Rect::Centered(view.CX(), cy + 112, hintW, 36);
+        ui_.Fill(pill, Surface, 9);
+        ui_.Stroke(pill.Inset(0.5f), Border, 9);
+        float x = std::round(pill.l + 16);
+        ui_.Text(Rect(x, pill.t, x + wa + 2, pill.b), a, 13.f, TextDim);
+        x += wa;
+        Rect lr(x - 2, pill.t + 4, x + wl + 2, pill.b - 4);
+        const UiId id = HashId("home.edithint");
+        const bool clicked = ui_.Click(id, lr);
+        ui_.Text(Rect(x, pill.t, x + wl + 2, pill.b), link, 13.f, ui_.Hover(lr) ? Accent : AccentHi, Bold());
+        x += wl;
+        ui_.Text(Rect(x, pill.t, pill.r, pill.b), b, 13.f, TextDim);
+        if (clicked) ResumeEditor();
     };
     switch (settings_.source) {
         case kSourceDisplay:
@@ -714,8 +777,9 @@ void App::DrawCapturePreview(Rect preview) {
         case kSourceRegion:
             if (!settings_.HasRegion()) {
                 placeholder(L"녹화할 영역을 지정하세요",
-                            L"왼쪽의 ‘영역 지정’을 누르고 화면에서 드래그하세요.\n단축키 " + hk +
-                                L" 은 지정한 영역을 바로 녹화합니다.");
+                            L"왼쪽의 ‘영역 지정’을 누르고 화면에서 드래그하세요.\n" + hk +
+                                L" 단축키를 누르면 지정한 영역을 바로 녹화합니다.",
+                            false);
             } else if (snapBmp_ && EqualRect(&snapRect_, &settings_.region)) {
                 auto sz = snapBmp_->GetSize();
                 Rect area = view.Inset(10);
@@ -741,8 +805,10 @@ void App::DrawCapturePreview(Rect preview) {
                              Align(AlignCenter));
                 ui_.NativeLayer(thumbArea_);  // from here on, only floats may be drawn over it
             } else {
-                placeholder(L"녹화할 창을 선택하세요", L"왼쪽 목록에서 고르거나 ‘화면에서 선택’을 누르세요.\n게임 중에는 " +
-                                                         hk + L" 을 누르면 지금 보고 있는 창을 바로 녹화합니다.");
+                placeholder(L"녹화할 창을 고르세요",
+                            L"왼쪽 목록에서 고르거나 ‘화면에서 선택’을 누르세요.\n게임 중에는 " + hk +
+                                L" 단축키로 바로 녹화할 수 있습니다.",
+                            true);
             }
             break;
     }
@@ -766,12 +832,7 @@ void App::DrawVideoResult(Rect preview) {
     Rect btns = in.CutRight(bw * 4 + 18);
     Rect b = Rect::Centered(0, btns.CY(), bw, 34);
     auto at = [&](int i) { return Rect::XYWH(btns.l + i * (bw + 6), b.t, bw, b.H()); };
-    if (ui_.Button(HashId("vres.edit"), at(0), L"편집", BtnStyle::Primary, icon::Cut, true, 12.f)) {
-        if (clip_ && _wcsicmp(clip_->SourcePath().c_str(), lastVideo_.path.c_str()) == 0)
-            ResumeEditor();
-        else
-            OpenVideo(lastVideo_.path);
-    }
+    if (ui_.Button(HashId("vres.edit"), at(0), L"편집", BtnStyle::Primary, icon::Cut, true, 12.f)) EditLastVideo();
     if (ui_.Button(HashId("vres.folder"), at(1), L"폴더", BtnStyle::Secondary, icon::Folder, true, 12.f))
         util::OpenFolderAndSelect(lastVideo_.path);
     if (ui_.Button(HashId("vres.copy"), at(2), L"복사", BtnStyle::Secondary, icon::Copy, true, 12.f)) {
@@ -793,9 +854,9 @@ void App::DrawVideoResult(Rect preview) {
     if (!lastVideo_.encoder.empty()) {  // only when it fits: the buttons leave little room in a narrow window
         std::wstring enc =
             lastVideo_.hardware ? L" · " + Mp4Writer::Vendor(lastVideo_.encoder) + L" 가속" : L" · CPU 인코딩";
-        if (ui_.Measure(sub + enc, 11.5f) <= in.W()) sub += enc;
+        if (ui_.Measure(sub + enc, 12.f) <= in.W()) sub += enc;
     }
-    ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), sub, 11.5f, TextDim);
+    ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), sub, 12.f, TextDim);
 }
 
 void App::DrawCapturePanel(Rect r) {
@@ -805,7 +866,7 @@ void App::DrawCapturePanel(Rect r) {
     const bool video = settings_.output == kOutputVideo;
     if (video) ProbeEncoders();
 
-    Rect controls = in.CutBottom(326);
+    Rect controls = in.CutBottom(346);
     in.CutBottom(16);
     DrawCapturePreview(in);
 
@@ -907,8 +968,9 @@ void App::DrawCapturePanel(Rect r) {
     }
     controls.CutTop(10);
 
-    // One-line summary of what will happen, with a shortcut to the detailed settings.
+    // What will come out, with a shortcut to the detailed settings; then what happens when the recording stops.
     Rect cap = controls.CutTop(20);
+    Rect then = controls.CutTop(20);
     if (video) {
         Rect link = cap.CutRight(80);
         UiId lid = HashId("home.vsettings");
@@ -923,8 +985,10 @@ void App::DrawCapturePanel(Rect r) {
                  warn ? Warning : TextFaint);
         ui_.Text(Rect(ar.l + 16, ar.t, ar.r, ar.b), audio, 12.f, warn ? Warning : TextDim);
         ui_.Text(cap, VideoSummary(), 12.f, TextFaint);
+        ui_.Text(then, L"녹화를 멈추면 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다.", 12.5f, TextFaint);
     } else {
-        ui_.Text(cap, L"녹화가 끝나면 편집 화면에서 구간 · 크기 · 형식을 정해 저장합니다", 12.f, TextFaint);
+        ui_.Text(cap, L"녹화를 멈추면 편집 탭이 열립니다.", 12.5f, TextFaint);
+        ui_.Text(then, L"거기서 자르고 저장하세요.", 12.5f, TextFaint);
     }
     controls.CutTop(14);
     if (changed) settingsDirty_ = true;
@@ -969,14 +1033,16 @@ void App::DrawCapturePanel(Rect r) {
 // ---------------------------------------------------------------- editor
 
 void App::DrawEditor(Rect r) {
+    r.CutTop(20);
     if (!clip_) {
-        screen_ = Screen::Home;
+        DrawEditHome(r);
         return;
     }
-    r.CutTop(20);
     Rect right = r.CutRight(316);
     r.CutRight(20);
     Rect left = r;
+    DrawFileBar(left.CutTop(36));
+    left.CutTop(10);
     Rect tl = left.CutBottom(84);
     left.CutBottom(8);
     Rect tr = left.CutBottom(44);
@@ -1015,6 +1081,186 @@ void App::DrawEditor(Rect r) {
     DrawTransport(tr);
     DrawTimeline(tl);
     DrawExportPanel(right);
+}
+
+std::wstring App::ClipTitle() const {
+    if (!clip_) return {};
+    return clip_->SourcePath().empty() ? clipName_ : util::FileNameOf(clip_->SourcePath());
+}
+
+void App::DrawFileBar(Rect r) {
+    const bool video = !clip_->SourcePath().empty();
+    const bool held = std::any_of(held_.begin(), held_.end(), [&](const HeldClip& h) { return h.clip == clip_; });
+    Rect close = r.CutRight(84);
+    close = Rect::Centered(close.CX(), close.CY(), 84, 32);
+    if (ui_.Button(HashId("edit.close"), close, L"닫기", BtnStyle::Ghost, icon::Close, !exporter_.Busy(), 12.5f))
+        CloseClip();
+    if (held) ui_.Tooltip(HashId("edit.close"), close, L"닫아도 ‘저장하지 않은 녹화’에 남습니다");
+    r.CutRight(12);
+    Rect ic = r.CutLeft(18);
+    if (video)
+        ui_.Icon(ic, icon::Video, 14.f, AccentHi);
+    else
+        ui_.Circle(ic.CX(), ic.CY(), 5.f, Rec);
+    r.CutLeft(8);
+    std::wstring meta = std::wstring(video ? L"동영상" : held ? L"움짤 녹화 · 저장하지 않음" : L"움짤 녹화") +
+                        util::Format(L" · %d×%d · ", clip_->Width(), clip_->Height()) +
+                        util::FormatClock(clip_->Seconds(), true);
+    const std::wstring name = ClipTitle();
+    const float mw = ui_.Measure(meta, 12.f) + 4;
+    const float nw = std::min(ui_.Measure(name, 13.5f, kSemibold) + 4, std::max(80.f, r.W() - mw - 12));
+    ui_.Text(r.CutLeft(nw), name, 13.5f, TextColor, Bold());
+    r.CutLeft(12);
+    ui_.Text(r, meta, 12.f, TextFaint);
+}
+
+void App::DrawEditHome(Rect r) {
+    // Where to drop a video, with the button for those who would rather pick one.
+    Rect dz = r.CutTop(std::clamp(r.H() * 0.42f, 200.f, 250.f));
+    r.CutTop(16);
+    ui_.Fill(dz, WithAlpha(Accent, 0.06f), 16);
+    ui_.StrokeDashed(dz.Inset(1.f), Hex(0x4B3D99), 16, 2.f, 7.f, 5.f);
+    const float stackH = 56 + 12 + 26 + 6 + 42 + 14 + 36;
+    float y = std::round(dz.CY() - stackH / 2);
+    Rect ic = Rect::Centered(dz.CX(), y + 28, 56, 56);
+    ui_.Fill(ic, WithAlpha(Accent, 0.16f), 16);
+    ui_.Icon(ic, icon::Download, 24.f, AccentHi);
+    y += 56 + 12;
+    ui_.Text(Rect(dz.l, y, dz.r, y + 26), L"동영상을 여기에 끌어다 놓으세요", 18.f, TextColor, Bold(AlignCenter));
+    y += 26 + 6;
+    TextStyle lines = Align(AlignCenter, AlignStart);
+    lines.wrap = true;
+    ui_.Text(Rect(dz.l + 20, y, dz.r - 20, y + 42),
+             L"MP4, MOV, MKV, WebM 같은 동영상을 열 수 있습니다.\nGIF, WebP 같은 움짤은 아직 열 수 없습니다.", 13.f,
+             TextDim, lines);
+    y += 42 + 14;
+    const float bw = ui_.Measure(L"동영상 열기…", 13.f, kSemibold) + 13 + 8 + 40;
+    if (ui_.Button(HashId("edit.browse"), Rect::Centered(dz.CX(), y + 18, bw, 36), L"동영상 열기…", BtnStyle::Primary,
+                   icon::OpenFile, true, 13.f))
+        BrowseForVideo();
+
+    // What there is to open: this run's recordings not saved yet, and the files saved or opened lately.
+    const float rowH = 52;
+    enum class Act { None, OpenHeld, DropHeld, OpenRecent, Folder } act = Act::None;
+    size_t actAt = 0;
+    auto panel = [&](int k, Rect p, const std::wstring& title, size_t rows, std::wstring_view empty,
+                     const std::function<void(size_t, Rect)>& row) {
+        ui_.Fill(p, Surface, 14);
+        ui_.Stroke(p.Inset(0.5f), Border, 14);
+        Rect in = p.Inset(14, 12);
+        ui_.Text(in.CutTop(24).Inset(8, 0), title, 12.f, TextFaint, Bold());
+        in.CutTop(4);
+        if (rows == 0) {
+            TextStyle st = Align(AlignStart, AlignStart);
+            st.wrap = true;
+            ui_.Text(in.Inset(8, 6), empty, 12.5f, TextFaint, st);
+            return;
+        }
+        const float content = rows * rowH, maxScroll = std::max(0.f, content - in.H());
+        float& scroll = editListScroll_[k];
+        if (ui_.Hover(in) && ui_.In().wheel != 0) scroll -= ui_.In().wheel * rowH;
+        scroll = std::clamp(scroll, 0.f, maxScroll);
+        ui_.PushClip(in);
+        for (size_t i = 0; i < rows; ++i) {
+            Rect rr = Rect::XYWH(in.l, in.t + i * rowH - scroll, in.W() - (maxScroll > 0 ? 8 : 0), rowH);
+            if (rr.b < in.t || rr.t > in.b) continue;
+            if (ui_.Hover(rr)) ui_.Fill(rr, Surface2, 10);
+            row(i, rr);
+        }
+        ui_.PopClip();
+        if (maxScroll > 0) {
+            float th = std::max(24.f, in.H() * in.H() / content);
+            float ty = in.t + (in.H() - th) * (scroll / maxScroll);
+            ui_.Fill(Rect(in.r - 3, ty, in.r, ty + th), BorderStrong, 1.5f);
+        }
+    };
+    auto item = [&](Rect rr, wchar_t glyph, D2D1_COLOR_F tint, const std::wstring& name, const std::wstring& sub) {
+        Rect ic = Rect::XYWH(rr.l + 8, rr.CY() - 17, 34, 34);
+        ui_.Fill(ic, WithAlpha(tint, 0.15f), 9);
+        ui_.Icon(ic, glyph, 15.f, tint);
+        Rect text(ic.r + 10, rr.t, rr.r - 8 - 30 - 6 - 74 - 10, rr.b);
+        ui_.Text(Rect(text.l, rr.t + 7, text.r, rr.CY() + 2), name, 13.f, TextColor, Bold());
+        ui_.Text(Rect(text.l, rr.CY() + 1, text.r, rr.b - 7), sub, 12.f, TextFaint);
+    };
+    auto edit = [&](Rect rr) { return Rect::XYWH(rr.r - 8 - 30 - 6 - 74, rr.CY() - 15, 74, 30); };
+    auto side = [&](Rect rr) { return Rect::XYWH(rr.r - 8 - 30, rr.CY() - 15, 30, 30); };
+
+    Rect left = r.CutLeft(std::floor((r.W() - 16) / 2));
+    r.CutLeft(16);
+    panel(0, left, util::Format(L"저장하지 않은 녹화 %zu개", held_.size()), held_.size(),
+          L"아직 없습니다. 저장하지 않은 움짤 녹화가 여기에 남습니다.", [&](size_t i, Rect rr) {
+              const HeldClip& h = held_[i];
+              item(rr, icon::Record, Accent2, h.name,
+                   util::FormatClock(h.clip->Seconds(), true) + L" · " + util::FormatAgo(util::NowSeconds() - h.when));
+              if (ui_.Button(HashId("edit.held", (uint32_t)i), edit(rr), L"편집", BtnStyle::Primary, icon::Cut, true,
+                             12.5f))
+                  act = Act::OpenHeld, actAt = i;
+              if (ui_.IconButton(HashId("edit.drop", (uint32_t)i), side(rr), icon::Delete, L"버리기"))
+                  act = Act::DropHeld, actAt = i;
+          });
+    panel(1, r, L"최근 파일", recentFiles_.size(), L"저장하거나 연 파일이 여기에 표시됩니다.", [&](size_t i, Rect rr) {
+        const RecentFile& f = recentFiles_[i];
+        item(rr, f.video ? icon::Video : icon::Photo, f.video ? Accent : Success, util::FileNameOf(f.path),
+             util::FormatBytes(f.bytes) + L" · " + util::FormatAgo(f.age));
+        const UiId eid = HashId("edit.recent", (uint32_t)i);
+        if (ui_.Button(eid, edit(rr), L"편집", BtnStyle::Secondary, icon::Cut, f.video, 12.5f))
+            act = Act::OpenRecent, actAt = i;
+        if (!f.video) ui_.Tooltip(eid, edit(rr), L"움짤은 아직 편집할 수 없습니다");
+        if (ui_.IconButton(HashId("edit.folder", (uint32_t)i), side(rr), icon::Folder, L"폴더에서 보기"))
+            act = Act::Folder, actAt = i;
+        Rect name(rr.l, rr.t, edit(rr).l - 10, rr.b);
+        if (ui_.Hover(name)) ui_.Tooltip(HashId("edit.tip", (uint32_t)i), name, f.path);
+    });
+    switch (act) {
+        case Act::OpenHeld: OpenHeld(actAt); break;
+        case Act::DropHeld: ConfirmDropHeld(actAt); break;
+        case Act::OpenRecent: OpenMediaFile(std::wstring(recentFiles_[actAt].path)); break;
+        case Act::Folder: util::OpenFolderAndSelect(recentFiles_[actAt].path); break;
+        case Act::None: break;
+    }
+}
+
+void App::DrawDropCue(Rect client) {
+    const bool yes = dragKind_ == DragKind::Video;
+    const D2D1_COLOR_F tint = yes ? Accent : Warning;
+    ui_.Fill(client, WithAlpha(Hex(0x08090C), 0.86f));
+    Rect box = client.Inset(14);
+    ui_.Fill(box, WithAlpha(tint, yes ? 0.10f : 0.07f), 18);
+    ui_.StrokeDashed(box, tint, 18, 2.5f, 9.f, 6.f);
+    const wchar_t *title = L"이 파일은 열 수 없습니다", *sub = L"동영상 파일만 열 수 있습니다";
+    switch (dragKind_) {
+        case DragKind::Video: title = L"놓으면 편집 탭에서 엽니다", sub = L"MP4, MOV, MKV, WebM 같은 동영상"; break;
+        case DragKind::Anim: title = L"움짤은 아직 열 수 없습니다"; break;
+        case DragKind::Busy:
+            if (rec_ != RecState::Idle)
+                title = L"녹화하는 동안은 열 수 없습니다", sub = L"녹화를 멈춘 뒤에 놓으세요";
+            else
+                title = L"저장하는 동안은 열 수 없습니다", sub = L"저장이 끝난 뒤에 놓으세요";
+            break;
+        default: break;
+    }
+    const float h = 72 + 16 + 30 + 6 + 22 + (dragName_.empty() ? 0.f : 14 + 30);
+    float y = std::round(client.CY() - h / 2);
+    Rect ic = Rect::Centered(client.CX(), y + 36, 72, 72);
+    ui_.Fill(ic, WithAlpha(tint, yes ? 0.2f : 0.16f), 20);
+    if (yes) {
+        ui_.Icon(ic, icon::Download, 30.f, AccentHi);
+    } else {  // a "no" sign: MDL2 has none that reads well at this size
+        const float rr = 14, d = rr * 0.7071f;
+        ui_.Ring(ic.CX(), ic.CY(), rr, Warning, 2.5f);
+        ui_.Line(ic.CX() - d, ic.CY() + d, ic.CX() + d, ic.CY() - d, Warning, 2.5f);
+    }
+    y += 72 + 16;
+    ui_.Text(Rect(box.l, y, box.r, y + 30), title, 22.f, TextColor, Bold(AlignCenter));
+    y += 30 + 6;
+    ui_.Text(Rect(box.l, y, box.r, y + 22), sub, 14.f, TextDim, Align(AlignCenter));
+    y += 22 + 14;
+    if (!dragName_.empty()) {
+        const float w = std::min(ui_.Measure(dragName_, 13.f) + 28, box.W() - 60);
+        Rect chip = Rect::Centered(client.CX(), y + 15, w, 30);
+        ui_.Fill(chip, Surface3, 8);
+        ui_.Text(chip.Inset(14, 0), dragName_, 13.f, TextColor, Align(AlignCenter));
+    }
 }
 
 void App::DrawPreview(Rect r) {
@@ -1618,8 +1864,8 @@ void App::DrawExportPanel(Rect r) {
             UiId id = HashId("ex.discard");
             if (ui_.Button(id, discard, video ? L"삭제" : L"버리기", BtnStyle::Secondary, icon::Delete, true, 13.f))
                 ConfirmDiscard();
-            ui_.Tooltip(id, discard, video ? L"이 동영상을 휴지통으로 옮기고 홈으로 갑니다 (Delete)"
-                                           : L"이 녹화를 버리고 홈으로 갑니다 (Delete)");
+            ui_.Tooltip(id, discard, video ? L"이 동영상을 휴지통으로 옮깁니다 (Delete)"
+                                           : L"이 녹화를 버립니다 (Delete)");
         }
         if (ui_.Button(HashId("ex.saveas"), saveAs, L"다른 이름으로 저장…", BtnStyle::Secondary, 0, avail, 13.f))
             StartExport(true);
@@ -1847,7 +2093,7 @@ void App::SettingsRecord(Rect& area, bool& changed) {
                               : L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요",
                230, [&](Rect c) { hotkeyButton(c, kHotkeyPause, settings_.hkPauseMods, settings_.hkPauseVk); });
 
-    SettingRow(area, L"최대 녹화 길이", L"이 길이가 되면 저장하고 편집 화면을 엽니다 · 움짤과 동영상 모두", 300,
+    SettingRow(area, L"최대 녹화 길이", L"이 길이가 되면 녹화를 멈춥니다. 움짤과 동영상 모두 해당합니다.", 300,
                [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.maxlen"), c, {L"끔", L"10분", L"30분", L"1시간"},
                                             settings_.maxLengthIdx);

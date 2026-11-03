@@ -863,7 +863,7 @@ int App::RunSelfTest(const std::wstring& dir) {
             toastUntil_ = 0;
             int yes = 0;
             auto ask = [&] {
-                Ask({L"저장하지 않은 녹화가 1개 있습니다", L"종료하면 사라집니다. 남기려면 먼저 편집 화면에서 저장하세요.",
+                Ask({L"저장하지 않은 녹화가 1개 있습니다", L"종료하면 사라집니다. 남기려면 먼저 편집 탭에서 저장하세요.",
                      L"종료", true, [&] { ++yes; }});
             };
             ask();
@@ -886,6 +886,53 @@ int App::RunSelfTest(const std::wstring& dir) {
                              L"Enter yes after the frame %d",
                              good ? L"ok" : L"FAIL", left, ui_.LayerErrors(), no, later && yes == 1));
             if (!good) ++failures;
+        }
+        // Files dragged over the window (OLE, as Explorer drags them): the whole window says what a drop would do,
+        // the preview included. Only a video drops, and it opens once the drop has returned (WM_APP_OPEN).
+        {
+            std::wstring mp4 = dir + L"\\끌어오기.mp4", gif = dir + L"\\끌어오기.gif";
+            for (const std::wstring& f : {mp4, gif}) {
+                HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            }
+            auto dataFor = [](const std::wstring& path) {
+                ComPtr<IShellItem> item;
+                ComPtr<IDataObject> data;
+                if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item))))
+                    item->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
+                return data;
+            };
+            const DWORD all = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            DWORD effect = all;
+            auto gifData = dataFor(gif), mp4Data = dataFor(mp4);
+            auto target = MakeDropTarget();  // what CreateMainWindow registers (this test has no main window)
+            bool ok = gifData && mp4Data;
+            if (ok) ok = SUCCEEDED(target->DragEnter(gifData.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
+                         dragKind_ == DragKind::Anim && effect == DROPEFFECT_NONE;
+            frames(3);
+            const bool gifShown = ui_.LayerErrors() == 0 &&
+                                  std::any_of(ui_.Floats().begin(), ui_.Floats().end(),
+                                              [](const Rect& f) { return f.W() >= 1120 && f.H() >= 780; });
+            target->DragLeave();
+            const bool left = dragKind_ == DragKind::None;
+            effect = all;
+            if (ok) ok = SUCCEEDED(target->DragEnter(mp4Data.Get(), MK_LBUTTON, {0, 0}, &effect)) &&
+                         dragKind_ == DragKind::Video && effect == DROPEFFECT_COPY && dragName_ == L"끌어오기.mp4";
+            frames(3);
+            PreviewLayout(dest, src);
+            const size_t uncovered = PreviewParts(dest).size();
+            const bool clean = thumbWanted_ && ui_.LayerErrors() == 0;
+            effect = all;
+            if (ok) ok = SUCCEEDED(target->Drop(mp4Data.Get(), MK_LBUTTON, {0, 0}, &effect));
+            const bool dropped = ok && effect == DROPEFFECT_COPY && dragKind_ == DragKind::None && pendingOpen_ == mp4;
+            pendingOpen_.clear();  // an empty stand-in, not a video: nothing for WM_APP_OPEN to open
+            good = ok && gifShown && left && clean && uncovered == 0 && dropped;
+            log(util::Format(L"drag over the window: %s GIF refused with a cue %d, cue gone on leave %d, video cue over "
+                             L"the preview (%zu parts left) %d, the drop opens it afterwards %d",
+                             good ? L"ok" : L"FAIL", gifShown, left, uncovered, clean, dropped));
+            if (!good) ++failures;
+            DeleteFileW(mp4.c_str());
+            DeleteFileW(gif.c_str());
         }
         filesOpen_ = false;
         toastUntil_ = 0;
@@ -1042,7 +1089,7 @@ int App::RunSelfTest(const std::wstring& dir) {
                              ok ? L"ok  " : L"FAIL", parent == 0 ? L"unknown" : parent == GetCurrentProcessId() ? L"OzMaker" : L"another process"));
         }
     }
-    // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the editor goes home.
+    // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the 편집 tab is left with nothing open.
     {
         auto clip = MakeSyntheticClip(320, 180, 10, 30);
         size_t before = held_.size();
@@ -1050,9 +1097,44 @@ int App::RunSelfTest(const std::wstring& dir) {
         OpenEditor(clip);
         bool can = CanDiscard();
         DiscardRecording();
-        bool ok = can && !clip_ && held_.size() == before && screen_ == Screen::Home && clip.use_count() == 1;
+        bool ok = can && !clip_ && held_.size() == before && screen_ == Screen::Editor && clip.use_count() == 1;
         if (!ok) ++failures;
         log(util::Format(L"discard: %s an unsaved recording goes from the editor", ok ? L"ok  " : L"FAIL"));
+        CloseEditor();
+    }
+    // The 녹화 | 편집 tabs: the open file waits in the 편집 tab while the 녹화 tab shows; 닫기 leaves the 편집 tab
+    // with nothing open and the recording still among those not saved; 버리기 on that list asks first.
+    {
+        auto clip = MakeSyntheticClip(320, 180, 10, 30);
+        size_t before = held_.size();
+        HoldRecording(clip);
+        OpenEditor(clip);
+        CloseEditor();
+        const bool away = screen_ == Screen::Home && clip_ == clip;
+        ResumeEditor();
+        const bool back = screen_ == Screen::Editor && clip_ == clip && playing_;
+        CloseClip();
+        const bool closed = screen_ == Screen::Editor && !clip_ && !playing_ && held_.size() == before + 1;
+        CloseEditor();
+        ResumeEditor();
+        const bool empty = screen_ == Screen::Editor && !clip_;
+        OpenHeld(0);
+        const bool reopened = screen_ == Screen::Editor && clip_ == clip;
+        CloseEditor();
+        ConfirmDropHeld(0);
+        const bool asked = question_.has_value() && held_.size() == before + 1;
+        if (question_) {
+            auto yes = std::move(question_->onYes);
+            question_.reset();
+            if (yes) yes();
+        }
+        const bool dropped = held_.size() == before && !clip_ && clip.use_count() == 1;
+        bool ok = away && back && closed && empty && reopened && asked && dropped;
+        if (!ok) ++failures;
+        log(util::Format(L"tabs: %s 녹화 keeps the file open %d, 편집 brings it back %d, 닫기 keeps the recording %d, "
+                         L"편집 with nothing open %d, reopened from the list %d, 버리기 asks %d and drops it %d",
+                         ok ? L"ok  " : L"FAIL", away, back, closed, empty, reopened, asked, dropped));
+        toastUntil_ = 0;
     }
     // Portable mode (#25): a settings.ini next to the exe is the settings file; a test run keeps its scratch file.
     {
@@ -1535,6 +1617,8 @@ int App::RunScreenshots(const std::wstring& dir) {
         estKey_ = EstimateKey();
         estValid_ = true;
     }
+    clipName_ = L"OzMaker Test Window";
+    held_ = {{clip_, clock - 40, clipName_}};
     shot(L"editor.png", 96);
     // 자세히 설정 open, with 강하게 (the longest hint), which no preset has at this size: 직접 설정함.
     settings_.exportDetails = true;
@@ -1598,8 +1682,28 @@ int App::RunScreenshots(const std::wstring& dir) {
     mouse = {};
     toastUntil_ = 0;
     filesOpen_ = false;
+    // Files dragged over the window, over the preview: a video, and a 움짤 that can't be opened yet.
+    dragKind_ = DragKind::Video;
+    dragName_ = L"회의_녹화.mp4";
+    shot(L"drop_video.png", 96);
+    dragKind_ = DragKind::Anim;
+    dragName_ = L"반응.gif";
+    shot(L"drop_gif.png", 96);
+    dragKind_ = DragKind::None;
+    dragName_.clear();
+    // The 편집 tab with nothing open: the two recordings and the recent files, then with none of either.
+    auto keep = std::exchange(clip_, nullptr);
+    screen_ = Screen::Editor;
+    shot(L"edit_home.png", 96);
+    mouse.mx = 1005;  // the GIF's 편집, which says why it is off
+    mouse.my = 60 + 20 + 250 + 16 + 12 + 28 + 26;
+    shot(L"edit_home_tip.png", 96);
+    mouse = {};
     held_.clear();
     recentFiles_.clear();
+    shot(L"edit_home_empty.png", 96);
+    screen_ = Screen::Home;
+    keep.reset();
     target_ = nullptr;
     if (standIn) DestroyWindow(standIn);
     log(layerErrors ? util::Format(L"RESULT: %d screen(s) with layering errors", layerErrors) : L"RESULT: all passed");
@@ -2719,9 +2823,13 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     r.seconds = 3.0;
     r.encoder = L"NVIDIA H.264 Encoder MFT";
     OnVideoSaved(r);
+    check(screen_ == Screen::Home && showVideo_ && !clip_ && lastVideo_.path == path,
+          L"saved video shows its card on the 녹화 tab");
+    EditLastVideo();
     check(screen_ == Screen::Editor && clip_ && clip_->SlowSeek() && hasResult_ && resultOriginal_ &&
               fmt_ == (int)Format::Mp4,
-          util::Format(L"saved video opens the editor (%zu frames, format %d)", clip_ ? clip_->Count() : 0, fmt_));
+          util::Format(L"the card's 편집 opens it in the 편집 tab (%zu frames, format %d)", clip_ ? clip_->Count() : 0,
+                       fmt_));
     size_t first = SIZE_MAX;
     pump(0.5, [&] { return shown_ != SIZE_MAX; });
     first = shown_;
@@ -2833,6 +2941,7 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         r.path = copy;
         r.bytes = util::FileSize(copy);
         OnVideoSaved(r);
+        EditLastVideo();
         pump(0.5);
         check(screen_ == Screen::Editor && CanDiscard(), L"the video just recorded can be deleted in the editor");
         testDeleteFiles_ = true;
@@ -2852,9 +2961,9 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         pump(0.3);
         key(VK_RETURN);
         pump(0.5);
-        check(screen_ == Screen::Home && !clip_ && !showVideo_ && !question_ &&
+        check(screen_ == Screen::Editor && !clip_ && !showVideo_ && !question_ &&
                   GetFileAttributesW(copy.c_str()) == INVALID_FILE_ATTRIBUTES && util::FileSize(path) > 0,
-              L"Enter on the question: 삭제 removes the video and its card and goes home");
+              L"Enter on the question: 삭제 removes the video and its card; the 편집 tab has nothing open");
         check(OpenVideo(path) && !CanDiscard(), L"a video opened by hand has no 삭제");
         CloseEditor();
     } else {
