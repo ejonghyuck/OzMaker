@@ -197,6 +197,7 @@ void Ui::Begin(ID2D1RenderTarget* rt, const UiInput& in, double now) {
     floats_.clear();
     natives_.clear();
     floatDepth_ = layerErrors_ = 0;
+    focusDrawn_ = false;
 }
 
 void Ui::End() {
@@ -216,6 +217,11 @@ void Ui::End() {
         EndFloat();
     }
     if (!in_.down || in_.released) active_ = 0;
+    // A field that is no longer drawn has no focus.
+    if (focus_ && !focusDrawn_) {
+        imeReset_ = !in_.composing.empty();
+        focus_ = 0;
+    }
 }
 
 void Ui::BeginFloat() {
@@ -417,6 +423,248 @@ bool Ui::ToggleRow(UiId id, const Rect& r, std::wstring_view label, bool& v, std
         Text(Rect(tr.l, tr.t + 5, tr.r, tr.CY() + 1), label, 13.f, enabled ? TextColor : TextFaint);
         Text(Rect(tr.l, tr.CY() - 1, tr.r, tr.b - 5), sub, 11.5f, TextFaint);
     }
+    return changed;
+}
+
+void Ui::Focus(UiId id) {
+    focus_ = id;
+    caret_ = anchor_ = SIZE_MAX;  // the end, once the text is known
+    scrollX_ = 0;
+    caretMoved_ = now_;
+}
+
+namespace {
+
+// Steps over a surrogate pair as one character.
+size_t PrevChar(const std::wstring& s, size_t i) {
+    if (i == 0) return 0;
+    --i;
+    if (i > 0 && IS_LOW_SURROGATE(s[i]) && IS_HIGH_SURROGATE(s[i - 1])) --i;
+    return i;
+}
+size_t NextChar(const std::wstring& s, size_t i) {
+    if (i >= s.size()) return s.size();
+    ++i;
+    if (i < s.size() && IS_LOW_SURROGATE(s[i]) && IS_HIGH_SURROGATE(s[i - 1])) ++i;
+    return i;
+}
+
+std::wstring ClipboardText() {
+    std::wstring s;
+    if (!OpenClipboard(nullptr)) return s;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+            s = p;
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return s;
+}
+
+void SetClipboardText(std::wstring_view s) {
+    if (s.empty() || !OpenClipboard(nullptr)) return;
+    EmptyClipboard();
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t))) {
+        auto* p = static_cast<wchar_t*>(GlobalLock(h));
+        memcpy(p, s.data(), s.size() * sizeof(wchar_t));
+        p[s.size()] = 0;
+        GlobalUnlock(h);
+        if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+    }
+    CloseClipboard();
+}
+
+}  // namespace
+
+bool Ui::TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view placeholder, size_t maxLen) {
+    const float fs = 13.f, pad = 10.f;
+    const Rect inner(r.l + pad, r.t, r.r - pad, r.b);
+    TextStyle st;
+    auto layout = [&](const std::wstring& s) { return Fonts::Layout(s, fs, st, 100000.f, r.H()); };
+    auto xOf = [&](IDWriteTextLayout* lay, size_t pos) {
+        float x = 0, y = 0;
+        DWRITE_HIT_TEST_METRICS m{};
+        if (lay) lay->HitTestTextPosition((UINT32)pos, FALSE, &x, &y, &m);
+        return x;
+    };
+    auto posAt = [&](float x) {
+        auto lay = layout(text);
+        BOOL trailing = FALSE, inside = FALSE;
+        DWRITE_HIT_TEST_METRICS m{};
+        if (!lay || FAILED(lay->HitTestPoint(x - inner.l + scrollX_, r.H() / 2, &trailing, &inside, &m)))
+            return text.size();
+        return std::min(text.size(), (size_t)m.textPosition + (trailing ? m.length : 0));
+    };
+
+    bool focused = focus_ == id, changed = false;
+    if (focused) {
+        focusDrawn_ = true;
+        caret_ = std::min(caret_, text.size());
+        anchor_ = std::min(anchor_, text.size());
+    }
+    const bool hot = Hover(r);
+    if (hot) cursor_ = IDC_IBEAM;
+    auto selection = [&] { return std::pair{std::min(caret_, anchor_), std::max(caret_, anchor_)}; };
+    auto eraseSelection = [&] {
+        auto [a, b] = selection();
+        if (a == b) return;
+        text.erase(a, b - a);
+        caret_ = anchor_ = a;
+        changed = true;
+    };
+    auto insert = [&](std::wstring s) {
+        for (wchar_t& c : s)
+            if (c < 0x20) c = L' ';  // one line
+        eraseSelection();
+        size_t room = maxLen > text.size() ? maxLen - text.size() : 0;
+        if (s.size() > room) {
+            s.resize(room);
+            if (!s.empty() && IS_HIGH_SURROGATE(s.back())) s.pop_back();
+        }
+        if (s.empty()) return;
+        text.insert(caret_, s);
+        caret_ = anchor_ = caret_ + s.size();
+        changed = true;
+    };
+    // Letting go keeps what the IME was composing.
+    auto blur = [&] {
+        if (!in_.composing.empty()) {
+            insert(in_.composing);
+            imeReset_ = true;
+        }
+        focus_ = 0;
+        focused = false;
+    };
+
+    if (!blocked_ && in_.pressed) {
+        if (hot && !pressTaken_) {
+            pressTaken_ = true;
+            active_ = id;
+            if (!focused) {
+                focus_ = id;
+                focused = focusDrawn_ = true;
+                scrollX_ = 0;
+            }
+            caret_ = posAt(in_.mx);
+            if (!in_.shift) anchor_ = caret_;
+            if (in_.dblclick) {
+                anchor_ = 0;
+                caret_ = text.size();
+            }
+            caretMoved_ = now_;
+        } else if (focused && !hot) {
+            blur();
+        }
+    } else if (focused && active_ == id && in_.down) {
+        caret_ = posAt(in_.mx);  // dragging selects
+    }
+
+    if (focused && !blocked_) {
+        const bool ctrl = in_.ctrl, shift = in_.shift;
+        for (UINT vk : in_.keys) {
+            size_t to = SIZE_MAX;  // where the caret moves
+            switch (vk) {
+                case VK_LEFT: {
+                    auto [a, b] = selection();
+                    to = !shift && a != b ? a : PrevChar(text, caret_);
+                    break;
+                }
+                case VK_RIGHT: {
+                    auto [a, b] = selection();
+                    to = !shift && a != b ? b : NextChar(text, caret_);
+                    break;
+                }
+                case VK_HOME: to = 0; break;
+                case VK_END: to = text.size(); break;
+                case VK_BACK:
+                    if (caret_ == anchor_) anchor_ = PrevChar(text, caret_);
+                    eraseSelection();
+                    break;
+                case VK_DELETE:
+                    if (caret_ == anchor_) anchor_ = NextChar(text, caret_);
+                    eraseSelection();
+                    break;
+                case VK_RETURN:
+                case VK_ESCAPE: blur(); break;
+                case 'A':
+                    if (ctrl) {
+                        anchor_ = 0;
+                        caret_ = text.size();
+                    }
+                    break;
+                case 'C':
+                case 'X':
+                    if (ctrl) {
+                        auto [a, b] = selection();
+                        SetClipboardText(std::wstring_view(text).substr(a, b - a));
+                        if (vk == 'X') eraseSelection();
+                    }
+                    break;
+                case 'V':
+                    if (ctrl) insert(ClipboardText());
+                    break;
+            }
+            if (!focused) break;
+            if (to != SIZE_MAX) {
+                caret_ = to;
+                if (!shift) anchor_ = caret_;
+            }
+            caretMoved_ = now_;
+        }
+        if (focused) insert(in_.chars);
+        // Nothing after the field sees what it took.
+        in_.keys.clear();
+        in_.chars.clear();
+    }
+
+    // The text, with what the IME is composing at the caret.
+    const std::wstring& comp = focused ? in_.composing : std::wstring();
+    std::wstring shown = text;
+    if (!comp.empty()) shown.insert(caret_, comp);
+    auto lay = layout(shown);
+    const size_t caretPos = caret_ + comp.size();
+    const float caretX = focused ? xOf(lay.Get(), caretPos) : 0.f;
+    if (focused) {
+        DWRITE_TEXT_METRICS m{};
+        if (lay) lay->GetMetrics(&m);
+        if (caretX - scrollX_ > inner.W() - 2) scrollX_ = caretX - inner.W() + 2;
+        if (caretX - scrollX_ < 0) scrollX_ = caretX;
+        scrollX_ = std::clamp(scrollX_, 0.f, std::max(0.f, m.widthIncludingTrailingWhitespace - inner.W() + 2));
+    } else if (!focus_) {
+        scrollX_ = 0;
+    }
+    const float sx = focused ? scrollX_ : 0.f;
+
+    Fill(r, Surface2, 9);
+    Stroke(r.Inset(0.5f), focused ? Accent : hot ? BorderStrong : Border, 9);
+    PushClip(inner);
+    if (shown.empty()) {
+        Text(inner, placeholder, fs, TextFaint);
+    } else if (lay) {
+        if (focused && caret_ != anchor_) {
+            auto [a, b] = selection();
+            float xa = xOf(lay.Get(), a), xb = xOf(lay.Get(), b);
+            Fill(Rect(inner.l + xa - sx, r.t + 7, inner.l + xb - sx, r.b - 7), WithAlpha(Accent, 0.4f));
+        }
+        Painted(inner);
+        RT()->DrawTextLayout({inner.l - sx, r.t}, lay.Get(), Brush(TextColor), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        if (!comp.empty()) {
+            float x0 = xOf(lay.Get(), caret_), x1 = xOf(lay.Get(), caretPos);
+            float y = std::round(r.CY() + fs * 0.62f);
+            Line(inner.l + x0 - sx, y, inner.l + x1 - sx, y, TextColor, 1.f);
+        }
+    }
+    caretRect_ = {};
+    if (focused) {
+        float x = std::round(inner.l + caretX - sx);
+        caretRect_ = Rect(x, r.t + 8, x + 1, r.b - 8);
+        // On for 0.53 s, off for 0.53 s, steady for a moment after it moves.
+        double t = std::fmod(now_ - caretMoved_, 1.06);
+        if (t < 0.53) Fill(caretRect_, TextColor);
+        RequestWake(now_ + (t < 0.53 ? 0.53 - t : 1.06 - t));
+    }
+    PopClip();
     return changed;
 }
 

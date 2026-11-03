@@ -12,6 +12,7 @@
 #include <compressapi.h>
 #include <mmsystem.h>
 #include <commctrl.h>
+#include <imm.h>
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>

@@ -56,6 +56,7 @@ private:
     void HideMain();
     void RememberPlacement();  // into settings_, for the next start
     void Toast(std::wstring text, bool error = false);
+    void SyncIme();
     // The live window preview (DWM thumbnails, which DWM draws above everything in this window).
     void ApplyThumbnail();
     bool AddThumbnail();
@@ -81,6 +82,7 @@ private:
     void DrawFileBar(Rect r);   // over the editor: the open file and 닫기
     void DrawPreview(Rect r);
     void DrawTransport(Rect r);
+    void DrawCaptionBar(Rect r);  // under the playback controls while 자막 is on
     void DrawTimeline(Rect r);
     void DrawExportPanel(Rect r);
     void OpenSettings(int tab = -1);  // -1: the tab viewed last
@@ -184,6 +186,12 @@ private:
     void SetPreviewVolume(int v);
     void SetPlaying(bool play);
     void Seek(size_t index);
+    void Shuttle(int dir);  // J (-1) and L (+1)
+    void ResetRange();      // R: the whole clip again
+    void RestartClock();    // the preview clock from the playhead, now
+    void FollowDirection();  // after the format or 재생 방향 changed
+    bool PreviewBackwards() const;  // normal playback starts backwards (거꾸로)
+    double PreviewRate() const { return shuttle_ ? std::abs(shuttle_) : kSpeedOptions[settings_.speedIdx]; }
     size_t PlayheadFromClock();
     int64_t RangeEndTs() const;
     void OutputSize(int& w, int& h, int scaleIdx = -1) const;  // -1 = the current setting
@@ -195,6 +203,9 @@ private:
     void StartFit();
     void OnEstimate();
     bool ExportAudio() const;
+    // MP4 of a video: why the range has to be encoded again; "" when it is copied as it is (Mp4Cut.h); null when
+    // copying can't be done here at all.
+    const wchar_t* CopyBlocker() const;
     VideoConfig VideoSettings(int fps) const;
     std::wstring ExportName(Format f) const;
     std::wstring FileStem(const std::wstring& what) const;  // settings_.nameTemplate filled in
@@ -245,6 +256,7 @@ private:
     Ui ui_;
     UiInput input_;
     bool dirty_ = true, tracking_ = false, quitting_ = false;
+    bool imeOn_ = false;  // the window has an IME context (a text field has the focus)
     double wake_ = 0;
     Screen screen_ = Screen::Home;
     Screen settingsReturn_ = Screen::Home;
@@ -295,6 +307,8 @@ private:
     uint32_t frameBmpGen_ = 0;
     size_t shown_ = SIZE_MAX, playhead_ = 0, inF_ = 0, outF_ = 0;
     bool playing_ = false;
+    bool playBack_ = false;  // the preview runs backwards: 거꾸로, a boomerang's way back, J
+    int shuttle_ = 0;        // J / K / L: the preview's speed while it plays, - backwards; 0 = normal playback
     double playWall_ = 0;
     int64_t playTs_ = 0;
     uint32_t playEpoch_ = 0, audioEpoch_ = 0;  // bumped whenever the preview clock jumps
@@ -306,6 +320,10 @@ private:
     bool cropMode_ = false;
     int cropAspect_ = 0;
     int cropDrag_ = -1;
+    std::shared_ptr<const mp4::CutSource> cutSource_;  // a video that can be cut without encoding it again
+    std::wstring caption_;      // 자막: one line over the whole clip (#22), kept for the clip open
+    int captionPos_ = 0;        // caption::Pos
+    bool captionOpen_ = false;  // the caption bar is up
     RECT cropStart_{};
     float dragX_ = 0, dragY_ = 0;
     Rect previewDst_;
@@ -405,6 +423,7 @@ private:
         size_t count = 0, first = 0, last = 0;
         double fps = 0, speed = 0;
         bool mp4 = false;
+        int direction = 0;
         size_t frames = 0;
         double ms = 0;
     };

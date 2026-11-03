@@ -44,7 +44,17 @@ void Settings::ApplyPreset(int i, bool video) {
     const ExportPreset& p = kExportPresets[i];
     scaleIdx = video ? p.videoSize : p.animSize;
     outFpsIdx = video ? p.videoFps : p.animFps;
-    gifLossy = p.gifLossy;
+    if (!video) gifLossy = p.gifLossy;
+}
+
+void Settings::UseExportKind(bool video) {
+    if (video == exportVideo) return;
+    ExportKnobs now{exportPreset, scaleIdx, outFpsIdx};
+    exportPreset = stashed.preset;
+    scaleIdx = stashed.scaleIdx;
+    outFpsIdx = stashed.outFpsIdx;
+    stashed = now;
+    exportVideo = video;
 }
 
 int Settings::MatchPreset(bool video, bool gif) const {
@@ -126,7 +136,14 @@ void Settings::Load() {
         ApplyPreset(exportPreset, false);
     else
         exportPreset = MatchPreset(false, true);
+    // MP4's own, from 0.6.3. Before that MP4 used the 움짤 preset; it starts at 고화질 now either way.
+    exportVideo = false;
+    GetPrivateProfileStringW(L"OzMaker", L"Mp4Preset", L"", pv, _countof(pv), ini.c_str());
+    stashed.preset = *pv ? std::clamp((int)wcstol(pv, nullptr, 10), -1, (int)_countof(kExportPresets) - 1) : 0;
+    stashed.scaleIdx = ReadInt(ini, L"Mp4Size", kExportPresets[0].videoSize, 0, _countof(kExportSizes) - 1);
+    stashed.outFpsIdx = ReadInt(ini, L"Mp4OutFps", kExportPresets[0].videoFps, 0, _countof(kOutFpsOptions) - 1);
     exportDetails = ReadInt(ini, L"ExportDetails", exportDetails, 0, 1) != 0;
+    directionIdx = ReadInt(ini, L"Direction", directionIdx, 0, 2);
 
     wchar_t buf[MAX_PATH * 2] = {};
     GetPrivateProfileStringW(L"OzMaker", L"Monitor", L"", buf, _countof(buf), ini.c_str());
@@ -203,15 +220,22 @@ void Settings::Save() const {
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
     num(L"GifLossy", gifLossy);
-    num(L"ExportSize", scaleIdx);
-    num(L"OutFps", outFpsIdx);
+    const ExportKnobs shown{exportPreset, scaleIdx, outFpsIdx};
+    const ExportKnobs& anim = exportVideo ? stashed : shown;
+    const ExportKnobs& mp4 = exportVideo ? shown : stashed;
+    num(L"ExportSize", anim.scaleIdx);
+    num(L"OutFps", anim.outFpsIdx);
     num(L"Speed", speedIdx);
     num(L"LoopCount", loopIdx);
     num(L"PreviewVolume", previewVolume);
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
-    num(L"ExportPreset", exportPreset);
+    num(L"ExportPreset", anim.preset);
+    num(L"Mp4Preset", mp4.preset);
+    num(L"Mp4Size", mp4.scaleIdx);
+    num(L"Mp4OutFps", mp4.outFpsIdx);
     num(L"ExportDetails", exportDetails);
+    num(L"Direction", directionIdx);
     put(L"OutDir", outDir);
     put(L"CrashSeen", crashSeen);
     put(L"MicDevice", micDevice);

@@ -99,11 +99,14 @@ struct UiInput {
     float wheel = 0;  // notches, + = up
     std::vector<UINT> keys;
     bool ctrl = false, shift = false, alt = false;
+    std::wstring chars;      // typed (WM_CHAR, and text the IME finished)
+    std::wstring composing;  // what the IME is putting together (a Korean syllable), until it is finished
 
     void ClearEdges() {
         pressed = released = dblclick = rpressed = false;
         wheel = 0;
         keys.clear();
+        chars.clear();
     }
     bool Key(UINT vk) const { return std::find(keys.begin(), keys.end(), vk) != keys.end(); }
 };
@@ -165,6 +168,15 @@ public:
                    bool enabled = true);
     void Tooltip(UiId id, const Rect& r, std::wstring_view text);
     void ProgressBar(const Rect& r, float t, D2D1_COLOR_F c);
+    // One line of text. A click puts the caret in it; Enter, Esc or a click elsewhere lets go. While it has the focus
+    // it takes every key, and the IME's text being composed shows underlined at the caret. True when text changed.
+    bool TextField(UiId id, const Rect& r, std::wstring& text, std::wstring_view placeholder, size_t maxLen);
+    void Focus(UiId id);  // the field takes the focus, caret at the end, when it is drawn next
+    bool TextFocused() const { return focus_ != 0; }
+    const Rect& CaretRect() const { return caretRect_; }  // for the IME's windows
+    // True once after a field let go of the focus with IME text in it: that text went into the field, so the IME
+    // should drop it.
+    bool TakeImeReset() { return std::exchange(imeReset_, false); }
 
     // Layers. The page is drawn first; anything drawn over it (popovers, toasts, tooltips) goes between BeginFloat
     // and EndFloat, and the bounds of what each float draws are kept for the frame. A native layer is something DWM
@@ -199,4 +211,12 @@ private:
     std::vector<Rect> floats_, natives_;
     Rect floatBounds_, layerError_;
     int floatDepth_ = 0, layerErrors_ = 0;
+    // The text field with the focus.
+    UiId focus_ = 0;
+    bool focusDrawn_ = false;  // this frame
+    size_t caret_ = 0, anchor_ = 0;  // the selection runs between them
+    float scrollX_ = 0;
+    double caretMoved_ = 0;  // the caret blinks from here
+    Rect caretRect_;
+    bool imeReset_ = false;
 };
