@@ -13,6 +13,7 @@ struct ExportJob {
     Format format = Format::Gif;
     int quality = 80;
     int plays = 0;               // 움짤: times it plays, 0 = forever
+    int lossy = 0;               // GIF: lossy compression, 0 off, 1 light, 2 strong
     double holdLastMs = 0;       // 움짤: extra time on the last frame
     VideoConfig video;           // MP4: codec and bitrate; size and rate come from the fields above
     AudioConfig audio;           // MP4: enabled = keep the clip's sound (only at speed 1)

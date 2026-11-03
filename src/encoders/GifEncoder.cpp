@@ -214,6 +214,84 @@ class LzwEncoder {
 public:
     LzwEncoder() : keys_(kHash), codes_(kHash), gens_(kHash, 0) {}
 
+    // Lossy LZW, as gifsicle --lossy does it: where the string so far has no entry for the next pixel, it may go on
+    // with an entry whose pixel is a colour close to it (ColorDist below maxDist, with what was off carried on to
+    // the next pixel). Longer strings, fewer codes. data is rewritten to what a decoder will show. The first pixel of
+    // each string and the transparent index (tIdx, -1 = none) are kept exact.
+    void EncodeLossy(uint8_t* data, size_t n, int minCodeSize, const Rgb* pal, int tIdx, int maxDist,
+                     std::vector<uint8_t>& out) {
+        out_ = &out;
+        bitBuf_ = 0;
+        bitCount_ = 0;
+        blockLen_ = 0;
+        out.push_back((uint8_t)minCodeSize);
+        const int clear = 1 << minCodeSize, eoi = clear + 1;
+        int codeSize = minCodeSize + 1, maxCode = eoi;
+        child_.assign(4096, -1);
+        sibling_.resize(4096);
+        suffix_.resize(4096);
+        Put(clear, codeSize);
+        size_t i = 0;
+        while (i < n) {
+            int code = data[i];
+            size_t j = i + 1;
+            float er = 0, eg = 0, eb = 0;
+            while (j < n) {
+                const int want = data[j];
+                const bool clearPx = want == tIdx;
+                const Rgb& wc = pal[clearPx ? 0 : want];
+                const float tr = wc.r + er, tg = wc.g + eg, tb = wc.b + eb;
+                int best = -1, bestD = INT_MAX;
+                for (int c = child_[code]; c >= 0; c = sibling_[c]) {
+                    const int k = suffix_[c];
+                    if ((k == tIdx) != clearPx) continue;
+                    int dd = 0;
+                    if (!clearPx) {
+                        dd = ColorDist((int)std::lround(tr) - pal[k].r, (int)std::lround(tg) - pal[k].g,
+                                       (int)std::lround(tb) - pal[k].b);
+                        if (dd > maxDist && k != want) continue;
+                    }
+                    if (dd < bestD || (dd == bestD && k == want)) {
+                        bestD = dd;
+                        best = c;
+                    }
+                }
+                if (best < 0) break;
+                const int k = suffix_[best];
+                if (clearPx) {
+                    er = eg = eb = 0;
+                } else {  // half of what is off goes on to the next pixel, so a run does not drift one way
+                    er = (tr - pal[k].r) * 0.5f;
+                    eg = (tg - pal[k].g) * 0.5f;
+                    eb = (tb - pal[k].b) * 0.5f;
+                }
+                data[j] = (uint8_t)k;
+                code = best;
+                ++j;
+            }
+            Put(code, codeSize);
+            if (j < n) {
+                ++maxCode;
+                suffix_[maxCode] = data[j];
+                sibling_[maxCode] = child_[code];
+                child_[code] = maxCode;
+                child_[maxCode] = -1;
+                if (maxCode >= (1 << codeSize)) ++codeSize;
+                if (maxCode == 4095) {
+                    Put(clear, codeSize);
+                    std::fill(child_.begin(), child_.end(), -1);
+                    codeSize = minCodeSize + 1;
+                    maxCode = eoi;
+                }
+            }
+            i = j;
+        }
+        Put(eoi, codeSize);
+        if (bitCount_ > 0) Byte((uint8_t)(bitBuf_ & 0xFF));
+        FlushBlock();
+        out.push_back(0);
+    }
+
     void Encode(const uint8_t* data, size_t n, int minCodeSize, std::vector<uint8_t>& out) {
         out_ = &out;
         bitBuf_ = 0;
@@ -294,6 +372,7 @@ private:
     std::vector<uint32_t> keys_;
     std::vector<uint16_t> codes_;
     std::vector<uint32_t> gens_;
+    std::vector<int> child_, sibling_, suffix_;  // EncodeLossy's dictionary as a tree: first child, next sibling
     uint32_t gen_ = 0;
     std::vector<uint8_t>* out_ = nullptr;
     uint32_t bitBuf_ = 0;
@@ -313,9 +392,14 @@ public:
             return false;
         }
         int q = std::clamp(p.quality, 1, 100);
-        threshold_ = (int)std::lround((100 - q) * 0.22);
-        maxColors_ = q >= 70 ? 256 : 64 + (int)(q / 70.0 * 192);
+        // A pixel counts as changed past this much (in any channel): enough to leave the grain of video alone, which
+        // would otherwise be dithered anew in every frame and flicker.
+        threshold_ = 4 + (int)std::lround((100 - q) * 0.2);
+        // 255 at most, so an entry is left for transparency whichever frame's palette is kept.
+        maxColors_ = q >= 70 ? 255 : 64 + (int)(q / 70.0 * 191);
         dither_ = q >= 60 ? 0.85f : 0.5f + q / 60.f * 0.35f;
+        static constexpr int kLossyDist[] = {0, 9 * 6 * 6, 9 * 13 * 13};  // ColorDist of 6 / 13 in each channel
+        lossyDist_ = kLossyDist[std::clamp(p.lossy, 0, 2)];
 
         if (_wfopen_s(&f_, p.path.c_str(), L"wb") || !f_) {
             err = L"파일을 열 수 없습니다: " + p.path;
@@ -345,18 +429,33 @@ public:
         double start = timeMs_;
         timeMs_ += std::max(0.0, durationMs);
 
-        int x0 = w_, y0 = h_, x1 = -1, y1 = -1;
-        size_t nChanged = 0;
+        // How far each pixel is from what it was when last sent (in its most changed channel).
+        size_t hist[256] = {};
         for (int y = 0; y < h_; ++y) {
             const uint8_t* s = bgra + (size_t)y * w_ * 4;
             const uint8_t* r = ref_.data() + (size_t)y * w_ * 3;
             uint8_t* c = changed_.data() + (size_t)y * w_;
             for (int x = 0; x < w_; ++x, s += 4, r += 3) {
-                bool ch = first_;
-                if (!ch) {
-                    int d = std::max({std::abs(s[2] - r[0]), std::abs(s[1] - r[1]), std::abs(s[0] - r[2])});
-                    ch = d > threshold_;
-                }
+                int d = first_ ? 255 : std::max({std::abs(s[2] - r[0]), std::abs(s[1] - r[1]), std::abs(s[0] - r[2])});
+                c[x] = (uint8_t)d;
+                ++hist[d];
+            }
+        }
+        // Grain moves every pixel a little in every frame. Its size, from the quarter of the picture that changed
+        // least, raises the threshold (up to a limit) so the grain stays out while real changes get through.
+        int threshold = threshold_;
+        if (!first_) {
+            size_t quarter = (size_t)w_ * h_ / 4, seen = 0;
+            int p25 = 0;
+            while (p25 < 255 && (seen += hist[p25]) < quarter) ++p25;
+            threshold = std::clamp(p25 * 2, threshold_, threshold_ + 10);
+        }
+        int x0 = w_, y0 = h_, x1 = -1, y1 = -1;
+        size_t nChanged = 0;
+        for (int y = 0; y < h_; ++y) {
+            uint8_t* c = changed_.data() + (size_t)y * w_;
+            for (int x = 0; x < w_; ++x) {
+                const bool ch = first_ || c[x] > threshold;
                 c[x] = ch;
                 if (ch) {
                     ++nChanged;
@@ -407,7 +506,10 @@ private:
         return best;
     }
 
-    void BuildPalette(const uint8_t* bgra, int x0, int y0, int x1, int y1, size_t nChanged, int maxColors) {
+    // A new palette for the changed pixels, unless the one before still fits them about as well: then a colour
+    // keeps its entry from frame to frame, pixels that didn't really change come out the same (and transparent), and
+    // the dithering pattern stays put instead of shimmering.
+    void ChoosePalette(const uint8_t* bgra, int x0, int y0, int x1, int y1, size_t nChanged) {
         wu_.Reset();
         size_t step = std::max<size_t>(1, nChanged / 50000);
         samples_.clear();
@@ -421,17 +523,29 @@ private:
                 if (seen++ % step == 0) samples_.push_back({s[2], s[1], s[0]});
             }
         }
-        palN_ = wu_.Build(maxColors, pal_);
-        if (palN_ == 0) pal_[palN_++] = {0, 0, 0};
+        double oldErr = -1;
+        if (palN_ > 0) {
+            int64_t sum = 0;
+            for (const Rgb& p : samples_) {
+                const Rgb& c = pal_[Nearest(p.r, p.g, p.b)];
+                sum += ColorDist(p.r - c.r, p.g - c.g, p.b - c.b);
+            }
+            oldErr = (double)sum / std::max<size_t>(1, samples_.size());
+        }
 
+        Rgb pal[256];
+        int n = wu_.Build(maxColors_, pal);
+        if (n == 0) pal[n++] = {0, 0, 0};
         // Two k-means passes over a sample fix the 5-bit histogram's coarse centroids.
-        for (int it = 0; it < 2 && palN_ > 1; ++it) {
+        double newErr = 0;
+        for (int it = 0; it < 2 && n > 1; ++it) {
             int64_t sum[256][3] = {};
             int64_t cnt[256] = {};
+            int64_t dist = 0;
             for (const Rgb& p : samples_) {
                 int best = 0, bestD = INT_MAX;
-                for (int i = 0; i < palN_; ++i) {
-                    int d = ColorDist(p.r - pal_[i].r, p.g - pal_[i].g, p.b - pal_[i].b);
+                for (int i = 0; i < n; ++i) {
+                    int d = ColorDist(p.r - pal[i].r, p.g - pal[i].g, p.b - pal[i].b);
                     if (d < bestD) {
                         bestD = d;
                         best = i;
@@ -441,18 +555,23 @@ private:
                 sum[best][1] += p.g;
                 sum[best][2] += p.b;
                 ++cnt[best];
+                dist += bestD;
             }
-            for (int i = 0; i < palN_; ++i)
+            for (int i = 0; i < n; ++i)
                 if (cnt[i])
-                    pal_[i] = {(uint8_t)((sum[i][0] + cnt[i] / 2) / cnt[i]), (uint8_t)((sum[i][1] + cnt[i] / 2) / cnt[i]),
-                               (uint8_t)((sum[i][2] + cnt[i] / 2) / cnt[i])};
+                    pal[i] = {(uint8_t)((sum[i][0] + cnt[i] / 2) / cnt[i]), (uint8_t)((sum[i][1] + cnt[i] / 2) / cnt[i]),
+                              (uint8_t)((sum[i][2] + cnt[i] / 2) / cnt[i])};
+            newErr = (double)dist / std::max<size_t>(1, samples_.size());
         }
+        if (oldErr >= 0 && oldErr <= newErr * 1.3 + 8) return;  // the palette so far, and its lookups, stay
+        std::copy(pal, pal + n, pal_);
+        palN_ = n;
+        std::fill(cache_.begin(), cache_.end(), 0xFFFF);
     }
 
     void EncodeFrame(const uint8_t* bgra, int x0, int y0, int x1, int y1, size_t nChanged) {
         const bool useTransparency = !first_;
-        BuildPalette(bgra, x0, y0, x1, y1, nChanged, useTransparency ? std::min(maxColors_, 255) : maxColors_);
-        std::fill(cache_.begin(), cache_.end(), 0xFFFF);
+        ChoosePalette(bgra, x0, y0, x1, y1, nChanged);
         const int tIdx = useTransparency ? palN_ : -1;
         bool usedT = false;
 
@@ -546,7 +665,22 @@ private:
             pending_.push_back(c.g);
             pending_.push_back(c.b);
         }
-        lzw_.Encode(indices_.data(), indices_.size(), std::max(2, bits), pending_);
+        if (lossyDist_ > 0) {
+            lzw_.EncodeLossy(indices_.data(), indices_.size(), std::max(2, bits), pal_, usedT ? tIdx : -1, lossyDist_,
+                             pending_);
+            // What will be on screen, for the next frame's comparisons.
+            for (int yy = 0; yy < rh; ++yy)
+                for (int xx = 0; xx < rw; ++xx) {
+                    const int v = indices_[(size_t)yy * rw + xx];
+                    if (v == tIdx) continue;
+                    uint8_t* cp = comp_.data() + ((size_t)(y0 + yy) * w_ + x0 + xx) * 3;
+                    cp[0] = pal_[v].r;
+                    cp[1] = pal_[v].g;
+                    cp[2] = pal_[v].b;
+                }
+        } else {
+            lzw_.Encode(indices_.data(), indices_.size(), std::max(2, bits), pending_);
+        }
         hasPending_ = true;
     }
 
@@ -564,7 +698,7 @@ private:
 
     FILE* f_ = nullptr;
     int w_ = 0, h_ = 0;
-    int threshold_ = 0, maxColors_ = 256;
+    int threshold_ = 0, maxColors_ = 255, lossyDist_ = 0;
     float dither_ = 0.85f;
     bool first_ = true;
     double timeMs_ = 0, pendingStartMs_ = 0;

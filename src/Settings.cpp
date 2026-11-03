@@ -40,6 +40,23 @@ void WriteIni(const std::wstring& ini, const std::wstring& text) {
 }
 }  // namespace
 
+void Settings::ApplyPreset(int i, bool video) {
+    const ExportPreset& p = kExportPresets[i];
+    scaleIdx = video ? p.videoSize : p.animSize;
+    outFpsIdx = video ? p.videoFps : p.animFps;
+    gifLossy = p.gifLossy;
+}
+
+int Settings::MatchPreset(bool video, bool gif) const {
+    for (int i = 0; i < (int)_countof(kExportPresets); ++i) {
+        const ExportPreset& p = kExportPresets[i];
+        if (scaleIdx == (video ? p.videoSize : p.animSize) && outFpsIdx == (video ? p.videoFps : p.animFps) &&
+            (!gif || gifLossy == p.gifLossy))
+            return i;
+    }
+    return -1;
+}
+
 void Settings::Load() {
     std::wstring ini = IniPath();
     source = ReadInt(ini, L"Source", source, 0, 2);
@@ -88,6 +105,7 @@ void Settings::Load() {
     format = ReadInt(ini, L"Format", format, 0, _countof(quality) - 1);  // a saved HEIF (3, since removed) becomes AVIF
     for (int i = 0; i < (int)_countof(quality); ++i)
         quality[i] = ReadInt(ini, util::Format(L"Quality%d", i).c_str(), quality[i], 1, 100);
+    gifLossy = ReadInt(ini, L"GifLossy", gifLossy, 0, 2);
     // Older versions kept the scale (100/75/50/33/25 %) under "Scale" and a loop switch under "Loop".
     int oldScale = ReadInt(ini, L"Scale", 0, 0, 4);
     scaleIdx = ReadInt(ini, L"ExportSize", oldScale == 4 ? 5 : oldScale, 0, _countof(kExportSizes) - 1);
@@ -97,6 +115,18 @@ void Settings::Load() {
     previewVolume = ReadInt(ini, L"PreviewVolume", previewVolume, 0, 100);
     holdLast = ReadInt(ini, L"HoldLast", holdLast, 0, 1) != 0;
     targetIdx = ReadInt(ini, L"TargetSize", targetIdx, 0, _countof(kTargetMB) - 1);
+    // A file from before the presets keeps its values and shows the preset they match, if any. A new one starts at
+    // 보통. (GetPrivateProfileInt reads -1 back as 0, so the preset is read as text.)
+    wchar_t pv[8] = {};
+    GetPrivateProfileStringW(L"OzMaker", L"ExportPreset", L"", pv, _countof(pv), ini.c_str());
+    if (*pv)
+        exportPreset = std::clamp((int)wcstol(pv, nullptr, 10), -1, (int)_countof(kExportPresets) - 1);
+    else if ((int)GetPrivateProfileIntW(L"OzMaker", L"ExportSize", (UINT)-1, ini.c_str()) < 0 &&
+             (int)GetPrivateProfileIntW(L"OzMaker", L"Scale", (UINT)-1, ini.c_str()) < 0)
+        ApplyPreset(exportPreset, false);
+    else
+        exportPreset = MatchPreset(false, true);
+    exportDetails = ReadInt(ini, L"ExportDetails", exportDetails, 0, 1) != 0;
 
     wchar_t buf[MAX_PATH * 2] = {};
     GetPrivateProfileStringW(L"OzMaker", L"Monitor", L"", buf, _countof(buf), ini.c_str());
@@ -172,6 +202,7 @@ void Settings::Save() const {
     num(L"MaxLength", maxLengthIdx);
     num(L"Format", format);
     for (int i = 0; i < (int)_countof(quality); ++i) num(util::Format(L"Quality%d", i).c_str(), quality[i]);
+    num(L"GifLossy", gifLossy);
     num(L"ExportSize", scaleIdx);
     num(L"OutFps", outFpsIdx);
     num(L"Speed", speedIdx);
@@ -179,6 +210,8 @@ void Settings::Save() const {
     num(L"PreviewVolume", previewVolume);
     num(L"HoldLast", holdLast);
     num(L"TargetSize", targetIdx);
+    num(L"ExportPreset", exportPreset);
+    num(L"ExportDetails", exportDetails);
     put(L"OutDir", outDir);
     put(L"CrashSeen", crashSeen);
     put(L"MicDevice", micDevice);

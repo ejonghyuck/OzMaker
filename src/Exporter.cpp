@@ -81,6 +81,7 @@ uint64_t EstimateBytes(const ExportJob& job, const std::atomic<bool>& cancel) {
         p.height = job.outH;
         p.quality = job.quality;
         p.plays = job.plays;
+        p.lossy = job.lossy;
         p.path = path;
         std::wstring err;
         if (!enc || !enc->Begin(p, err)) return 0;
@@ -248,6 +249,7 @@ bool Exporter::RunImage(const ExportJob& job, const std::wstring& tmp, ExportRes
     p.height = job.outH;
     p.quality = job.quality;
     p.plays = job.plays;
+    p.lossy = job.lossy;
     p.path = tmp;
     if (!enc->Begin(p, res.error)) return false;
     auto reader = job.clip->NewReader();
