@@ -57,11 +57,25 @@ inline constexpr int kTimerMaxMinutes = 24 * 60;
 inline constexpr uint64_t kLowDiskWarn = 1ull << 30;        // warn before recording below this much free space
 inline constexpr uint64_t kLowDiskStop = 300ull << 20;      // and stop (saving what there is) below this
 
+// 순간 리플레이 (#20): how much of what just went by it holds, and how long the held span of a program that closed
+// stays to be saved.
+inline constexpr int kReplayLenOptions[] = {15, 30, 60, 120, 300};  // seconds
+inline constexpr int kReplayKeepClosed = 300;                         // seconds
+inline constexpr size_t kMaxReplayTargets = 32;
+// What 순간 리플레이 waits for (the 리플레이 tab's list): a program, by its exe, or a whole monitor. No window titles.
+struct ReplayTarget {
+    bool monitor = false;
+    std::wstring path;  // the program's exe; a monitor's device name (MONITORINFOEX::szDevice)
+    std::wstring name;  // as shown: the program's description, else its exe's name; "" for a monitor
+    bool on = true;     // switched on in the list
+};
+
 enum Source { kSourceWindow = 0, kSourceDisplay = 1, kSourceRegion = 2 };
 enum Output { kOutputClip = 0, kOutputVideo = 1 };
 enum CaptureMode { kCaptureAuto = 0, kCaptureWindow = 1, kCaptureDisplay = 2 };
 enum OverlayMode { kOverlayAlways = 0, kOverlayExceptFullscreen = 1, kOverlayNever = 2 };
-enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout, kTabCount };
+// The numbers are saved (SettingsTab); the settings show 리플레이 after 녹화.
+enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout, kTabReplay, kTabCount };
 enum ThemeChoice { kThemeSystem = 0, kThemeDark, kThemeLight };
 enum LanguageChoice { kLangSystem = 0, kLangKorean, kLangEnglish };
 enum StartHide { kHideToTray = 0, kHideMinimize };  // 설정 › 녹화 "녹화를 시작하면" (#46)
@@ -124,6 +138,17 @@ struct Settings {
     std::wstring micDevice;  // endpoint ID, empty = Windows' default input
     int micVolume = 100;     // %, 0-200
     bool micMonitor = true;  // 마이크 확인 plays the mic back while it runs
+
+    // 순간 리플레이 (#20)
+    bool rpOn = false;  // kept: on again at the next start
+    int rpLenIdx = 1;   // kReplayLenOptions
+    int rpFpsIdx = 2;   // kVideoFpsOptions
+    int rpResIdx = 0;   // kVideoResOptions
+    bool rpAudio = true, rpMic = false, rpCursor = true;
+    UINT rpHkMods = MOD_CONTROL | MOD_ALT;  // registered only while replay is on
+    UINT rpHkVk = VK_F10;
+    bool rpHkHook = false;
+    std::vector<ReplayTarget> rpTargets;
 
     // export
     int format = 0;                     // 움짤 format (GIF, WebP, AVIF); MP4 and WebM are picked per clip

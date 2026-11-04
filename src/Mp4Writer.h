@@ -1,6 +1,8 @@
 #pragma once
 #include <strmif.h>
 
+class ReplayRing;
+
 // MFStartup once per process.
 void EnsureMediaFoundation();
 
@@ -39,9 +41,10 @@ public:
     // Reasonable bitrate for the size and frame rate when the user leaves it on automatic.
     static UINT32 AutoBitrate(int w, int h, int fps, bool hevc);
 
-    // dev must have multithread protection on; it's shared with the encoder.
+    // dev must have multithread protection on; it's shared with the encoder. ring: write a fragmented MP4 into it
+    // instead of a file (순간 리플레이, #20); path is not used then, and Finish only sends the last fragments there.
     bool Open(const std::wstring& path, const VideoConfig& v, const AudioConfig& a, ID3D11Device* dev,
-              std::wstring& err);
+              std::wstring& err, ReplayRing* ring = nullptr);
     bool IsOpen() const { return writer_ != nullptr; }
 
     // Converts a BGRA frame into a pooled NV12 sample. Don't hold the device lock when calling.
@@ -87,6 +90,7 @@ private:
     VideoConfig v_;
     AudioConfig a_;
     std::wstring path_;
+    ReplayRing* ring_ = nullptr;
     std::wstring marker_;  // fragmented: names path_ while it is written, for Recover
     std::wstring notice_;
     std::wstring tried_;

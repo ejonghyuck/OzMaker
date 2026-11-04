@@ -16,6 +16,7 @@ struct VideoOptions {
     bool mic = false;           // the microphone mixed in (#21)
     std::wstring micDevice;     // endpoint ID, empty = Windows' default input
     float micGain = 1;
+    ReplayRing* ring = nullptr;  // 순간 리플레이 (#20): into memory instead of path; it outlives the capture
 };
 
 struct CaptureOptions {

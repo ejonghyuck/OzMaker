@@ -86,6 +86,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     }
     Fonts::Init(gfx_.DWrite());
     overlay_.Init(inst, gfx_.D2D());
+    rpNotice_.Init(inst, gfx_.D2D());
     picker_.Init(inst, gfx_.D2D());
     regionPicker_.Init(inst, gfx_.D2D());
 
@@ -108,6 +109,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--replay-test") return RunReplayTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--test-window")
         return RunTestWindow(_wtof(args[1].c_str()), args.size() >= 3 && args[2] == L"capture");
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
@@ -123,6 +125,9 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     autostart_ = !Settings::Portable() && util::AutostartEnabled();
     if (autostart_) util::SetAutostart(true);
     if (!CreateMainWindow(tray ? SW_HIDE : show)) return 1;
+    // The PC locking or going to sleep lets go of what 순간 리플레이 held.
+    WTSRegisterSessionNotification(hwnd_, NOTIFY_FOR_THIS_SESSION);
+    if (settings_.rpOn) SetReplayOn(true, false);  // on as it was left
     updater_.Init(util::ExePath(), hwnd_, WM_APP_UPDATE);
     SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way
     if (updated) {
@@ -534,7 +539,7 @@ void App::ShowMain(bool activate) {
     ShowWindow(hwnd_, activate ? SW_SHOW : SW_SHOWNA);
     if (activate) SetForegroundWindow(hwnd_);
     if (rec_ == RecState::Recording) SetRecordingLook(true);  // a taskbar button that only now exists
-    if (screen_ == Screen::Home) RefreshWindows();
+    if (screen_ == Screen::Home || screen_ == Screen::Replay) RefreshWindows();
     Invalidate();
 }
 
@@ -551,7 +556,7 @@ void App::MinimizeMain() {
 void App::SetRecordingLook(bool on) {
     if (!hwnd_) return;
     // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later).
-    SetWindowDisplayAffinity(hwnd_, on ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    SetWindowDisplayAffinity(hwnd_, on || rpCap_.Running() ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
     if (!taskbar_ &&
         SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&taskbar_))) &&
         FAILED(taskbar_->HrInit()))
@@ -747,7 +752,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_ERASEBKGND:
             return 1;
         case WM_ACTIVATE:
-            if (LOWORD(w) != WA_INACTIVE && screen_ == Screen::Home) RefreshWindows();
+            if (LOWORD(w) != WA_INACTIVE && (screen_ == Screen::Home || screen_ == Screen::Replay)) RefreshWindows();
             if (LOWORD(w) == WA_INACTIVE) SetCapturingHotkey(0);  // keys go elsewhere now; keep the old one
             Invalidate();
             break;
@@ -757,6 +762,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 OnHotkey();
             else if (w == kHotkeyPause)
                 TogglePause();
+            else if (w == kHotkeyReplay)
+                ReplaySave();
             return 0;
         case WM_DISPLAYCHANGE:
             monitors_ = EnumerateMonitors();
@@ -802,6 +809,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     micLevelAt_ = now;
                     Invalidate();
                 }
+            } else if (w == kTimerReplay) {
+                ReplayTick();
             } else if (w == kTimerAnimLoad) {
                 if (animLoad_ && !animLoad_->done) ShowAnimProgress();
             } else if (w == kTimerUpdate) {
@@ -811,7 +820,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 // Otherwise Home refreshes when it is shown or activated again.
                 KillTimer(hwnd_, kTimerRefresh);
                 windowsDirty_ = false;
-                if (screen_ == Screen::Home && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && !picker_.Active() &&
+                if ((screen_ == Screen::Home || screen_ == Screen::Replay) && IsWindowVisible(hwnd_) && !IsIconic(hwnd_) &&
+                    !picker_.Active() &&
                     !regionPicker_.Active())
                     RefreshWindows();
             }
@@ -868,6 +878,30 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_ANIM_LOADED:
             OnAnimLoaded();
             return 0;
+        case WM_APP_REPLAY_CLOSED:
+            OnReplayClosed(w != 0);
+            return 0;
+        case WM_APP_REPLAY_SAVED:
+            OnReplaySaved();
+            return 0;
+        case WM_WTSSESSION_CHANGE:
+            if (w == WTS_SESSION_LOCK || w == WTS_SESSION_UNLOCK) {
+                rpLocked_ = w == WTS_SESSION_LOCK;
+                if (rpLocked_)
+                    ReplayClear();
+                else
+                    ReplayTick();
+            }
+            return 0;
+        case WM_POWERBROADCAST:
+            if (w == PBT_APMSUSPEND) {
+                rpAsleep_ = true;
+                ReplayClear();
+            } else if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
+                rpAsleep_ = false;
+                ReplayTick();
+            }
+            return TRUE;
         case WM_APP_ESTIMATE:
             OnEstimate();
             return 0;
@@ -894,6 +928,14 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
+            if (!settings_.closeToTray && settings_.rpOn && !quitting_) {
+                // 순간 리플레이 goes on in the tray: closing the window doesn't take what it holds.
+                HideMain();
+                if (!std::exchange(rpTrayHint_, true))
+                    TrayBalloon(tr(L"순간 리플레이는 트레이에서 계속 담습니다"),
+                                tr(L"끝내려면 트레이 아이콘을 오른쪽 클릭하고 종료를 누르세요."));
+                return 0;
+            }
             if (!settings_.closeToTray && !quitting_) {
                 AskQuit(false, [this] { PostMessageW(hwnd_, WM_APP_QUIT, 0, 0); });
                 return 0;
@@ -921,6 +963,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 rec_ = RecState::Idle;
             }
             if (w) {
+                KillTimer(hwnd_, kTimerReplay);
+                if (rpSaveThread_.joinable()) rpSaveThread_.join();  // a replay being saved is finished
+                rpCap_.Stop();
+            }
+            if (w) {
                 RememberPlacement();
                 settings_.Save();
             }
@@ -933,6 +980,12 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             access_.Detach();
             keyHook_.Stop();
             if (rec_ == RecState::Recording) capture_.Stop();
+            KillTimer(hwnd_, kTimerReplay);
+            if (rpSaveThread_.joinable()) rpSaveThread_.join();
+            rpCap_.Stop();
+            rpRing_.Clear();
+            rpNotice_.Hide();
+            WTSUnRegisterSessionNotification(hwnd_);
             RememberPlacement();
             overlay_.Hide();
             exporter_.Cancel();
@@ -945,6 +998,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             StopMicTest();
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
+            UnregisterHotKey(hwnd_, kHotkeyReplay);
             if (dropTarget_) {
                 RevokeDragDrop(hwnd_);
                 dropTarget_.Reset();
@@ -1388,6 +1442,8 @@ void App::BeginCapture() {
                     tr(L"저장할 드라이브에 남은 공간이 ") + util::FormatBytes(freeBytes) + tr(L"뿐입니다. 공간을 비운 뒤 녹화하세요."));
         return;
     }
+    // 순간 리플레이 rests while recording, and starts over afterwards (ReplayTick).
+    if (settings_.rpOn) ReplayStop(false);
     std::wstring err;
     if (!capture_.Start(o, hwnd_, WM_APP_CAPTURE_CLOSED, err)) {
         rec_ = RecState::Idle;
@@ -2046,6 +2102,7 @@ const wchar_t* App::Activity() const {
     switch (screen_) {
         case Screen::Editor: return clip_ ? tr(L"편집 탭") : tr(L"편집 탭 · 연 파일 없음");
         case Screen::Settings: return tr(L"설정");
+        case Screen::Replay: return tr(L"리플레이 탭");
         default: return tr(L"녹화 탭");
     }
 }
@@ -2786,6 +2843,7 @@ void App::SyncKeyHook() {
     std::vector<KeyHook::Combo> combos;
     if (hookRecord_) combos.push_back({settings_.hkMods, settings_.hkVk, kHotkeyRecord});
     if (hookPause_) combos.push_back({settings_.hkPauseMods, settings_.hkPauseVk, kHotkeyPause});
+    if (hookReplay_) combos.push_back({settings_.rpHkMods, settings_.rpHkVk, kHotkeyReplay});
     if (combos.empty() && !capturingHotkey_) {
         keyHook_.Stop();
         return;
@@ -2793,6 +2851,7 @@ void App::SyncKeyHook() {
     const bool ok = keyHook_.Set(hwnd_, WM_APP_HOOKED_KEY, std::move(combos), capturingHotkey_ != 0);
     if (hookRecord_) hotkeyOk_ = ok;
     if (hookPause_) pauseHotkeyOk_ = ok;
+    if (hookReplay_) replayHotkeyOk_ = ok;
 }
 
 // While a new key is being chosen the current ones are released, so pressing them again reaches the window (and
@@ -2803,19 +2862,26 @@ void App::SetCapturingHotkey(int which) {
     if (which) hkConflict_ = {};
     RegisterRecordHotkey();
     RegisterPauseHotkey();
+    RegisterReplayHotkey();
     Invalidate();
 }
 
+App::HotkeySlot App::Hotkey(int which) {
+    if (which == kHotkeyPause) return {settings_.hkPauseMods, settings_.hkPauseVk, settings_.hkPauseHook};
+    if (which == kHotkeyReplay) return {settings_.rpHkMods, settings_.rpHkVk, settings_.rpHkHook};
+    return {settings_.hkMods, settings_.hkVk, settings_.hkHook};
+}
+
 void App::CaptureHotkey(UINT mods, UINT vk) {
-    const bool record = capturingHotkey_ == kHotkeyRecord;
-    UINT& hm = record ? settings_.hkMods : settings_.hkPauseMods;
-    UINT& hv = record ? settings_.hkVk : settings_.hkPauseVk;
-    bool& hook = record ? settings_.hkHook : settings_.hkPauseHook;
-    const UINT otherMods = record ? settings_.hkPauseMods : settings_.hkMods;
-    const UINT otherVk = record ? settings_.hkPauseVk : settings_.hkVk;
-    if (KeyHook::Usable(mods, vk) && mods == otherMods && vk == otherVk) {
-        Toast(record ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
-                     : tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요."),
+    auto [hm, hv, hook] = Hotkey(capturingHotkey_);
+    // Two of OzMaker's keys can't be the same combination.
+    int clash = 0;
+    for (int other : {kHotkeyRecord, kHotkeyPause, kHotkeyReplay})
+        if (other != capturingHotkey_ && Hotkey(other).mods == mods && Hotkey(other).vk == vk) clash = other;
+    if (KeyHook::Usable(mods, vk) && clash) {
+        Toast(clash == kHotkeyRecord  ? tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요.")
+              : clash == kHotkeyPause ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
+                                      : tr(L"리플레이 저장 단축키와 같습니다. 다른 조합을 눌러 주세요."),
               true);
     } else if (KeyHook::Usable(mods, vk)) {
         // Try it first; the keys are registered for real once capturing ends.
@@ -2845,15 +2911,16 @@ void App::CaptureHotkey(UINT mods, UINT vk) {
 void App::TakeHotkey() {
     const HotkeyConflict c = std::exchange(hkConflict_, {});
     if (!c.which) return;
-    const bool record = c.which == kHotkeyRecord;
-    (record ? settings_.hkMods : settings_.hkPauseMods) = c.mods;
-    (record ? settings_.hkVk : settings_.hkPauseVk) = c.vk;
-    (record ? settings_.hkHook : settings_.hkPauseHook) = true;
+    auto [hm, hv, hook] = Hotkey(c.which);
+    hm = c.mods;
+    hv = c.vk;
+    hook = true;
     RegisterRecordHotkey();
     RegisterPauseHotkey();
+    RegisterReplayHotkey();
     settings_.Save();
     TrayUpdate();
-    if (record && !hotkeyOk_)
+    if ((c.which == kHotkeyRecord && !hotkeyOk_) || (c.which == kHotkeyReplay && settings_.rpOn && !replayHotkeyOk_))
         Toast(tr(L"키보드 후크를 시작하지 못해 이 조합을 쓸 수 없습니다."), true);
     else
         Toast(util::Format(tr(L"이제 OzMaker가 %s을(를) 먼저 받습니다"), util::HotkeyToString(c.mods, c.vk).c_str()));
@@ -2867,6 +2934,7 @@ void App::ResetSettings() {
     hkConflict_ = {};
     RegisterRecordHotkey();
     RegisterPauseHotkey();
+    SetReplayOn(settings_.rpOn, false);  // off again, with its key
     ApplyTheme();
     ApplyLanguage();
     settings_.Save();
@@ -2930,13 +2998,21 @@ void App::ApplyLanguage() {
 void App::TrayUpdate() {
     if (!nid_.hWnd) return;
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    nid_.hIcon = rec_ == RecState::Recording ? iconRec_ : iconAppSmall_;
+    const RpState rp = ReplayState();
+    nid_.hIcon = rec_ == RecState::Recording ? iconRec_ : rp == RpState::Holding ? ReplayTrayIcon() : iconAppSmall_;
     std::wstring hk = util::HotkeyToString(settings_.hkMods, settings_.hkVk);
     std::wstring tip = rec_ == RecState::Recording && recPaused_ ? tr(L"OzMaker · 일시정지 (") +
                                                                          util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk) + tr(L" 이어서)")
                        : rec_ == RecState::Recording ? tr(L"OzMaker · 녹화 중") + (hotkeyOk_ ? L" (" + hk + tr(L" 중지)") : L"")
                        : hotkeyOk_                  ? L"OzMaker · " + hk + tr(L" 녹화")
                                                     : tr(L"OzMaker · 녹화 단축키를 쓸 수 없음");
+    if (rec_ == RecState::Idle && rp == RpState::Holding)
+        tip += tr(L"\n리플레이 담는 중") +
+               (replayHotkeyOk_ ? L" · " + util::HotkeyToString(settings_.rpHkMods, settings_.rpHkVk) + tr(L" 저장") : L"");
+    else if (rec_ == RecState::Idle && rp == RpState::Waiting)
+        tip += tr(L"\n리플레이 기다리는 중");
+    else if (rec_ == RecState::Idle && rp == RpState::Paused)
+        tip += tr(L"\n리플레이 멈춤");
     if (rec_ != RecState::Recording && UpdateReady()) tip += tr(L"\n업데이트 준비 완료");
     wcsncpy_s(nid_.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
@@ -2976,6 +3052,11 @@ void App::TrayMenu() {
                     ((recPaused_ ? tr(L"이어서 녹화\t") : tr(L"일시정지\t")) +
                      util::HotkeyToString(settings_.hkPauseMods, settings_.hkPauseVk))
                         .c_str());
+    if (settings_.rpOn && rec_ == RecState::Idle) {
+        const bool can = rpCap_.Running() || !rpClosed_.path.empty();
+        AppendMenuW(menu, MF_STRING | (can && !rpSaving_ ? 0 : MF_GRAYED), 6,
+                    (tr(L"리플레이 저장\t") + util::HotkeyToString(settings_.rpHkMods, settings_.rpHkVk)).c_str());
+    }
     if (UpdateReady())
         AppendMenuW(menu, MF_STRING | (rec_ == RecState::Idle ? 0 : MF_GRAYED), 4,
                     util::Format(tr(L"새 버전 %s으로 업데이트"), updater_.Get().version.c_str()).c_str());
@@ -2994,6 +3075,7 @@ void App::TrayMenu() {
             InstallUpdate();
             break;
         case 5: TogglePause(); break;
+        case 6: ReplaySave(); break;
         case 2:
             if (rec_ == RecState::Idle)
                 StartRecording(current, false);

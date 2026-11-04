@@ -22,6 +22,7 @@
 #include "GpuResize.h"
 #include "Mp4Cut.h"
 #include "Mp4Unfragment.h"
+#include "Replay.h"
 #include "Resize.h"
 #include "Util.h"
 #include "Version.h"
@@ -47,6 +48,8 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
                   bool fragmented = false, bool crash = false);
 bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got);
 bool WriteVfrMp4(const std::wstring& path, bool hardware, std::wstring& err, std::wstring& got, bool fragmented = true);
+class Log;
+int ReplayRingCheck(const std::wstring& dir, bool hardware, Log& log);
 int ReadIndex(const uint8_t* p, int w, int h);
 void DrawIndexed(uint8_t* p, int w, int h, int index, double t);
 
@@ -1227,6 +1230,11 @@ int App::RunSelfTest(const std::wstring& dir) {
                              err.c_str()));
             if (!ok) ++failures;
         }
+    }
+    // 순간 리플레이 (#20): the memory ring and the file saved from it.
+    if (HasVideoProcessor()) {
+        if (!Mp4Writer::FindEncoder(false, true).empty()) failures += ReplayRingCheck(dir, true, log);
+        failures += ReplayRingCheck(dir, false, log);
     }
     // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
     // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
@@ -2447,6 +2455,28 @@ int App::RunSelfTest(const std::wstring& dir) {
         check(anim && back.exportPreset == 2 && back.scaleIdx == 4 && back.outFpsIdx == 1,
               L"움짤 and MP4 values are saved apart");
 
+        // 순간 리플레이 (#20): off in a new file; what was set comes back with its list of programs, and 설정 초기화
+        // turns it off but keeps the list.
+        {
+            Settings rp = load(L"replay.ini", "");
+            const bool fresh0 = !rp.rpOn && rp.rpLenIdx == 1 && rp.rpTargets.empty() && rp.rpHkVk == VK_F10 && !rp.rpMic;
+            rp.rpOn = rp.rpMic = rp.rpHkHook = true;
+            rp.rpLenIdx = 3;
+            rp.rpTargets = {{false, L"C:\\Games\\A b\\game.exe", L"Game | One", false}, {true, L"\\\\.\\DISPLAY2", L"", true}};
+            std::wstring ini = dir + L"\\replay.ini";
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", ini.c_str());
+            rp.Save();
+            SetEnvironmentVariableW(L"OZMAKER_SETTINGS", env);
+            Settings got = load(L"replay.ini", nullptr);
+            const auto& t = got.rpTargets;
+            check(fresh0 && got.rpOn && got.rpMic && got.rpHkHook && got.rpLenIdx == 3 && t.size() == 2 && !t[0].monitor &&
+                      !t[0].on && t[0].path == L"C:\\Games\\A b\\game.exe" && t[0].name == L"Game | One" &&
+                      t[1].monitor && t[1].on && t[1].path == L"\\\\.\\DISPLAY2",
+                  L"순간 리플레이: off at first; the settings and the programs come back");
+            got.Reset();
+            check(!got.rpOn && got.rpTargets.size() == 2, L"설정 초기화 turns replay off and keeps its programs");
+        }
+
         // 0.6.5: 최대 녹화 길이 becomes a record timer that stops (#47), H.264 becomes 자동 and HEVC stays (#42),
         // and a file written since keeps its own over the old keys.
         Settings ten = load(L"timer_old10.ini", "[OzMaker]\r\nMaxLength=1\r\nVideoCodec=1\r\n");
@@ -3163,6 +3193,32 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             overlay_.PaintTest(p, 12034.5, false, 0, 200 * 60, true);
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
         });
+        // 순간 리플레이's save notice (#20): with 편집 · 폴더 (편집 under the pointer), over a game that holds the mouse
+        // (no buttons), and when the save failed, at 150 %.
+        {
+            ReplayNotice::Content saved{tr(L"리플레이를 저장했습니다"),
+                                        util::Format(tr(L"방금 %s · MP4 · %s"), L"0:30", util::FormatBytes(48ull << 20).c_str()),
+                                        true, true};
+            ReplayNotice::Content quiet = saved;
+            quiet.buttons = false;
+            ReplayNotice::Content failed{tr(L"리플레이를 저장하지 못했습니다"),
+                                         tr(L"파일을 저장하지 못했습니다. 디스크 공간을 확인하세요."), false, false};
+            const float nw = std::max({ReplayNotice::Width(saved), ReplayNotice::Width(quiet), ReplayNotice::Width(failed)}) + 12;
+            const float nh = ReplayNotice::kHeight * 3 + 24;
+            gfx_.RenderToPng((dir + L"\\replay_notice.png").c_str(), (UINT)(nw * 1.5f), (UINT)(nh * 1.5f), 144,
+                             [&](ID2D1DeviceContext* dc) {
+                                 Painter p;
+                                 p.Bind(dc);
+                                 p.Fill(Rect(0, 0, nw, nh), theme::Hex(0x2B4C7E));
+                                 dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 6));
+                                 rpNotice_.PaintTest(p, saved, ReplayNotice::kEdit);
+                                 dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 12 + ReplayNotice::kHeight));
+                                 rpNotice_.PaintTest(p, quiet, 0);
+                                 dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 18 + ReplayNotice::kHeight * 2));
+                                 rpNotice_.PaintTest(p, failed, 0);
+                                 dc->SetTransform(D2D1::Matrix3x2F::Identity());
+                             });
+        }
         gfx_.RenderToPng((dir + L"\\region_adjust.png").c_str(), mw, mh, 96, [&](ID2D1DeviceContext* dc) {
             Painter p;
             p.Bind(dc);
@@ -3207,7 +3263,7 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
 
     screen_ = Screen::Settings;
     const wchar_t* tabShots[kTabCount] = {L"settings.png", L"settings_record.png", L"settings_video.png",
-                                          L"settings_audio.png", L"settings_about.png"};
+                                          L"settings_audio.png", L"settings_about.png", L"settings_replay_off.png"};
     for (int i = 0; i < kTabCount; ++i) {
         settings_.settingsTab = i;
         settingsScroll_ = 0;
@@ -3548,6 +3604,91 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             log(L"editor_anim.png: skipped (" + err + L")");
         }
         DeleteFileW(job.path.c_str());
+    }
+    // 순간 리플레이 (#20): the 리플레이 tab in each state, over made-up programs and saved replays, with the add popover,
+    // a row's menu and a name being typed; then 설정 › 리플레이. Nothing is held: the states are made up.
+    {
+        const std::vector<ReplayTarget> targets = settings_.rpTargets;
+        const bool wasOn = settings_.rpOn;
+        screen_ = Screen::Replay;
+        rpFiles_.clear();
+        settings_.rpTargets.clear();
+        rpStateForTest_ = (int)RpState::NoTarget;
+        shot(L"replay_none.png", 96);
+        settings_.rpTargets = {{false, L"C:\\Games\\Starfall\\starfall.exe", L"Starfall Arena", true},
+                               {false, L"C:\\Games\\PixelRacer\\pixelracer.exe", L"Pixel Racer", true},
+                               {false, L"C:\\Games\\Moonlit\\moonlit.exe", L"Moonlit Tactics", false}};
+        settings_.rpOn = false;
+        rpRunningForTest_ = 0;
+        rpStateForTest_ = (int)RpState::Off;
+        shot(L"replay_off.png", 96);
+        settings_.rpOn = true;
+        rpRunningForTest_ = -1;
+        rpStateForTest_ = (int)RpState::Waiting;
+        shot(L"replay_waiting.png", 96);
+        rpClosed_ = {settings_.rpTargets[1].path, settings_.rpTargets[1].name, util::NowSeconds(), 30};
+        rpHeldForTest_ = 30;
+        shot(L"replay_closed.png", 96);
+        rpClosed_ = {};
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        const uint64_t now = (uint64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime;
+        int n = 0;
+        auto file = [&](const std::wstring& program, double ago, double seconds, uint64_t mb) {
+            ReplayFile f;
+            f.program = program;
+            f.path = L"C:\\Replays\\" + program + util::Format(L"\\%s_%d.mp4", program.c_str(), ++n);
+            f.bytes = mb << 20;
+            f.written = now - (uint64_t)(ago * 1e7);
+            f.seconds = seconds;
+            return f;
+        };
+        rpFiles_ = {file(L"Starfall Arena", 40, 30, 48), file(L"Starfall Arena", 760, 30, 51),
+                    file(L"Pixel Racer", 3700, 30, 31), file(L"Starfall Arena", 26 * 3600, 28, 39),
+                    file(util::Format(tr(L"화면 %d"), 1), 27 * 3600, 60, 62), file(L"Pixel Racer", 75 * 3600, 30, 33)};
+        rpNewPath_ = rpFiles_[0].path;
+        rpRunningForTest_ = 0;
+        rpStateForTest_ = (int)RpState::Holding;
+        rpHeldForTest_ = 16;
+        shot(L"replay_holding.png", 96);
+        settings_.rpMic = true;
+        rpRunningForTest_ = 1;
+        rpPause_ = RpPause::Minimized;
+        rpStateForTest_ = (int)RpState::Paused;
+        shot(L"replay_paused.png", 96);
+        rpPause_ = RpPause::None;
+        rpStateForTest_ = (int)RpState::Holding;
+        shot(L"replay_holding_mic.png", 96);
+        settings_.rpMic = false;
+        rpRunningForTest_ = 0;
+        rpRunning_ = {{L"C:\\Games\\Orbit\\orbit.exe", L"Orbit Drift", true}, {L"C:\\Tools\\memo.exe", L"Memo", false}};
+        rpAddOpen_ = true;
+        shot(L"replay_add.png", 96);
+        rpAddOpen_ = false;
+        rpRunning_.clear();
+        rpFileMenu_ = 1;
+        shot(L"replay_menu.png", 96);
+        rpFileMenu_ = -1;
+        rpRenaming_ = 1;
+        rpRenameFocused_ = false;
+        rpRenameText_ = L"Starfall Arena_20261104_151208";
+        ui_.Focus(HashId("rp.rename"));
+        shot(L"replay_rename.png", 96);
+        rpRenaming_ = -1;
+        screen_ = Screen::Settings;
+        settings_.settingsTab = kTabReplay;
+        settingsScroll_ = 0;
+        shot(L"settings_replay.png", 96);
+        settingsScroll_ = 10000;
+        shot(L"settings_replay_end.png", 96);
+        settingsScroll_ = 0;
+        settings_.settingsTab = kTabGeneral;
+        rpStateForTest_ = rpRunningForTest_ = -1;
+        rpHeldForTest_ = 0;
+        rpFiles_.clear();
+        rpNewPath_.clear();
+        settings_.rpTargets = targets;
+        settings_.rpOn = wasOn;
     }
     screen_ = Screen::Home;
     keep.reset();
@@ -4629,6 +4770,105 @@ bool WriteVfrMp4(const std::wstring& path, bool hardware, std::wstring& err, std
     return w.Finish(err);
 }
 
+// 순간 리플레이 (#20): 13 s at 30 fps into a replay ring (keyframes every second, a picture numbered by the second, a
+// tone that steps from 440 to 880 Hz at 9.5 s), then the 5 s before 12 s saved. The file must start at the keyframe at
+// 7 s and end at 12 s, the sound along with the picture (the step at 2.5 s), without a write going back.
+int ReplayRingCheck(const std::wstring& dir, bool hardware, Log& log) {
+    const int W = 320, H = 180, fps = 30, frames = 13 * fps;
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<ID3D11Multithread> mt;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                 D3D11_SDK_VERSION, &dev, nullptr, &ctx)) ||
+        FAILED(ctx.As(&mt))) {
+        log(L"replay ring: FAIL no device");
+        return 1;
+    }
+    mt->SetMultithreadProtected(TRUE);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = W;
+    td.Height = H;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> tex;
+    dev->CreateTexture2D(&td, nullptr, &tex);
+    VideoConfig v;
+    v.width = W;
+    v.height = H;
+    v.fps = fps;
+    v.gopFrames = fps;
+    v.hardware = hardware;
+    AudioConfig a;
+    a.enabled = true;
+    ReplayRing ring;
+    ring.SetKeep(6 * 10'000'000LL);
+    Mp4Writer w;
+    std::wstring err;
+    if (!w.Open(L"", v, a, dev.Get(), err, &ring)) {
+        log(L"replay ring: FAIL open " + err + L" " + w.Tried());
+        return 1;
+    }
+    const std::wstring enc = w.EncoderName() + (w.HardwareEncoder() ? L" (hardware)" : L" (software)");
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    std::vector<int16_t> pcm;
+    int64_t pushed = 0;
+    double phase = 0;
+    bool wrote = true;
+    for (int k = 0; k < frames && wrote; ++k) {
+        DrawIndexed(px.data(), W, H, k / fps, k / (double)fps);
+        ctx->UpdateSubresource(tex.Get(), 0, nullptr, px.data(), W * 4, 0);
+        ComPtr<IMFSample> s;
+        for (int tries = 0; !(s = w.Convert(tex.Get())) && tries < 2500; ++tries) Sleep(2);
+        const int64_t want = (int64_t)(k + 1) * a.sampleRate / fps;
+        pcm.clear();
+        for (int64_t i = pushed; i < want; ++i) {
+            phase += 2 * 3.14159265358979 * (i < 9.5 * a.sampleRate ? 440 : 880) / a.sampleRate;
+            const int16_t x = (int16_t)(0.03 * std::sin(phase) * 32767);
+            pcm.push_back(x);
+            pcm.push_back(x);
+        }
+        w.PushAudio(pcm.data(), pcm.size() / 2);
+        pushed = want;
+        wrote = s && w.WriteVideo(s.Get(), (int64_t)k * 10'000'000 / fps, 10'000'000 / fps);
+    }
+    const std::wstring path = dir + (hardware ? L"\\selftest_replay_hw.mp4" : L"\\selftest_replay_sw.mp4");
+    double seconds = 0;
+    std::wstring saveErr;
+    const size_t held = ring.Fragments();
+    const std::wstring frags = ring.Describe();
+    const double heldSec = ring.Held() / 1e7, mb = ring.Bytes() / 1e6;
+    const bool saved = wrote && ring.Save(path, 12 * 10'000'000LL, 5 * 10'000'000LL, 3000, seconds, saveErr);
+    w.Abort();
+    bool ok = saved && ring.Rewrites() == 0;
+    std::wstring seen;
+    if (saved) {
+        if (auto c = VideoClip::Open(path, err)) {
+            auto rd = c->NewReader();
+            const uint8_t* px0 = rd->Get(0);  // the reader's buffer: read it before the next Get
+            const int i0 = px0 ? ReadIndex(px0, W, H) : -1;
+            const uint8_t* px1 = c->Count() ? rd->Get(c->Count() - 1) : nullptr;
+            const int i1 = px1 ? ReadIndex(px1, W, H) : -1;
+            int rate = 0;
+            const std::vector<int16_t> st = ReadAllAudio(*c, 0, 5.0, rate);
+            const double step = ToneSwitch(st, rate, 0.5, 440, 880);
+            seen = util::Format(L"%zu frames, %.3f s (file %.3f), #%d..#%d, 440->880 at %.3f s (2.500)", c->Count(),
+                                c->EndTs() / 1e7, seconds, i0, i1, step);
+            ok = ok && c->Count() == 150 && std::fabs(c->EndTs() / 1e7 - 5.0) < 0.05 && i0 == 7 && i1 == 11 &&
+                 c->HasAudio() && std::fabs(step - 2.5) < 0.02;
+        } else {
+            seen = L"can't open: " + err;
+            ok = false;
+        }
+    }
+    log(util::Format(L"replay ring (%s): %s · %s · held %zu fragments %.2f s %.1f MB, rewrites %zu · %s · %s %s",
+                     hardware ? L"hardware" : L"software", ok ? L"ok" : L"FAIL", enc.c_str(), held, heldSec, mb,
+                     ring.Rewrites(), frags.c_str(), seen.c_str(), saveErr.c_str()));
+    return ok ? 0 : 1;
+}
+
 // A copy of an MP4 whose video track says to show it turned clockwise by cw degrees, the way phones mark portrait
 // video: the display matrix and size in the track header (tkhd) change, the pictures stay as they are.
 bool WriteRotatedCopy(const std::wstring& src, const std::wstring& dst, int cw) {
@@ -5192,6 +5432,91 @@ int App::RunEncoderTest(const std::wstring& dir) {
         if (!ok) ++failures;
     }
     DeleteFileW((dir + L"\\probe.mp4").c_str());
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+int App::RunReplayTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\replay-test.log");
+    int failures = 0;
+    if (!Mp4Writer::FindEncoder(false, true).empty()) failures += ReplayRingCheck(dir, true, log);
+    failures += ReplayRingCheck(dir, false, log);
+
+    // The whole of it in the app: replay on for a program (the test window, in a process of its own: other windows
+    // are left out), what it holds saved as the save key does, and again what is left once the program closed.
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    settings_.outDir = dir;
+    settings_.sounds = false;
+    settings_.rpTargets = {{false, util::ExePath(), ProgramName(util::ExePath()), true}};
+    settings_.rpMic = false;
+    if (!CreateMainWindow(SW_HIDE)) return 1;
+    auto pump = [&](double seconds, const std::function<bool()>& until) {
+        const double end = util::NowSeconds() + seconds;
+        MSG msg;
+        while (util::NowSeconds() < end && !(until && until())) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    };
+    SetReplayOn(true, false);
+    check(ReplayState() == RpState::Waiting, L"replay app: waits while the program doesn't run");
+    std::wstring cmd = L"\"" + util::ExePath() + L"\" --test-window 9 capture";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        check(false, L"replay app: can't start --test-window");
+    } else {
+        pump(8, [&] { return rpCap_.Running(); });
+        check(rpCap_.Running() && ReplayState() == RpState::Holding && rpHeld_.name == settings_.rpTargets[0].name,
+              L"replay app: holds the program once its window opens");
+        pump(3.5, nullptr);
+        ReplaySave();
+        pump(8, [&] { return !rpSaving_; });
+        const std::wstring first = rpSave_.path;
+        double seconds = 0;
+        bool audio = false;
+        std::wstring err;
+        if (auto v = VideoClip::Open(first, err)) {
+            seconds = v->Seconds();
+            audio = v->HasAudio();
+        }
+        check(rpSave_.ok && seconds > 2.5 && seconds < 5.5,
+              util::Format(L"replay app: saved %.2f s%s (%s)", seconds, audio ? L" with sound" : L"",
+                           rpSave_.ok ? util::FileNameOf(first).c_str() : rpSave_.err.c_str()));
+        check(first.rfind(ReplayDir() + L"\\" + util::SafeFileName(settings_.rpTargets[0].name, 60) + L"\\", 0) == 0,
+              L"replay app: saved in 저장 폴더 › 리플레이 › the program");
+        check(!rpFiles_.empty() && rpFiles_[0].path == first && std::abs(rpFiles_[0].seconds - seconds) < 0.05 &&
+                  rpNewPath_ == first,
+              L"replay app: the saved list shows it first and new, its length read from the file");
+        check(rpNotice_.Visible(), L"replay app: the save notice shows over the program");
+        rpNotice_.Hide();
+        // The program closes: what was held stays to be saved, and goes once it is.
+        WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        pump(4, [&] { return !rpCap_.Running(); });
+        pump(1.2, nullptr);
+        check(!rpCap_.Running() && !rpClosed_.path.empty() && ReplayState() == RpState::Waiting && rpRing_.Held() > 0,
+              util::Format(L"replay app: the program closed, %.1f s of it kept", rpClosed_.seconds));
+        ReplaySave();
+        pump(8, [&] { return !rpSaving_; });
+        check(rpSave_.ok && rpSave_.path != first && rpClosed_.path.empty() && rpRing_.Bytes() == 0,
+              util::Format(L"replay app: saved what the closed program left (%.2f s), then let it go", rpSave_.seconds));
+        rpNotice_.Hide();
+    }
+    SetReplayOn(false, false);
+    check(!rpCap_.Running() && rpRing_.Bytes() == 0, L"replay app: switched off, nothing is left in memory");
+    quitting_ = true;
+    DestroyWindow(hwnd_);
+    pump(0.5, nullptr);
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }

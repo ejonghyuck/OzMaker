@@ -277,6 +277,28 @@ bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
     return true;
 }
 
+bool PickExeFile(HWND owner, std::wstring& out) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    COMDLG_FILTERSPEC filters[] = {{tr(L"프로그램"), L"*.exe"}};
+    dlg->SetFileTypes(_countof(filters), filters);
+    dlg->SetTitle(tr(L"리플레이를 켤 프로그램"));
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);  // a shortcut gives the program it starts
+    ComPtr<IShellItem> folder;
+    if (SUCCEEDED(SHGetKnownFolderItem(FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&folder))))
+        dlg->SetDefaultFolder(folder.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return false;
+    PWSTR p = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return false;
+    out = p;
+    CoTaskMemFree(p);
+    return out.size() > 4 && _wcsicmp(out.c_str() + out.size() - 4, L".exe") == 0;
+}
+
 std::wstring SafeFileName(std::wstring_view s, size_t maxLen) {
     std::wstring out;
     for (wchar_t c : s) {

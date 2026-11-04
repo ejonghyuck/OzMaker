@@ -6,12 +6,13 @@
 #include "Gfx.h"
 #include "KeyHook.h"
 #include "Overlays.h"
+#include "Replay.h"
 #include "Settings.h"
 #include "Ui.h"
 #include "Updater.h"
 #include "WindowList.h"
 
-enum class Screen { Home, Editor, Settings };
+enum class Screen { Home, Editor, Settings, Replay };
 
 class AnimClip;
 
@@ -50,12 +51,16 @@ private:
         WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
         WM_APP_HOOKED_KEY,  // the keyboard hook took a combination while a hotkey is being chosen (#50)
         WM_APP_ANIM_LOADED,  // a 움짤 file finished decoding (#41)
+        WM_APP_REPLAY_CLOSED,  // 순간 리플레이's capture: what it held went away (wParam 0) or its encoder failed (1)
+        WM_APP_REPLAY_SAVED,   // the replay being saved is written (or not)
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
-    enum : UINT_PTR { kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad };
+    enum : UINT_PTR {
+        kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad, kTimerReplay
+    };
     enum class RecState { Idle, Countdown, Recording };
-    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2 };  // RegisterHotKey ids
+    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2, kHotkeyReplay = 3 };  // RegisterHotKey ids
 
     // ---- window plumbing (App.cpp)
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -87,7 +92,7 @@ private:
     // ---- views (AppViews.cpp)
     void DrawFrame(Rect client);
     void DrawHeader(Rect r);
-    void DrawTabs(Rect r);  // 녹화 | 편집 in the middle of the header
+    void DrawTabs(Rect r);  // 녹화 | 편집 | 리플레이 in the middle of the header
     void DrawHome(Rect r);
     void DrawSourcePanel(Rect r);
     void DrawWindowList(Rect r);
@@ -115,6 +120,7 @@ private:
     void SettingsRecord(Rect& area, bool& changed);
     void SettingsVideo(Rect& area, bool& changed);
     void SettingsAudio(Rect& area, bool& changed);
+    void SettingsReplay(Rect& area, bool& changed);
     void SettingsAbout(Rect& area);
     void DrawToast(Rect client);
     void DrawFilesButton(Rect& right);
@@ -126,6 +132,7 @@ private:
     Rect SettingRow(Rect& area, std::wstring_view title, std::wstring_view desc, float controlW,
                     const std::function<void(Rect)>& control, float below = 0);
     void SettingSection(Rect& area, std::wstring_view title);
+    void HotkeyRow(Rect& area, int which, std::wstring_view title, std::wstring_view desc);  // and the takeover panel
     ID2D1Bitmap* IconFor(const WinInfo& w);
 
     // ---- sources
@@ -268,11 +275,94 @@ private:
     void ResetCrop();
     void ApplyCropAspect();
 
+    // ---- 순간 리플레이 (#20, AppReplay.cpp)
+    enum class RpState { NoTarget, Off, Waiting, Holding, Paused };  // the 리플레이 tab's status strip
+    enum class RpPause { None, Minimized, Blocked };  // what is held isn't taken now (recording, lock: ReplayState)
+    struct RpHeld {
+        bool monitor = false;
+        std::wstring path, name;  // the ReplayTarget's; a monitor is named "화면 N"
+        HWND hwnd = nullptr;      // the program's window
+        HMONITOR mon = nullptr;
+    };
+    struct RpClosed {  // a program that closed: what was held of it stays kReplayKeepClosed seconds
+        std::wstring path, name;
+        double at = 0, seconds = 0;
+    };
+    struct RpSave {
+        std::wstring path, name, err;
+        double seconds = 0;
+        uint64_t bytes = 0;
+        bool ok = false, closed = false;  // closed: what a closed program left
+        RECT rect{};                      // where the notice goes
+        bool full = false, grabbed = false, exclusive = false, inApp = false;
+    };
+    struct RpSaveOut {  // the save thread's
+        bool ok = false;
+        double seconds = 0;
+        uint64_t bytes = 0;
+        std::wstring err;
+    };
+    struct ReplayFile {
+        std::wstring path, program;       // program: the folder it is in
+        uint64_t bytes = 0, written = 0;  // written: FILETIME
+        double seconds = 0;
+    };
+    struct RunningProgram {
+        std::wstring path, name;
+        bool full = false;
+    };
+    RpState ReplayState() const;
+    double ReplayHeldSeconds() const;  // of the replay length, what is held so far
+    void SetReplayOn(bool on, bool save = true);
+    std::wstring ReplayConfigKey() const;
+    RpHeld PickReplayTarget() const;
+    void ReplayTick();  // kTimerReplay: what to hold, whether it went away or was minimized
+    bool ReplayStart(const RpHeld& t, std::wstring& err);
+    void ReplayStop(bool keep);  // keep: what was held stays to be saved (the program closed)
+    void ClearRing();
+    void ReplayClear();  // the PC locked or went to sleep: nothing of what went by stays
+    void SyncCaptureLook();
+    void OnReplayClosed(bool failed);
+    void NoticePlace(RECT& rect, bool& full, bool& grabbed, bool& exclusive) const;
+    void ReplaySave();  // the save key, 지금 저장, the tray menu
+    void OnReplaySaved();
+    void ShowReplayResult();
+    HICON ReplayTrayIcon();
+    void RegisterReplayHotkey();  // only while replay is on
+    void AddReplayTarget(ReplayTarget t);
+    void RemoveReplayTarget(size_t i);
+    void ListRunningPrograms();
+    void BrowseReplayProgram();
+    void RefreshReplayFiles();
+    void RenameReplay(size_t i, std::wstring name);
+    void TrashReplay(size_t i);
+    void EditReplay(const std::wstring& path);
+    void OpenReplayTab();
+    std::wstring ReplayDir() const;  // 저장 폴더 › 리플레이
+    static std::wstring ProgramName(const std::wstring& exe);  // its description, else the exe's name
+    ID2D1Bitmap* ExeIcon(const std::wstring& exe);
+    void DrawReplay(Rect r);
+    void DrawReplayStrip(Rect r);
+    void DrawReplayPrograms(Rect r);
+    void DrawReplayFiles(Rect r);
+    void DrawReplayAddPopover(Rect client);
+    void DrawReplayMenus(Rect client);
+    void DrawTargetIcon(const Rect& ic, const std::wstring& exe, std::wstring_view name, int monitor);
+    std::wstring TargetName(const ReplayTarget& t) const;
+    bool TargetRuns(const ReplayTarget& t) const;  // a window of the program is open, the monitor is there
+    bool TargetHeld(const ReplayTarget& t) const;
+
     // ---- system
     void RegisterRecordHotkey();
     void RegisterPauseHotkey();  // only while recording, so the keys stay free for other programs otherwise
-    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause, 0 = none
+    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay, 0 = none
     void CaptureHotkey(UINT mods, UINT vk);  // a combination pressed while choosing one
+    struct HotkeySlot {  // a hotkey's settings
+        UINT& mods;
+        UINT& vk;
+        bool& hook;  // taken over (#50)
+    };
+    HotkeySlot Hotkey(int which);
     void TakeHotkey();  // the conflict panel's 그래도 OzMaker가 쓰기 (#50)
     void SyncKeyHook();  // the keyboard hook on for what needs it, off otherwise
     void ResetSettings();  // 설정 › 일반 › 설정 초기화, once asked (#49)
@@ -302,6 +392,7 @@ private:
     int RunAnalyzeTest(const std::wstring& args);
     int RunVideoTest(const std::wstring& dir, int w, int h);
     int RunEncoderTest(const std::wstring& dir);
+    int RunReplayTest(const std::wstring& dir);
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
@@ -381,6 +472,38 @@ private:
     int countdownLeft_ = 0;
     RecOverlay overlay_;
     PickerOverlay picker_;
+
+    // 순간 리플레이 (#20)
+    ReplayRing rpRing_;  // before rpCap_: the capture's writer writes into it until the capture is destroyed
+    Capture rpCap_;
+    RpHeld rpHeld_;
+    RpPause rpPause_ = RpPause::None;
+    std::wstring rpBlocked_, rpBlockedKey_;  // why the capture didn't start, and for what (not again every second)
+    std::wstring rpConfig_;                  // ReplayConfigKey of the capture running
+    RpClosed rpClosed_;
+    bool rpLocked_ = false, rpAsleep_ = false;
+    std::thread rpSaveThread_;
+    bool rpSaving_ = false, rpClearAfterSave_ = false;
+    RpSave rpSave_;
+    RpSaveOut rpSaveOut_;  // written by the save thread, read once it is joined
+    bool replayHotkeyOk_ = true, hookReplay_ = false;
+    ReplayNotice rpNotice_;
+    std::vector<ReplayFile> rpFiles_;  // newest first
+    std::wstring rpNewPath_;           // saved in this run, the newest: 새로
+    std::wstring rpFilter_;            // the saved list's program, "" = all
+    std::vector<RunningProgram> rpRunning_;  // the add popover's list
+    bool rpAddOpen_ = false, rpTrayHint_ = false;
+    Rect rpAddBtn_;
+    int rpProgMenu_ = -1, rpFileMenu_ = -1;  // the ⋯ menu open on a row
+    Rect rpMenuAnchor_;
+    int rpRenaming_ = -1;  // the saved replay whose name is being typed
+    std::wstring rpRenameText_;
+    bool rpRenameFocused_ = false;
+    float rpProgScroll_ = 0, rpFileScroll_ = 0, rpAddScroll_ = 0;
+    int rpStateForTest_ = -1;    // screenshots: a made-up RpState and what it holds
+    int rpRunningForTest_ = -1;  // and the one program of the list that runs (its index)
+    double rpHeldForTest_ = 0;
+    std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap1>> exeIcons_;
 
     // editor
     std::shared_ptr<Clip> clip_;
@@ -511,7 +634,7 @@ private:
     bool hotkeyOk_ = true, pauseHotkeyOk_ = true;  // it works: registered, or (taken over) through the hook
     // A combination another program holds, pressed while choosing: the panel under the row offers to take it (#50).
     struct HotkeyConflict {
-        int which = 0;  // kHotkeyRecord / kHotkeyPause, 0 = none
+        int which = 0;  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay, 0 = none
         UINT mods = 0, vk = 0;
     } hkConflict_;
     KeyHook keyHook_;
@@ -549,6 +672,6 @@ private:
     PlanSummary planCache_;
     bool autostart_ = false;
     NOTIFYICONDATAW nid_{};
-    HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr;
+    HICON iconApp_ = nullptr, iconAppSmall_ = nullptr, iconRec_ = nullptr, iconReplay_ = nullptr;
     UINT taskbarCreated_ = 0;
 };

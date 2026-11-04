@@ -751,7 +751,7 @@ void Capture::TickLoop() {
         vc.fps = opt_.fps;
         vc.fragmented = true;  // a crash leaves a file that plays; Finish makes it a plain MP4 (#24)
         std::wstring err;
-        open = writer_->Open(opt_.video->path, vc, opt_.video->audio, dev_.Get(), err);
+        open = writer_->Open(opt_.video->path, vc, opt_.video->audio, dev_.Get(), err, opt_.video->ring);
         if (!open) Fail(err);
     }
     if (open) {

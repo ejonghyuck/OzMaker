@@ -138,6 +138,8 @@ inline constexpr wchar_t ChevronUp = 0xE70E;
 inline constexpr wchar_t Download = 0xE896;
 inline constexpr wchar_t Timer = 0xE916;  // stopwatch
 inline constexpr wchar_t Font = 0xE8D2;
+inline constexpr wchar_t Replay = 0xE81C;  // History: a clock with an arrow back
+inline constexpr wchar_t More = 0xE712;
 }  // namespace icon
 
 }  // namespace theme
