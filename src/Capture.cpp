@@ -3,6 +3,7 @@
 #include "Util.h"
 #include "WindowList.h"
 
+#include "DiffPS.h"
 #include "ScalePS.h"
 #include "ScaleVS.h"
 
@@ -126,6 +127,8 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         frames_ = 0;
         scaled_ = 0;
         finishDue_ = false;
+        shots_ = 0;
+        stopAt_ = 0;
         pausedAt_ = 0;
         pausedTotal_ = 0;
         running_ = true;
@@ -331,6 +334,27 @@ bool Capture::Setup(int sw, int sh) {
     if (FAILED(dev_->CreateTexture2D(&td, nullptr, &out_)) ||
         FAILED(dev_->CreateRenderTargetView(out_.Get(), nullptr, &outRtv_)))
         return false;
+    diffReady_ = diffPending_ = false;
+    if (opt_.video && opt_.video->video.vfr) {
+        // What the comparison needs. Without it every picture that may have changed counts as changed.
+        D3D11_TEXTURE2D_DESC cd = td, dd = td;
+        cd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        diffW_ = (UINT)(w + 15) / 16;
+        diffH_ = (UINT)(h + 15) / 16;
+        dd.Width = diffW_;
+        dd.Height = diffH_;
+        dd.Format = DXGI_FORMAT_R8_UNORM;
+        ComPtr<ID3D11Texture2D> diff;
+        D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION_PREDICATE, 0};
+        diffReady_ = SUCCEEDED(dev_->CreateTexture2D(&cd, nullptr, &cand_)) &&
+                     SUCCEEDED(dev_->CreateTexture2D(&cd, nullptr, &prev_)) &&
+                     SUCCEEDED(dev_->CreateShaderResourceView(cand_.Get(), nullptr, &candSrv_)) &&
+                     SUCCEEDED(dev_->CreateShaderResourceView(prev_.Get(), nullptr, &prevSrv_)) &&
+                     SUCCEEDED(dev_->CreateTexture2D(&dd, nullptr, &diff)) &&
+                     SUCCEEDED(dev_->CreateRenderTargetView(diff.Get(), nullptr, &diffRtv_)) &&
+                     SUCCEEDED(dev_->CreatePixelShader(g_DiffPS, sizeof(g_DiffPS), nullptr, &diffPs_)) &&
+                     SUCCEEDED(dev_->CreateQuery(&qd, &diffQuery_));
+    }
 
     if (!opt_.video) {
         td.Usage = D3D11_USAGE_STAGING;
@@ -436,6 +460,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
             if (r.right > r.left && r.bottom > r.top) finish_.mask.push_back(r);
         }
     }
+    if (video) ++shots_;
     if (video && finish_.scaled) {
         finishDue_ = true;  // the ticker scales it if it is still the newest at the next tick
         SetEvent(firstFrame_);
@@ -466,7 +491,7 @@ void Capture::FinishFrame() {
     if (f.scaled) {
         if (f.lod > 0) ctx_->GenerateMips(mipSrv_.Get());
         struct {
-            float fx, fy, lod, pad;
+            float fx, fy, lod, overWhite;
         } params{1.f / f.dw, 1.f / f.dh, (float)f.lod, 0.f};
         ctx_->UpdateSubresource(cb_.Get(), 0, nullptr, &params, 0, 0);
         if (f.dw != outW_ || f.dh != outH_) {
@@ -493,6 +518,43 @@ void Capture::FinishFrame() {
         const float black[4] = {0, 0, 0, 1};
         ctx1_->ClearView(outRtv_.Get(), black, f.mask.data(), (UINT)f.mask.size());
     }
+}
+
+ID3D11Texture2D* Capture::Snapshot(ID3D11Texture2D* picture, bool compare) {
+    diffPending_ = false;
+    if (!diffReady_) return picture;
+    ctx_->CopyResource(cand_.Get(), picture);
+    if (!compare) return cand_.Get();
+    D3D11_VIEWPORT vp{0.f, 0.f, (float)diffW_, (float)diffH_, 0.f, 1.f};
+    ID3D11ShaderResourceView* srv[2] = {candSrv_.Get(), prevSrv_.Get()};
+    ctx_->OMSetRenderTargets(1, diffRtv_.GetAddressOf(), nullptr);
+    ctx_->RSSetViewports(1, &vp);
+    ctx_->IASetInputLayout(nullptr);
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+    ctx_->PSSetShader(diffPs_.Get(), nullptr, 0);
+    ctx_->PSSetShaderResources(0, 2, srv);
+    ctx_->Begin(diffQuery_.Get());
+    ctx_->Draw(3, 0);
+    ctx_->End(diffQuery_.Get());
+    ID3D11ShaderResourceView* none[2] = {};
+    ctx_->PSSetShaderResources(0, 2, none);
+    ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    diffPending_ = true;
+    return cand_.Get();
+}
+
+bool Capture::Changed() {
+    if (!diffPending_) return true;
+    diffPending_ = false;
+    BOOL any = TRUE;
+    HRESULT hr;
+    while ((hr = ctx_->GetData(diffQuery_.Get(), &any, sizeof(any), 0)) == S_FALSE) SwitchToThread();
+    return FAILED(hr) || any;
+}
+
+void Capture::Written() {
+    if (diffReady_) ctx_->CopyResource(prev_.Get(), cand_.Get());
 }
 
 // ---------------------------------------------------------------- click highlight
@@ -669,7 +731,8 @@ void Capture::DrainOne() {
 
 void Capture::TickLoop() {
     // Constant frame rate for the MP4: every 1/fps the newest captured frame is encoded, repeating it while the
-    // source is idle (Windows only delivers frames when something changes).
+    // source is idle (Windows only delivers frames when something changes). Variable frame rate (#55) keeps the
+    // ticks but encodes one only when the picture changed, or when a keyframe is due; the frame before lasts until it.
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     bool coarse = timer == nullptr;
     if (coarse) {
@@ -680,6 +743,7 @@ void Capture::TickLoop() {
     // while it delivers frames, and the encoder needs that lock from its own threads.
     HANDLE first[2] = {tickStop_, firstFrame_};
     bool open = false;
+    const bool vfr = opt_.video->video.vfr;
     if (WaitForMultipleObjects(2, first, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
         VideoConfig vc = opt_.video->video;
         vc.width = outW_;
@@ -696,6 +760,9 @@ void Capture::TickLoop() {
         // once running in real time, a stall skips ticks instead.
         // While paused no ticks are encoded; afterwards they continue where they stopped, later by the pause.
         bool synced = false;
+        uint64_t checked = ~0ull;  // VFR: shots_ at the last tick
+        bool fxChecked = false;    // and whether that tick had a click highlight
+        int64_t end = 0;           // where the last tick ends, which the last frame lasts until
         for (int64_t k = 0;; ++k) {
             if (pausedAt_) {
                 HANDLE waits[2] = {tickStop_, resumed_};
@@ -720,22 +787,55 @@ void Capture::TickLoop() {
                 int64_t cur = (now - startQpc_ - pausedTotal_) * fps / 10'000'000;
                 if (cur > k + 2) k = cur;
             }
+            const int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;
             // Never under mtx_: the frame callback may own the device lock while it waits for mtx_.
             ID3D11Texture2D* picture = out_.Get();
+            bool maybe = false, keyDue = false;
             {
                 DeviceLock lock(mt_.Get());
                 if (finishDue_) FinishFrame();
-                if (opt_.clickFx && DrawClicks(due)) picture = fx_.Get();
+                bool fx = false;
+                if (opt_.clickFx && DrawClicks(due)) picture = fx_.Get(), fx = true;
+                if (vfr) {
+                    // A new capture, or a highlight drawn or just gone, may have changed the picture. It is taken as
+                    // it is now (Windows can put a newer one in out_ at any time) and compared with the last frame.
+                    maybe = shots_ != checked || fx || fxChecked;
+                    checked = shots_;
+                    fxChecked = fx;
+                    keyDue = writer_->KeyDue(t0);
+                    if (maybe || keyDue) picture = Snapshot(picture, maybe && !keyDue);
+                }
+            }
+            if (vfr) {
+                end = t1;
+                if (!keyDue && !(maybe && Changed())) continue;  // the frame shown goes on
+                ComPtr<IMFSample> sample = writer_->Convert(picture);
+                if (!sample) {  // encoder pool momentarily full: the next tick tries again
+                    checked = ~0ull;
+                    continue;
+                }
+                if (!writer_->HoldVideo(std::move(sample), t0)) {
+                    Fail(tr(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요."));
+                    break;
+                }
+                {
+                    DeviceLock lock(mt_.Get());
+                    Written();
+                }
+                ++frames_;
+                continue;
             }
             ComPtr<IMFSample> sample = writer_->Convert(picture);
             if (!sample) continue;  // encoder pool momentarily full: this tick is dropped
-            int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;
             if (!writer_->WriteVideo(sample.Get(), t0, t1 - t0)) {
                 Fail(tr(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요."));
                 break;
             }
             ++frames_;
         }
+        // The last frame lasts until the stop press, also when the ticker was behind then.
+        if (vfr && !failed_ && !writer_->EndVideo(std::max(end, stopAt_.load())))
+            Fail(tr(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요."));
     }
     if (coarse) timeEndPeriod(1);
     CloseHandle(timer);
@@ -817,6 +917,7 @@ CaptureResult Capture::Stop() {
     } catch (...) {
     }
     if (opt_.video) {
+        stopAt_ = stopQpc - startQpc_ - pausedTotal_;
         SetEvent(tickStop_);
         if (ticker_.joinable()) ticker_.join();
         audio_.Stop(stopQpc);  // pads silence up to the stop press
@@ -833,7 +934,7 @@ CaptureResult Capture::Stop() {
         if (res.ok && !writer_->Notice().empty())
             res.notice = res.notice.empty() ? writer_->Notice() : res.notice + L" " + writer_->Notice();
         if (res.ok && !videoError_.empty()) {
-            res.seconds = (double)writer_->VideoFrames() / std::max(1, opt_.fps);
+            res.seconds = writer_->VideoEnd() / 1e7;
             std::wstring kept = videoError_ + tr(L" 오류 전까지(") + util::FormatClock(res.seconds, false) + tr(L") 저장했습니다.");
             res.notice = res.notice.empty() ? kept : kept + L" " + res.notice;
         }

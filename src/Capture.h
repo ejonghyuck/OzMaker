@@ -161,6 +161,21 @@ private:
         std::vector<D3D11_RECT> mask;
     } finish_;
     bool finishDue_ = false;
+    uint64_t shots_ = 0;  // video mode: frames Process took (under the device lock)
+    // Variable frame rate (#55). Windows hands over frames of a window that hasn't changed too, so the ticker takes
+    // the picture (Snapshot, into cand_) and compares it on the GPU with the last frame written (prev_): blocks with
+    // no pixel changed are discarded, and an occlusion query says whether any were left (Changed).
+    ID3D11Texture2D* Snapshot(ID3D11Texture2D* picture, bool compare);  // under the device lock
+    bool Changed();                                                      // without it
+    void Written();                                                      // under it: cand_ went to the encoder
+    ComPtr<ID3D11Texture2D> cand_, prev_;
+    ComPtr<ID3D11ShaderResourceView> candSrv_, prevSrv_;
+    ComPtr<ID3D11PixelShader> diffPs_;
+    ComPtr<ID3D11RenderTargetView> diffRtv_;
+    ComPtr<ID3D11Query> diffQuery_;
+    UINT diffW_ = 0, diffH_ = 0;
+    bool diffReady_ = false;    // the textures and shader above were made
+    bool diffPending_ = false;  // a comparison is on its way
     std::atomic<size_t> scaled_{0};
 
     std::shared_ptr<FrameStore> store_;
@@ -170,6 +185,7 @@ private:
     int64_t lastTs_ = 0, lastArrivalQpc_ = 0;  // the last frame: its time in the clip, when it came (minus pauses)
     std::atomic<int64_t> pausedAt_{0};     // QPC (100 ns) of the pause in progress, 0 = not paused
     std::atomic<int64_t> pausedTotal_{0};  // length of the pauses so far
+    std::atomic<int64_t> stopAt_{0};       // video: the stop press on the recording's clock (minus pauses)
     std::atomic<size_t> frames_{0};
     mutable std::mutex mtx_;
     std::atomic<bool> running_{false};

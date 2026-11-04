@@ -1269,8 +1269,9 @@ void App::DrawTimerPopover(Rect client) {
                                  : Mp4Writer::AutoBitrate(ow, oh, kVideoFpsOptions[settings_.vFpsIdx], hevc);
         const double audio = settings_.audio || settings_.mic ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000.0 : 0;
         const uint64_t bytes = (uint64_t)((video + audio) / 8 * minutes * 60), free = util::FreeBytes(settings_.outDir);
-        space = util::Format(tr(L"이 길이면 약 %s · 남은 공간 %s"), util::FormatBytes(bytes).c_str(),
-                             util::FormatBytes(free).c_str());
+        // Variable frame rate puts fewer frames in while the screen is still: the bitrate is then the most it takes.
+        space = util::Format(settings_.vFrameMode == 1 ? tr(L"이 길이면 최대 %s · 남은 공간 %s") : tr(L"이 길이면 약 %s · 남은 공간 %s"),
+                             util::FormatBytes(bytes).c_str(), util::FormatBytes(free).c_str());
         spaceWarn = bytes > free;
     }
     TextStyle wrap;
@@ -2297,7 +2298,8 @@ void App::DrawExportPanel(Rect r) {
             if (fmt == Format::Gif) part(util::Format(tr(L"손실 압축 %s"), tr(kLossyNames[settings_.gifLossy])));
         }
         part(util::Format(L"%d×%d", ow, oh));
-        part(util::Format(L"%.0ffps", outFps));
+        part(isVideo && settings_.vFrameMode == 1 ? util::Format(tr(L"%.0ffps 가변"), outFps)
+                                                  : util::Format(L"%.0ffps", outFps));
         part(util::Format(L"%g×", speed));
         if (direction) part(direction == 1 ? tr(L"거꾸로") : tr(L"부메랑"));
         if (!isVideo) part(tr(kLoopNames[settings_.loopIdx]));
@@ -2329,8 +2331,9 @@ void App::DrawExportPanel(Rect r) {
             ui_.Text(in.CutTop(22), VideoSummary(hevc, hevc && settings_.vCodec == kCodecAuto), 12.5f, TextColor);
         } else if (webm) {
             // VP9 by quality (#40). Under 용량 맞추기 a bitrate takes its place.
-            const wchar_t* how = ExportAudio() ? tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩 · 소리는 Opus")
-                                               : tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩");
+            std::wstring how = ExportAudio() ? tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩 · 소리는 Opus")
+                                             : tr(L"VP9 · 화면 내용에 맞춤 · CPU로 인코딩");
+            if (settings_.vFrameMode == 1) how += tr(L" · 가변 프레임");
             if (settings_.targetIdx) {
                 label(tr(L"인코딩"), {});
                 std::wstring text = how;
@@ -2345,7 +2348,7 @@ void App::DrawExportPanel(Rect r) {
                     changed = true;
                 }
                 in.CutTop(4);
-                hintText(how, TextFaint);
+                hintText(how.c_str(), TextFaint);
             }
         } else {
             int& q = settings_.quality[(int)fmt];
@@ -2994,9 +2997,13 @@ void App::SettingsVideo(Rect& area, bool& changed) {
         changed |= ui_.Toggle(HashId("set.vhw"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.vHardware);
     });
 
-    SettingRow(area, tr(L"프레임 레이트"), tr(L"게임은 60, 화면 설명 · 강의는 30이면 충분합니다"), 230, [&](Rect c) {
-        changed |= ui_.Segmented(HashId("set.vfps"), c, {L"24", L"30", L"60"}, settings_.vFpsIdx);
-    });
+    const bool vfr = settings_.vFrameMode == 1;
+    SettingRow(area, tr(L"프레임 레이트"),
+               vfr ? tr(L"가변일 때는 가장 높은 값입니다 · 게임은 60, 강의는 30이면 충분합니다")
+                   : tr(L"게임은 60, 화면 설명 · 강의는 30이면 충분합니다"),
+               230, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.vfps"), c, {L"24", L"30", L"60"}, settings_.vFpsIdx);
+               });
 
     SettingRow(area, tr(L"해상도"), tr(L"원본보다 크게 키우지는 않습니다 · 세로 화면은 짧은 쪽 기준"), 330, [&](Rect c) {
         changed |= ui_.Segmented(HashId("set.vres"), c, {tr(L"원본"), L"2160p", L"1440p", L"1080p", L"720p"},
@@ -3094,6 +3101,21 @@ void App::SettingsVideo(Rect& area, bool& changed) {
                230, [&](Rect c) {
                    changed |= ui_.Segmented(HashId("set.vrc"), c, {L"VBR", L"CBR"}, settings_.vRateCtrl);
                });
+
+    // #55: 가변 puts a frame in only when the screen changes, and one per keyframe interval while it doesn't.
+    const wchar_t* keyNames[] = {tr(L"1초"), tr(L"2초"), tr(L"5초")};
+    Rect vfrMore = SettingRow(
+        area, tr(L"프레임 레이트 방식"), tr(L"고정: 1초에 늘 같은 수 · 편집 프로그램과 잘 맞음 · 가변: 화면이 바뀔 때만 넣어 용량이 작음"),
+        230,
+        [&](Rect c) {
+            changed |= ui_.Segmented(HashId("set.vfr"), c, {tr(L"고정 (CFR)"), tr(L"가변 (VFR)")}, settings_.vFrameMode);
+        },
+        vfr ? 16 + 14.f : 0);
+    if (vfr)
+        ui_.Text(vfrMore.CutTop(16),
+                 util::Format(tr(L"화면이 그대로여도 %s(키프레임 간격)마다 한 장은 넣습니다 · 편집 화면의 MP4와 WebM 저장도 가변입니다"),
+                              keyNames[settings_.vKeyIdx]),
+                 12.f, TextFaint);
 
     SettingRow(area, tr(L"키프레임 간격"), tr(L"짧을수록 편집 프로그램에서 탐색이 빠르고, 용량은 조금 늘어납니다"), 230,
                [&](Rect c) {

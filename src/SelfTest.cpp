@@ -1,7 +1,7 @@
 // Headless test entry points (command line):
 //   --selftest <dir>                      synthetic clip -> frame store round trip -> every available encoder
 //   --screenshot <dir>                    renders each screen to PNG for visual review
-//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause] [mic] [click]
+//   --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4] [audio|mute] [pause] [mic] [click] [vfr]
 //                                         records a real window (or its monitor / its area) and exports it
 //   --analyze <file.mp4> <dir> [freq ...] decodes an MP4: timing, size, test-tone levels
 //   --editor-test <file.mp4> <dir>        the real window: saved video -> editor -> keys -> trimmed export -> 삭제
@@ -10,7 +10,8 @@
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
 //   --preview-test <dir>                  the live window preview on screen, with the files list open over it;
 //                                         the window list following another process's window
-//   --test-window <sec>                   a pattern window in a process of its own (for --preview-test)
+//   --test-window <sec> [capture]         a pattern window in a process of its own (for --preview-test); capture:
+//                                         grey, one Windows lets --record-test take, a white square blinking every 1.5 s
 //   --update-test <dir> [url|github]      the updater on a fake release folder (also part of --selftest); url: the
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
@@ -18,6 +19,7 @@
 #include "AnimClip.h"
 #include "Caption.h"
 #include "Crash.h"
+#include "GpuResize.h"
 #include "Mp4Cut.h"
 #include "Mp4Unfragment.h"
 #include "Resize.h"
@@ -44,6 +46,7 @@ std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double secon
 bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
                   bool fragmented = false, bool crash = false);
 bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got);
+bool WriteVfrMp4(const std::wstring& path, bool hardware, std::wstring& err, std::wstring& got, bool fragmented = true);
 int ReadIndex(const uint8_t* p, int w, int h);
 void DrawIndexed(uint8_t* p, int w, int h, int index, double t);
 
@@ -55,6 +58,8 @@ struct WebmContents {
     int width = 0, height = 0;
     double seconds = 0;              // the segment's duration
     std::vector<int> indexes;        // ReadIndex of each frame
+    std::vector<double> times;       // when each frame starts (s)
+    std::vector<int> keys;           // the frames that are keyframes
     std::vector<uint8_t> first;      // the first frame, BGRA
     std::vector<int16_t> audio;      // 48 kHz stereo, the encoder's pre-skip dropped
 };
@@ -197,7 +202,17 @@ LRESULT CALLBACK AccessTestProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 const COLORREF kPatternColors[8] = {RGB(230, 40, 40),  RGB(40, 200, 60),  RGB(40, 90, 230),  RGB(240, 220, 40),
                                     RGB(220, 50, 220), RGB(40, 220, 220), RGB(250, 140, 30), RGB(150, 90, 30)};
 
+// --test-window capture: grey (no colour the click check takes for its highlight), and a white square that shows
+// while this is odd.
+bool g_patternPlain = false;
+int g_patternBlinks = 0;
+
 LRESULT CALLBACK PatternProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_TIMER) {
+        ++g_patternBlinks;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
@@ -205,9 +220,13 @@ LRESULT CALLBACK PatternProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         GetClientRect(h, &rc);
         for (int i = 0; i < 8; ++i) {
             RECT c{rc.right * (i % 4) / 4, rc.bottom * (i / 4) / 2, rc.right * (i % 4 + 1) / 4, rc.bottom * (i / 4 + 1) / 2};
-            HBRUSH b = CreateSolidBrush(kPatternColors[i]);
+            HBRUSH b = CreateSolidBrush(g_patternPlain ? RGB(70, 80, 90) : kPatternColors[i]);
             FillRect(dc, &c, b);
             DeleteObject(b);
+        }
+        if (g_patternBlinks & 1) {  // in a corner, clear of the middle where the click check looks
+            RECT sq{8, 8, 48, 48};
+            FillRect(dc, &sq, (HBRUSH)GetStockObject(WHITE_BRUSH));
         }
         EndPaint(h, &ps);
         return 0;
@@ -1033,6 +1052,181 @@ int App::RunSelfTest(const std::wstring& dir) {
                          ok ? L"ok" : L"FAIL", wc.indexes.size(), wrong, step, len, wc.seconds,
                          (wc.err.empty() ? werr : wc.err).c_str()));
         if (!ok) ++failures;
+    }
+    // 가변 프레임 레이트 (#55). The plan as frames: a source frame that repeats is one frame, and a keyframe interval
+    // starts a new one, which is a keyframe; constant frame rate is a frame a tick.
+    {
+        const std::vector<size_t> plan{0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3};
+        std::wstring got;
+        for (const VideoRun& r : PlanVideoRuns(plan, true, 4)) got += util::Format(L"%zu+%zu%s ", r.k, r.n, r.key ? L"K" : L"");
+        const auto cfr = PlanVideoRuns(plan, false, 4);
+        bool each = cfr.size() == plan.size();
+        for (size_t k = 0; each && k < cfr.size(); ++k) each = cfr[k].k == k && cfr[k].n == 1 && !cfr[k].key;
+        const bool ok = got == L"0+3K 3+1 4+1K 5+3 8+4K 12+1K " && each;
+        log(util::Format(L"VFR plan: %s %s(keyframes every 4 ticks), constant: a frame a tick %d", ok ? L"ok" : L"FAIL",
+                         got.c_str(), each));
+        if (!ok) ++failures;
+    }
+    // A clip that changes at 0, 0.1, 0.2, 6.0 and 6.1 s and ends at 6.9, saved at 30 fps. As MP4 with keyframes every
+    // second, read back: a frame where the picture changes and one a second while it is still, each a keyframe, at
+    // the times written, the last one lasting to the end. As WebM (keyframes every 5 s): the same, with one still
+    // frame at 5 s. Constant frame rate has 207 frames and is larger.
+    struct VfrFrame {
+        double t;
+        int index;
+        bool key;
+    };
+    const std::vector<VfrFrame> vfrMp4{{0, 0, true},   {0.1, 1, false}, {0.2, 2, false}, {1, 2, true},  {2, 2, true},
+                                       {3, 2, true},   {4, 2, true},    {5, 2, true},    {6, 3, true},  {6.1, 4, false}};
+    const std::vector<VfrFrame> vfrWebm{{0, 0, true}, {0.1, 1, false}, {0.2, 2, false},
+                                        {5, 2, true}, {6, 3, false},   {6.1, 4, false}};
+    // slow: the times as SetVideoTiming made them, that many times as long.
+    auto readVfrMp4 = [&](const std::wstring& path, std::wstring& got, int slow = 1) {
+        std::wstring err;
+        auto v = VideoClip::Open(path, err);
+        if (!v) {
+            got = err;
+            return false;
+        }
+        auto rd = v->NewReader();
+        bool ok = v->Count() == vfrMp4.size() && std::llabs(v->EndTs() - 69'000'000 * slow) < 20'000;
+        for (size_t i = 0; i < v->Count(); ++i) {
+            const uint8_t* px = rd->Get(i);
+            const int index = px ? ReadIndex(px, v->Width(), v->Height()) : -1;
+            const bool key = v->KeyBefore(i) == i;
+            got += util::Format(L"%.2f%s#%d ", v->Ts(i) / 1e7, key ? L"K" : L"", index);
+            ok = ok && i < vfrMp4.size() && std::fabs(v->Ts(i) / 1e7 - vfrMp4[i].t * slow) < 0.002 &&
+                 index == vfrMp4[i].index && key == vfrMp4[i].key;
+        }
+        got += util::Format(L"end %.3f", v->EndTs() / 1e7);
+        return ok;
+    };
+    {
+        auto store = std::make_shared<FrameStore>();
+        std::wstring err;
+        const double starts[] = {0, 0.1, 0.2, 6.0, 6.1};
+        bool made = store->Open(320, 180, err, false);
+        for (int i = 0; made && i < 5; ++i) {
+            auto buf = store->Acquire();
+            DrawIndexed(buf->data(), 320, 180, i, i / 10.0);
+            made = store->Submit(buf, std::llround(starts[i] * 1e7), true);
+        }
+        store->Finish(69'000'000);
+        ExportJob job;
+        job.clip = store;
+        job.last = 4;
+        job.crop = {0, 0, 320, 180};
+        job.outW = 320;
+        job.outH = 180;
+        job.fpsLimit = 30;
+        job.video.gopFrames = 30;
+        job.video.vfr = true;
+        if (HasVideoProcessor()) {
+            job.format = Format::Mp4;
+            job.path = dir + L"\\selftest_vfr.mp4";
+            ExportResult r = ExportSync(ex, job);
+            std::wstring got;
+            const bool read = r.ok && readVfrMp4(job.path, got);
+            job.video.vfr = false;
+            job.path = dir + L"\\selftest_cfr.mp4";
+            ExportResult c = ExportSync(ex, job);
+            job.video.vfr = true;
+            const bool ok = read && r.frames == (int)vfrMp4.size() && c.ok && c.frames == 207 && r.bytes < c.bytes;
+            log(util::Format(L"MP4 variable frame rate: %s %s · %d frames %s, constant %d frames %s %s", ok ? L"ok" : L"FAIL",
+                             got.c_str(), r.frames, util::FormatBytes(r.bytes).c_str(), c.frames,
+                             util::FormatBytes(c.bytes).c_str(), (r.error + c.error).c_str()));
+            if (!ok) ++failures;
+            // What Finish does to a variable frame rate MP4, on a copy: each frame twice as long, read back as such.
+            // With a frame too few the file stays as it was.
+            const std::wstring slow = dir + L"\\selftest_vfr_slow.mp4";
+            std::vector<uint32_t> dur;
+            for (size_t i = 0; i < vfrMp4.size(); ++i)
+                dur.push_back((uint32_t)std::llround(((i + 1 < vfrMp4.size() ? vfrMp4[i + 1].t : 6.9) - vfrMp4[i].t) * 2e7));
+            std::wstring why, gotSlow;
+            const bool copied = r.ok && CopyFileW((dir + L"\\selftest_vfr.mp4").c_str(), slow.c_str(), FALSE);
+            const uint64_t before = util::FileSize(slow);
+            const std::vector<uint32_t> fewer(dur.begin(), dur.end() - 1);
+            const bool refused = copied && !mp4::SetVideoTiming(slow, fewer, why) && util::FileSize(slow) == before;
+            const std::wstring refusal = why;
+            const bool set = copied && mp4::SetVideoTiming(slow, dur, why) && readVfrMp4(slow, gotSlow, 2);
+            log(util::Format(L"MP4 frame times set afterwards: %s %s · a frame too few: refused %d (%s) %s",
+                             set && refused ? L"ok" : L"FAIL", gotSlow.c_str(), refused, refusal.c_str(), why.c_str()));
+            if (!set || !refused) ++failures;
+        } else {
+            log(L"MP4 variable frame rate: skipped (no GPU video processor)");
+        }
+        if (FormatAvailable(Format::WebM) && WebmReaderBuilt()) {
+            job.format = Format::WebM;
+            job.quality = 70;
+            job.path = dir + L"\\selftest_vfr.webm";
+            ExportResult r = ExportSync(ex, job);
+            WebmContents wc = r.ok ? ReadWebm(job.path) : WebmContents{};
+            std::wstring got;
+            bool ok = wc.ok && wc.indexes.size() == vfrWebm.size() && wc.times.size() == vfrWebm.size() &&
+                      std::fabs(wc.seconds - 6.9) < 0.002 && r.frames == (int)vfrWebm.size();
+            for (size_t i = 0; i < wc.times.size() && i < wc.indexes.size(); ++i) {
+                const bool key = std::find(wc.keys.begin(), wc.keys.end(), (int)i) != wc.keys.end();
+                got += util::Format(L"%.2f%s#%d ", wc.times[i], key ? L"K" : L"", wc.indexes[i]);
+                ok = ok && i < vfrWebm.size() && std::fabs(wc.times[i] - vfrWebm[i].t) < 0.002 &&
+                     wc.indexes[i] == vfrWebm[i].index && key == vfrWebm[i].key;
+            }
+            log(util::Format(L"WebM variable frame rate: %s %send %.3f · %s %s %s", ok ? L"ok" : L"FAIL", got.c_str(),
+                             wc.seconds, util::FormatBytes(r.bytes).c_str(), wc.err.c_str(), r.error.c_str()));
+            if (!ok) ++failures;
+        }
+    }
+    // Recording (#55): what the ticker writes, through each encoder here. Fragmented and made plain as recording does;
+    // the sound still steps at 4.5 s, in the middle of the still part.
+    if (HasVideoProcessor()) {
+        for (int variant = 0; variant < 3; ++variant) {
+            const bool hardware = variant == 0, frag = variant < 2;
+            if (hardware && Mp4Writer::FindEncoder(false, true).empty()) {
+                log(L"VFR recording (hardware): skipped (no hardware encoder)");
+                continue;
+            }
+            const std::wstring path = dir + (hardware ? L"\\selftest_vfr_rec_hw.mp4" : frag ? L"\\selftest_vfr_rec_sw.mp4" : L"\\selftest_vfr_rec_swplain.mp4");
+            std::wstring err, enc, got;
+            const bool wrote = WriteVfrMp4(path, hardware, err, enc, frag);
+            bool ok = wrote && readVfrMp4(path, got);
+            double step = -1;
+            if (wrote) {
+                if (auto v = VideoClip::Open(path, err)) {
+                    int rate = 0;
+                    const std::vector<int16_t> st = ReadAllAudio(*v, 0, 6.9, rate);
+                    step = ToneSwitch(st, rate, 0.5, 440, 880);
+                }
+                ok = ok && std::fabs(step - 4.5) < 0.02;
+            }
+            if (!frag) enc += L" plain";
+            // Cut without encoding (#22) from the keyframe at 2 s to the frame at 6.0: as long each, the sound along.
+            if (ok && variant == 1) {
+                std::wstring cut = dir + L"\\selftest_vfr_cut.mp4", why;
+                std::atomic<bool> stop{false};
+                std::atomic<float> progress{0};
+                mp4::CutSource::Result cres;
+                auto src = mp4::CutSource::Open(path);
+                const bool made = src && src->KeyBefore(4) == 4 && src->Cut(4, 8, true, cut, stop, progress, cres, why);
+                auto out = made ? VideoClip::Open(cut, why) : nullptr;
+                std::wstring seen;
+                bool cutOk = out && out->Count() == 5 && out->HasAudio() && std::llabs(out->EndTs() - 41'000'000) < 20'000;
+                if (out) {
+                    auto rd = out->NewReader();
+                    for (size_t i = 0; i < out->Count(); ++i) {
+                        const uint8_t* px = rd->Get(i);
+                        const int index = px ? ReadIndex(px, out->Width(), out->Height()) : -1;
+                        seen += util::Format(L"%.2f#%d ", out->Ts(i) / 1e7, index);
+                        cutOk = cutOk && std::fabs(out->Ts(i) / 1e7 - (double)i) < 0.002 && index == (i < 4 ? 2 : 3);
+                    }
+                    seen += util::Format(L"end %.3f", out->EndTs() / 1e7);
+                }
+                log(util::Format(L"VFR recording cut as it is: %s %s %s", cutOk ? L"ok" : L"FAIL", seen.c_str(), why.c_str()));
+                if (!cutOk) ++failures;
+            }
+            log(util::Format(L"VFR recording (%s): %s %s · 440->880 at %.3fs (4.500) · %s %s",
+                             hardware ? L"hardware" : L"software", ok ? L"ok" : L"FAIL", got.c_str(), step, enc.c_str(),
+                             err.c_str()));
+            if (!ok) ++failures;
+        }
     }
     // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
     // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
@@ -2051,6 +2245,125 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"caption %s: %s white %d/%d/%d by third, dark %d", pos == caption::kTop ? L"top" : L"bottom",
                          ok ? L"ok" : L"FAIL", white[0], white[1], white[2], dark));
     }
+    // The MP4 export's frames on the GPU (#23) against the CPU's (AreaResizer, Overlay::Blend, over white): the same
+    // where the size stays (an odd edge trimmed), close where it is scaled (a box filter over mips against an exact
+    // one), with a caption and with see-through parts. And how long 1920×1080 to 1280×720 takes either way.
+    {
+        ComPtr<ID3D11Device> gdev;
+        ComPtr<ID3D11DeviceContext> gctx;
+        bool made = false;
+        for (D3D_DRIVER_TYPE type : {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP})
+            if (!made)
+                made = SUCCEEDED(D3D11CreateDevice(nullptr, type, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr,
+                                                   0, D3D11_SDK_VERSION, &gdev, nullptr, &gctx));
+        const int SW = 2000, SH = 1200, stride = SW * 4;
+        std::vector<uint8_t> solid((size_t)SW * SH * 4), see(solid.size());
+        DrawSynthetic(solid.data(), SW, SH, 0.3);
+        // See-through, premultiplied: fading out to the right, and a clear band with nothing in it.
+        for (int y = 0; y < SH; ++y)
+            for (int x = 0; x < SW; ++x) {
+                const size_t i = ((size_t)y * SW + x) * 4;
+                const unsigned a = y % 200 < 30 ? 0 : 255 - x * 200 / SW;
+                for (int c = 0; c < 3; ++c) see[i + c] = (uint8_t)((solid[i + c] * a + 127) / 255);
+                see[i + 3] = (uint8_t)a;
+            }
+        struct Case {
+            const wchar_t* name;
+            int cx, cy, cw, ch, w, h;
+            bool alpha;
+            const wchar_t* text;
+            double psnr;  // at least; 0: the same, give or take 1
+        };
+        const Case cases[] = {
+            {L"same size", 100, 50, 640, 360, 640, 360, false, L"", 0},
+            {L"same size, caption, see-through", 100, 50, 640, 360, 640, 360, true, L"자막 Caption", 0},
+            {L"odd edge trimmed", 101, 51, 641, 361, 640, 360, false, L"", 0},
+            {L"1.5x, caption", 0, 0, 1920, 1080, 1280, 720, false, L"자막 Caption", 38},
+            {L"2.4x", 37, 11, 1537, 865, 640, 360, false, L"", 38},
+            {L"6x (mips), see-through", 0, 0, 1920, 1080, 320, 180, true, L"자막", 38},
+        };
+        std::wstring got;
+        bool all = made;
+        double gpuMs = 0, cpuMs = 0;
+        for (const Case& c : cases) {
+            if (!made) break;
+            const uint8_t* src = c.alpha ? see.data() : solid.data();
+            caption::Overlay cap;
+            cap.Make(c.text, caption::kBottom, c.w, c.h);
+            // The CPU's frame, cropped as the GPU does when it copies.
+            const bool copy = c.cw - c.w >= 0 && c.cw - c.w <= 1 && c.ch - c.h >= 0 && c.ch - c.h <= 1;
+            std::vector<uint8_t> want((size_t)c.w * c.h * 4), have(want.size());
+            AreaResizer resizer;
+            auto onCpu = [&] {
+                resizer.Run(src, stride, c.cx, c.cy, copy ? c.w : c.cw, copy ? c.h : c.ch, want.data(), c.w, c.h,
+                            c.alpha);
+                cap.Blend(want.data());
+                if (c.alpha)
+                    for (size_t i = 0; i < want.size(); i += 4) {
+                        for (int k = 0; k < 3; ++k) want[i + k] = (uint8_t)std::min(255, want[i + k] + 255 - want[i + 3]);
+                        want[i + 3] = 255;
+                    }
+            };
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = c.w;
+            td.Height = c.h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            ComPtr<ID3D11Texture2D> out, staging;
+            D3D11_TEXTURE2D_DESC sd = td;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            GpuResizer gpu;
+            const uint8_t* crop = src + (size_t)c.cy * stride + (size_t)c.cx * 4;
+            bool ok = SUCCEEDED(gdev->CreateTexture2D(&td, nullptr, &out)) &&
+                      SUCCEEDED(gdev->CreateTexture2D(&sd, nullptr, &staging)) &&
+                      gpu.Init(gdev.Get(), out.Get(), c.cw, c.ch, c.alpha, cap);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            auto readBack = [&] {
+                gctx->CopyResource(staging.Get(), out.Get());
+                if (FAILED(gctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+                for (int y = 0; y < c.h; ++y)
+                    memcpy(&have[(size_t)y * c.w * 4], (const uint8_t*)m.pData + (size_t)y * m.RowPitch, c.w * 4);
+                gctx->Unmap(staging.Get(), 0);
+                return true;
+            };
+            if (ok) {
+                gpu.Draw(gctx.Get(), crop, stride);
+                ok = readBack();
+            }
+            onCpu();
+            int most = 0;
+            double se = 0;
+            for (size_t i = 0; ok && i < want.size(); i += 4)
+                for (int k = 0; k < 3; ++k) {
+                    const int d = std::abs(want[i + k] - have[i + k]);
+                    most = std::max(most, d);
+                    se += d * d;
+                }
+            const double psnr = se > 0 ? 10 * std::log10(255.0 * 255.0 / (se / (want.size() / 4 * 3))) : 99;
+            ok = ok && (c.psnr > 0 ? psnr >= c.psnr : most <= 1);
+            got += util::Format(L"%s %s %.1f dB (most %d); ", c.name, ok ? L"ok" : L"FAIL", psnr, most);
+            all = all && ok;
+            // 1920×1080 to 1280×720 with the caption: 20 frames each way.
+            if (ok && c.w == 1280) {
+                const int n = 20;
+                int64_t t = util::Qpc100ns();
+                for (int i = 0; i < n; ++i) gpu.Draw(gctx.Get(), crop, stride);
+                readBack();
+                gpuMs = (util::Qpc100ns() - t) / 1e4 / n;
+                t = util::Qpc100ns();
+                for (int i = 0; i < n; ++i) onCpu();
+                cpuMs = (util::Qpc100ns() - t) / 1e4 / n;
+            }
+        }
+        if (!all) ++failures;
+        log(util::Format(L"MP4 export frames on the GPU: %s %s1920x1080 to 1280x720 a frame: GPU %.1f ms, CPU %.1f ms",
+                         all ? L"ok" : L"FAIL", made ? got.c_str() : L"no device; ", gpuMs, cpuMs));
+    }
     // Portable mode (#25): a settings.ini next to the exe is the settings file; a test run keeps its scratch file.
     {
         auto pcheck = [&](bool ok, const wchar_t* what) {
@@ -2151,6 +2464,12 @@ int App::RunSelfTest(const std::wstring& dir) {
                   kept.vCodec == kCodecH264 && kept.hkHook && kept.startHide == kHideMinimize,
               L"a 0.6.5 file keeps its timer, codec, taken-over hotkey and start over the old keys");
 
+        // 프레임 레이트 방식 (#55): a file from before it has none and stays 고정.
+        Settings vfrOld = load(L"vfr_old.ini", "[OzMaker]\r\nVideoRateControl=1\r\n");
+        Settings vfrOn = load(L"vfr_on.ini", "[OzMaker]\r\nVideoFrameRateMode=1\r\n");
+        check(fresh.vFrameMode == 0 && vfrOld.vFrameMode == 0 && vfrOld.vRateCtrl == 1 && vfrOn.vFrameMode == 1,
+              L"프레임 레이트 방식: 고정 in a new file and in one from before it, 가변 read back");
+
         // 설정 초기화 (#49) keeps the save folder, the window's place, the 녹화 tab's pick and the files lists, and
         // puts back the rest, hotkeys taken over or not; the editor's kind of 화질 stays the one it shows.
         Settings r = load(L"reset.ini", "");
@@ -2171,6 +2490,7 @@ int App::RunSelfTest(const std::wstring& dir) {
         r.theme = kThemeLight;
         r.language = kLangEnglish;
         r.vCodec = kCodecHevc;
+        r.vFrameMode = 1;
         r.startHide = kHideMinimize;
         r.nameTemplate = L"{날짜}";
         r.output = kOutputVideo;
@@ -2186,9 +2506,9 @@ int App::RunSelfTest(const std::wstring& dir) {
               L"설정 초기화 keeps the save folder, the window's place, the 녹화 tab's pick and the files lists");
         check(r.hkMods == d.hkMods && r.hkVk == d.hkVk && !r.hkHook && !r.hkPauseHook && r.TimerMinutes() == 0 &&
                   !r.timerStop && r.theme == d.theme && r.language == d.language && r.vCodec == kCodecAuto &&
-                  r.startHide == kHideToTray && r.nameTemplate == d.nameTemplate && r.output == d.output &&
+                  r.vFrameMode == 0 && r.startHide == kHideToTray && r.nameTemplate == d.nameTemplate && r.output == d.output &&
                   r.fpsIdx == d.fpsIdx,
-              L"and puts back the rest: hotkeys (taken over or not), timer, theme, language, codec, start");
+              L"and puts back the rest: hotkeys (taken over or not), timer, theme, language, codec, frame rate mode, start");
         const bool mp4First = r.exportVideo && r.exportPreset == 0 && r.scaleIdx == 0 && r.outFpsIdx == 0;
         r.UseExportKind(false);
         check(mp4First && r.exportPreset == 1 && r.scaleIdx == 4 && r.outFpsIdx == 3,
@@ -2755,6 +3075,9 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     shot(L"home_selected_150.png", 144);
     settings_.output = kOutputVideo;
     shot(L"home_video.png", 96);
+    settings_.vFrameMode = 1;  // 가변 프레임 (#55) on the line under the options
+    shot(L"home_video_vfr.png", 96);
+    settings_.vFrameMode = 0;
     // The record timer's popover (#47), on 직접 입력 at 3시간 20분, stopping.
     settings_.timerIdx = kTimerCustom;
     settings_.timerMinutes = 200;
@@ -2933,6 +3256,10 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         brNote_.clear();
         settings_.vBitrateIdx = 0;
         settings_.vBitrateKbps = 20000;
+        // 프레임 레이트 방식 on 가변 (#55): the line under it, and 프레임 레이트 says it is the highest rate.
+        settings_.vFrameMode = 1;
+        shot(L"settings_video_vfr.png", 96);
+        settings_.vFrameMode = 0;
         // 일반 › 언어, its list open: drawn like the rest of the app, not a Windows menu.
         settings_.settingsTab = kTabGeneral;
         menu_.owner = HashId("set.language");
@@ -3041,6 +3368,9 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     fmt_ = (int)Format::Mp4;  // MP4: the same preset gives other values; 인코딩 instead of 품질
     settings_.ApplyPreset(settings_.exportPreset = 1, true);
     shot(L"editor_mp4.png", 96);
+    settings_.vFrameMode = 1;  // 가변 (#55): on the 자세히 summary and the 인코딩 line
+    shot(L"editor_mp4_vfr.png", 96);
+    settings_.vFrameMode = 0;
     // WebM (#40): chosen on the second row, its 품질 and the VP9 line; under 용량 맞추기, the bitrate instead.
     fmt_ = (int)Format::WebM;
     shot(L"editor_webm.png", 96);
@@ -3843,6 +4173,8 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     // click (anywhere after the mode): a made-up click at the window's centre a quarter of the way in, then the
     // frames are checked for its highlight. Never a real click: that would land on whatever is on screen.
     bool click = std::find(a.begin() + std::min<size_t>(a.size(), 8), a.end(), L"click") != a.end();
+    // vfr (anywhere after the mode): a variable frame rate MP4 (#55), checked for how few frames a still window gets.
+    bool vfr = mp4 && std::find(a.begin() + std::min<size_t>(a.size(), 8), a.end(), L"vfr") != a.end();
     CaptureOptions o;
     o.target = target;
     o.fps = a.size() > 4 ? _wtoi(a[4].c_str()) : 30;
@@ -3870,6 +4202,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
         v.video.hardware = !software;
         v.video.hevc = hevc;
         v.video.gopFrames = o.fps * 2;
+        v.video.vfr = vfr;
         v.sound = audio;
         // mic (anywhere after the mode): the default input mixed in. Never in automated runs: it records the room.
         v.mic = std::find(a.begin() + std::min<size_t>(a.size(), 8), a.end(), L"mic") != a.end();
@@ -3974,6 +4307,36 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
             std::wstring verr;
             auto vc = VideoClip::Open(res.path, verr);
             if (!vc || !clickCheck(*vc)) return 2;
+        }
+        if (vfr) {
+            // Frames only where the window changed (the cursor, a click's highlight), and one every keyframe interval
+            // (2 s) while it is still: far fewer than a constant rate, none apart by more than that, and as long.
+            std::wstring verr;
+            auto vc = VideoClip::Open(res.path, verr);
+            if (!vc) {
+                log(L"FAIL vfr: " + verr);
+                return 2;
+            }
+            int64_t longest = 0, keyGap = 0, lastKey = 0;
+            std::wstring times;
+            for (size_t i = 0; i < vc->Count(); ++i) {
+                const int64_t end = i + 1 < vc->Count() ? vc->Ts(i + 1) : vc->EndTs();
+                longest = std::max(longest, end - vc->Ts(i));
+                if (vc->KeyBefore(i) == i) {
+                    keyGap = std::max(keyGap, vc->Ts(i) - lastKey);
+                    lastKey = vc->Ts(i);
+                }
+                if (i < 40) times += util::Format(L" %.2f%s", vc->Ts(i) / 1e7, vc->KeyBefore(i) == i ? L"K" : L"");
+            }
+            keyGap = std::max(keyGap, vc->EndTs() - lastKey);
+            const size_t constant = (size_t)std::lround(res.seconds * o.fps);
+            const bool ok = vc->Count() * 3 < constant && longest <= 20'000'000 + 10'000'000 / o.fps &&
+                            keyGap <= 20'000'000 + 10'000'000 / o.fps && std::fabs(vc->EndTs() / 1e7 - res.seconds) < 0.1;
+            log(util::Format(L"%s vfr: %zu frames (constant: %zu), longest %.3fs, keyframes at most %.3fs apart, %.3fs "
+                             L"long (recorded %.3fs):%s",
+                             ok ? L"ok  " : L"FAIL", vc->Count(), constant, longest / 1e7, keyGap / 1e7,
+                             vc->EndTs() / 1e7, res.seconds, times.c_str()));
+            if (!ok) return 2;
         }
         return 0;
     }
@@ -4188,6 +4551,84 @@ bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::w
     return w.Finish(err);
 }
 
+// Variable frame rate as recording writes it (#55): 30 fps ticks over 6.9 s, a picture that changes at 0, 0.1, 0.2, 6.0
+// and 6.1 s and stays still between, keyframes every second, and sound that steps from 440 to 880 Hz at 4.5 s. Like
+// the recording ticker, a frame goes in a tick's time after the one before, so the encoder has taken that one.
+bool WriteVfrMp4(const std::wstring& path, bool hardware, std::wstring& err, std::wstring& got, bool fragmented) {
+    const int W = 320, H = 180, fps = 30, ticks = 207;
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<ID3D11Multithread> mt;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                 D3D11_SDK_VERSION, &dev, nullptr, &ctx)) ||
+        FAILED(ctx.As(&mt))) {
+        err = L"no device";
+        return false;
+    }
+    mt->SetMultithreadProtected(TRUE);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = W;
+    td.Height = H;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> tex;
+    dev->CreateTexture2D(&td, nullptr, &tex);
+    VideoConfig v;
+    v.width = W;
+    v.height = H;
+    v.fps = fps;
+    v.gopFrames = fps;
+    v.hardware = hardware;
+    v.vfr = true;
+    v.fragmented = fragmented;  // as recording writes it; Finish makes it plain
+    AudioConfig a;
+    a.enabled = true;
+    Mp4Writer w;
+    if (!w.Open(path, v, a, dev.Get(), err)) return false;
+    got = w.EncoderName() + (w.HardwareEncoder() ? L" (hardware)" : L" (software)");
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    std::vector<int16_t> pcm;
+    int64_t pushed = 0;
+    double phase = 0;
+    int shown = -1;
+    for (int k = 0; k < ticks; ++k) {
+        const int index = k < 3 ? 0 : k < 6 ? 1 : k < 180 ? 2 : k < 183 ? 3 : 4;
+        const int64_t t0 = (int64_t)k * 10'000'000 / fps;
+        if (index != shown || w.KeyDue(t0)) {
+            DrawIndexed(px.data(), W, H, index, index / 10.0);
+            ctx->UpdateSubresource(tex.Get(), 0, nullptr, px.data(), W * 4, 0);
+            Sleep(1000 / fps);
+            ComPtr<IMFSample> s;
+            for (int tries = 0; !(s = w.Convert(tex.Get())) && tries < 2500; ++tries) Sleep(2);
+            if (!s || !w.HoldVideo(s, t0)) {
+                err = L"write failed";
+                w.Abort();
+                return false;
+            }
+            shown = index;
+        }
+        const int64_t want = (int64_t)(k + 1) * a.sampleRate / fps;
+        pcm.clear();
+        for (int64_t i = pushed; i < want; ++i) {
+            phase += 2 * 3.14159265358979 * (i < 4.5 * a.sampleRate ? 440 : 880) / a.sampleRate;
+            const int16_t x = (int16_t)(0.03 * std::sin(phase) * 32767);  // quiet: the preview may play it
+            pcm.push_back(x);
+            pcm.push_back(x);
+        }
+        w.PushAudio(pcm.data(), pcm.size() / 2);
+        pushed = want;
+    }
+    if (!w.EndVideo((int64_t)ticks * 10'000'000 / fps)) {
+        err = L"write failed";
+        w.Abort();
+        return false;
+    }
+    return w.Finish(err);
+}
+
 // A copy of an MP4 whose video track says to show it turned clockwise by cw degrees, the way phones mark portrait
 // video: the display matrix and size in the track header (tkhd) change, the pictures stay as they are.
 bool WriteRotatedCopy(const std::wstring& src, const std::wstring& dst, int cw) {
@@ -4368,6 +4809,8 @@ WebmContents ReadWebm(const std::wstring& path) {
                             c.ok = false;
                             c.err = L"VP9 decoding failed";
                         }
+                        if (b->IsKey()) c.keys.push_back((int)c.times.size());
+                        c.times.push_back(b->GetTime(cl) / 1e9);
                         vpx_codec_iter_t it = nullptr;
                         while (vpx_image_t* img = vpx_codec_get_frame(&vpx, &it)) {
                             const int w = (int)img->d_w, h = (int)img->d_h;
@@ -5150,17 +5593,20 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
 // The live window preview as DWM shows it. A window of colour blocks is picked and the files list opened over the
 // preview: on screen (our window only, kept on top) the list must show where it is and the window everywhere else,
 // with the title bar hidden and shown, and closing the list must bring back the whole preview.
-int App::RunTestWindow(double seconds) {
+int App::RunTestWindow(double seconds, bool capture) {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = PatternProc;
     wc.hInstance = inst_;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"OzMakerTestPattern";
     RegisterClassExW(&wc);
-    HWND h = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"OzMaker Test Window 2", WS_OVERLAPPEDWINDOW, 60, 60,
-                             420, 260, nullptr, nullptr, inst_, nullptr);
+    // Windows won't capture a window that can't be activated; it still opens without taking the focus.
+    HWND h = CreateWindowExW(capture ? 0 : WS_EX_NOACTIVATE, wc.lpszClassName, L"OzMaker Test Window 2",
+                             WS_OVERLAPPEDWINDOW, 60, 60, 420, 260, nullptr, nullptr, inst_, nullptr);
     if (!h) return 1;
     ShowWindow(h, SW_SHOWNOACTIVATE);
+    g_patternPlain = capture;
+    if (capture) SetTimer(h, 1, 1500, nullptr);
     double end = util::NowSeconds() + seconds;
     while (util::NowSeconds() < end) {
         MSG msg;

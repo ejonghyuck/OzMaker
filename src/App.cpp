@@ -108,7 +108,8 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--region-test") return RunRegionTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
-    if (args.size() >= 2 && args[0] == L"--test-window") return RunTestWindow(_wtof(args[1].c_str()));
+    if (args.size() >= 2 && args[0] == L"--test-window")
+        return RunTestWindow(_wtof(args[1].c_str()), args.size() >= 3 && args[2] == L"capture");
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
     if (args.size() >= 2 && args[0] == L"--video-test")
         return RunVideoTest(args[1], args.size() >= 4 ? _wtoi(args[2].c_str()) : 640,
@@ -1672,6 +1673,7 @@ std::wstring App::VideoSummary(bool hevc, bool bigHevc) const {
     }
     const UINT32 bps = settings_.VideoBitrate();
     s += bps ? L" · " + MbpsText((int)(bps / 1000)) + L" Mbps" : std::wstring(tr(L" · 자동 화질"));
+    if (settings_.vFrameMode == 1) s += tr(L" · 가변 프레임");
     return s;
 }
 
@@ -2380,6 +2382,7 @@ VideoConfig App::VideoSettings(int fps) const {
     v.hardware = settings_.vHardware;
     v.bitrate = settings_.VideoBitrate();
     v.cbr = settings_.vRateCtrl == 1;
+    v.vfr = settings_.vFrameMode == 1;
     v.gopFrames = fps * kKeyframeOptions[settings_.vKeyIdx];
     v.qualityVsSpeed = kPresetOptions[settings_.vPresetIdx];
     return v;
@@ -2538,6 +2541,7 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
         job.quality = quality;  // VP9 by quality (#40); a bitrate only to fit a size
     }
     if (IsVideoFormat(job.format)) {
+        job.video.vfr = settings_.vFrameMode == 1;  // MP4 and WebM alike (#55)
         if (settings_.targetIdx && fitBitrate_) job.video.bitrate = fitBitrate_;
         job.audio.enabled = ExportAudio();
         job.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;

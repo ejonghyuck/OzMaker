@@ -1,6 +1,6 @@
 #pragma once
 
-// WebM files (#40): VP9 video from BGRA frames at a constant rate and Opus sound from 16-bit stereo PCM, muxed by
+// WebM files (#40): VP9 video from BGRA frames on a 1 / fps clock and Opus sound from 16-bit stereo PCM, muxed by
 // libwebm with cues so players can seek. Encoded on the CPU. A build without libvpx, Opus or libwebm has none
 // (Available() is false).
 class WebmWriter {
@@ -21,8 +21,10 @@ public:
 
     static bool Available();
     bool Open(const std::wstring& path, const Config& c, std::wstring& err);
-    // The next frame (k shows from k / fps for 1 / fps): tightly packed BGRA, alpha ignored.
-    bool AddVideo(const uint8_t* bgra, std::wstring& err);
+    static constexpr int kKeySeconds = 5;  // the longest time between keyframes, so seeking stays quick
+    // The next frame, shown for `ticks` of 1 / fps (more than one: variable frame rate, #55): tightly packed BGRA,
+    // alpha ignored. key: make it a keyframe.
+    bool AddVideo(const uint8_t* bgra, std::wstring& err, int ticks = 1, bool key = false);
     void PushAudio(const int16_t* pcm, size_t frames);  // interleaved stereo
     bool HasAudio() const;
     bool Finish(std::wstring& err);  // writes what is left and closes the file

@@ -114,6 +114,7 @@ struct Settings {
     int vBitrateIdx = 0;
     int vBitrateKbps = 20000;  // what 직접 입력 holds, in steps of 100 kbps (a tenth of a Mbps)
     int vRateCtrl = 0;  // 0 = VBR, 1 = CBR
+    int vFrameMode = 0;  // 0 = CFR, 1 = VFR (#55)
     int vKeyIdx = 1;
     int vPresetIdx = 1;
     bool audio = true;

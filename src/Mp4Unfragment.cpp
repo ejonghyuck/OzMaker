@@ -376,4 +376,169 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
     return true;
 }
 
+bool SetVideoTiming(const std::wstring& path, const std::vector<uint32_t>& dur100ns, std::wstring& err) {
+    err = tr(L"MP4 구조를 읽을 수 없습니다.");
+    File f(path);
+    if (!f.Ok()) {
+        err = util::Format(tr(L"파일을 열 수 없습니다. (%lu)"), GetLastError());
+        return false;
+    }
+    const uint64_t end = f.Size();
+    std::vector<Top> top;
+    for (uint64_t p = 0; end - p >= 8;) {
+        uint8_t h[16];
+        const size_t n = (size_t)std::min<uint64_t>(16, end - p);
+        if (!f.Read(p, h, n)) return false;
+        uint32_t hdr = 8;
+        uint64_t size = Be32(h);
+        if (size == 1) {
+            if (n < 16) return false;
+            size = Be64(h + 8);
+            hdr = 16;
+        } else if (size == 0) {
+            size = end - p;
+        }
+        if (size < hdr || size > end - p) return false;
+        top.push_back({Be32(h + 4), p, size, hdr});
+        p += size;
+    }
+    const Top* mt = nullptr;
+    for (const Top& t : top)
+        if (t.type == kMoov) {
+            if (mt) return false;  // which one?
+            mt = &t;
+        }
+    if (!mt || mt->size > (64u << 20)) return false;
+    Bytes moov((size_t)mt->size);
+    if (!f.Read(mt->pos, moov.data(), moov.size())) return false;
+    const std::vector<Box> kids = Children(moov, mt->hdr, moov.size());
+    const Box* mvhd = Find(kids, kMvhd);
+    if (!mvhd || mvhd->BodySize() < 24 || Find(kids, kMvex)) return false;
+    const uint8_t* mh = &moov[mvhd->Body()];
+    const uint64_t movieScale = Be32(mh + (mh[0] == 1 ? 20 : 12));
+
+    // The video trak, its time scale, and how many samples its stts counts.
+    const Box* trak = nullptr;
+    uint64_t scale = 0, samples = 0;
+    for (const Box& t : kids) {
+        if (t.type != kTrak) continue;
+        auto tk = Children(moov, t);
+        const Box* mdia = Find(tk, kMdia);
+        auto md = mdia ? Children(moov, *mdia) : std::vector<Box>{};
+        const Box* hdlr = Find(md, Tag("hdlr"));
+        const Box* mdhd = Find(md, kMdhd);
+        const Box* minf = Find(md, kMinf);
+        if (!hdlr || hdlr->BodySize() < 12 || Be32(&moov[hdlr->Body() + 8]) != Tag("vide")) continue;
+        if (trak || !mdhd || mdhd->BodySize() < 24 || !minf) return false;
+        const uint8_t* m = &moov[mdhd->Body()];
+        scale = Be32(m + (m[0] == 1 ? 20 : 12));
+        const Box* stbl = Find(Children(moov, *minf), kStbl);
+        auto st = stbl ? Children(moov, *stbl) : std::vector<Box>{};
+        const Box* stts = Find(st, Tag("stts"));
+        if (!stts || stts->BodySize() < 8) return false;
+        const uint32_t entries = Be32(&moov[stts->Body() + 4]);
+        if (stts->BodySize() < 8 + (size_t)entries * 8) return false;
+        for (uint32_t i = 0; i < entries; ++i) samples += Be32(&moov[stts->Body() + 8 + i * 8]);
+        if (const Box* ctts = Find(st, Tag("ctts"))) {
+            const uint32_t n = ctts->BodySize() >= 8 ? Be32(&moov[ctts->Body() + 4]) : 0;
+            for (uint32_t i = 0; i < n && ctts->BodySize() >= 16 + (size_t)i * 8; ++i)
+                if (Be32(&moov[ctts->Body() + 12 + i * 8]) != 0) {
+                    err = L"B-frames";
+                    return false;
+                }
+        }
+        trak = &t;
+    }
+    if (!trak || scale == 0 || movieScale == 0 || samples != dur100ns.size()) {
+        if (trak && samples != dur100ns.size())
+            err = util::Format(L"%llu frames in the file, %zu written", samples, dur100ns.size());
+        return false;
+    }
+
+    // In the trak's time scale, rounded where each frame ends so the rounding doesn't add up.
+    std::vector<uint32_t> dur(dur100ns.size());
+    uint64_t at = 0, media = 0;
+    for (size_t i = 0; i < dur.size(); ++i) {
+        at += dur100ns[i];
+        const uint64_t e = (at * scale + 5'000'000) / 10'000'000;
+        dur[i] = (uint32_t)std::max<uint64_t>(1, e > media ? e - media : 0);
+        media += dur[i];
+    }
+    const uint64_t videoDur = media * movieScale / scale;
+    uint64_t movieDur = videoDur;
+    for (const Box& t : kids) {  // the other tracks' lengths as they are
+        if (t.type != kTrak || &t == trak) continue;
+        auto tk = Children(moov, t);
+        const Box* tkhd = Find(tk, kTkhd);
+        if (!tkhd || tkhd->BodySize() < 24) continue;
+        const uint8_t* h = &moov[tkhd->Body()];
+        movieDur = std::max<uint64_t>(movieDur, h[0] == 1 ? (tkhd->BodySize() >= 36 ? Be64(h + 28) : 0) : Be32(h + 20));
+    }
+
+    Bytes o;
+    Wrap(o, kMoov, [&] {
+        for (const Box& x : kids) {
+            if (x.type == kMvhd) {
+                PutWithDuration(o, moov, x, movieDur);
+                continue;
+            }
+            if (&x != trak) {
+                Copy(o, moov, x);
+                continue;
+            }
+            Wrap(o, kTrak, [&] {
+                for (const Box& t : Children(moov, x)) {
+                    if (t.type == kTkhd) {
+                        PutWithDuration(o, moov, t, videoDur);
+                    } else if (t.type == Tag("edts")) {
+                        // none: the video starts at 0, as the sound does
+                    } else if (t.type != kMdia) {
+                        Copy(o, moov, t);
+                    } else {
+                        Wrap(o, kMdia, [&] {
+                            for (const Box& y : Children(moov, t)) {
+                                if (y.type == kMdhd) {
+                                    PutWithDuration(o, moov, y, media);
+                                } else if (y.type != kMinf) {
+                                    Copy(o, moov, y);
+                                } else {
+                                    Wrap(o, kMinf, [&] {
+                                        for (const Box& z : Children(moov, y)) {
+                                            if (z.type != kStbl) {
+                                                Copy(o, moov, z);
+                                                continue;
+                                            }
+                                            Wrap(o, kStbl, [&] {
+                                                for (const Box& s : Children(moov, z)) {
+                                                    if (s.type != Tag("stts")) {
+                                                        Copy(o, moov, s);
+                                                        continue;
+                                                    }
+                                                    Wrap(o, Tag("stts"), [&] {
+                                                        Put32(o, 0);
+                                                        PutRuns(o, dur);
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    });
+    // The moov is normally the last box: in its place. Otherwise the new one goes at the end and the old one is freed.
+    const bool last = mt == &top.back();
+    if (last ? !f.Write(mt->pos, o.data(), o.size()) || !f.Truncate(mt->pos + o.size())
+             : !f.Write(end, o.data(), o.size()) || !f.Rename(mt->pos, kFree)) {
+        err = tr(L"파일에 쓸 수 없습니다.");
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
 }  // namespace mp4

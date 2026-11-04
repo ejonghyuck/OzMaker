@@ -85,7 +85,7 @@ struct WebmWriter::Impl {
     bool vpxOpen = false;
     vpx_image_t img{};
     std::vector<uint8_t> i420;
-    int64_t frames = 0;  // video frames given
+    int64_t ticks = 0;  // where the video frames given end, in 1 / fps
     OpusEncoder* opus = nullptr;
     Resampler resampler;
     std::vector<int16_t> pcm;  // 48 kHz stereo waiting for a whole Opus frame
@@ -200,7 +200,7 @@ bool WebmWriter::Open(const std::wstring& path, const Config& cfg, std::wstring&
     vc.g_threads = threads;
     vc.g_lag_in_frames = 16;
     vc.kf_mode = VPX_KF_AUTO;
-    vc.kf_max_dist = cfg.fps * 5;  // seeking stays quick
+    vc.kf_max_dist = cfg.fps * kKeySeconds;  // in frames: variable frame rate also asks for them by time
     if (cfg.bitrate) {
         vc.rc_end_usage = VPX_VBR;
         vc.rc_target_bitrate = std::max(50u, cfg.bitrate / 1000);
@@ -260,15 +260,18 @@ bool WebmWriter::Open(const std::wstring& path, const Config& cfg, std::wstring&
     return true;
 }
 
-bool WebmWriter::AddVideo(const uint8_t* bgra, std::wstring& err) {
+bool WebmWriter::AddVideo(const uint8_t* bgra, std::wstring& err, int ticks, bool key) {
     Impl& m = *impl_;
     const int w = m.c.width, h = m.c.height;
     libyuv::ARGBToI420(bgra, w * 4, m.img.planes[VPX_PLANE_Y], m.img.stride[VPX_PLANE_Y], m.img.planes[VPX_PLANE_U],
                        m.img.stride[VPX_PLANE_U], m.img.planes[VPX_PLANE_V], m.img.stride[VPX_PLANE_V], w, h);
-    if (vpx_codec_encode(&m.vpx, &m.img, m.frames++, 1, 0, VPX_DL_GOOD_QUALITY) != VPX_CODEC_OK) {
+    ticks = std::max(1, ticks);
+    if (vpx_codec_encode(&m.vpx, &m.img, m.ticks, ticks, key ? VPX_EFLAG_FORCE_KF : 0, VPX_DL_GOOD_QUALITY) !=
+        VPX_CODEC_OK) {
         err = tr(L"VP9 인코딩에 실패했습니다.");
         return false;
     }
+    m.ticks += ticks;
     m.Drain();
     if (m.failed) err = tr(L"WebM 파일을 쓸 수 없습니다.");
     return !m.failed;
@@ -300,11 +303,11 @@ bool WebmWriter::Finish(std::wstring& err) {
         if (extra > 0 && !m.audioQ.empty()) m.audioQ.back().discardNs = extra * 1'000'000'000ll / 48000;
     }
     // No picture, until the encoder has given up every frame it held back.
-    while (vpx_codec_encode(&m.vpx, nullptr, m.frames, 1, 0, VPX_DL_GOOD_QUALITY) == VPX_CODEC_OK && m.Drain()) {
+    while (vpx_codec_encode(&m.vpx, nullptr, m.ticks, 1, 0, VPX_DL_GOOD_QUALITY) == VPX_CODEC_OK && m.Drain()) {
     }
     m.WriteAudioUpTo(UINT64_MAX);
     // To the end of the last frame, not its start, which is what the muxer would take.
-    m.segment.set_duration(m.frames * 1e9 / m.c.fps / (double)m.segment.GetSegmentInfo()->timecode_scale());
+    m.segment.set_duration(m.ticks * 1e9 / m.c.fps / (double)m.segment.GetSegmentInfo()->timecode_scale());
     bool ok = !m.failed && m.segment.Finalize();
     m.writer.reset();
     ok = m.f && fclose(m.f) == 0 && ok;
@@ -327,7 +330,7 @@ bool WebmWriter::Open(const std::wstring&, const Config&, std::wstring& err) {
     err = tr(L"WebM 인코더가 이 빌드에 포함되어 있지 않습니다.");
     return false;
 }
-bool WebmWriter::AddVideo(const uint8_t*, std::wstring&) { return false; }
+bool WebmWriter::AddVideo(const uint8_t*, std::wstring&, int, bool) { return false; }
 void WebmWriter::PushAudio(const int16_t*, size_t) {}
 bool WebmWriter::Finish(std::wstring&) { return false; }
 void WebmWriter::Abort() {}

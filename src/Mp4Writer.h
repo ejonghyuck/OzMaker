@@ -1,4 +1,5 @@
 #pragma once
+#include <strmif.h>
 
 // MFStartup once per process.
 void EnsureMediaFoundation();
@@ -11,6 +12,7 @@ struct VideoConfig {
     UINT32 bitrate = 0;          // bits per second
     bool cbr = false;
     int gopFrames = 120;
+    bool vfr = false;            // a frame only when the picture changes (#55): HoldVideo, keyframes by time
     int qualityVsSpeed = 50;     // 0 = fastest, 100 = best
     bool fragmented = false;     // fragmented MP4 while writing, so a crash leaves a file (#24); Finish makes it plain
 };
@@ -44,8 +46,15 @@ public:
 
     // Converts a BGRA frame into a pooled NV12 sample. Don't hold the device lock when calling.
     ComPtr<IMFSample> Convert(ID3D11Texture2D* bgra);
-    // Writes queued audio, then the frame. Call from one thread.
-    bool WriteVideo(IMFSample* sample, int64_t time, int64_t duration);
+    // Writes queued audio, then the frame. Call from one thread. key: ask the encoder to make this frame a keyframe.
+    bool WriteVideo(IMFSample* sample, int64_t time, int64_t duration, bool key = false);
+    // VFR (#55): the frame shows from `time` until the next one, so it goes to the encoder when the next one comes,
+    // or at EndVideo. It is a keyframe when a keyframe interval (gopFrames at fps) has gone by since the last one.
+    bool HoldVideo(ComPtr<IMFSample> sample, int64_t time);
+    // Whether a frame at `time` would be a keyframe: VFR writes one then even when nothing changed.
+    bool KeyDue(int64_t time) const;
+    // Writes the frame HoldVideo holds, lasting until `end`.
+    bool EndVideo(int64_t end);
     // Thread-safe; queued until the next WriteVideo/Finish. Interleaved 16-bit stereo.
     void PushAudio(const int16_t* pcm, size_t frames);
 
@@ -65,6 +74,8 @@ public:
     const std::wstring& Tried() const { return tried_; }
     bool Failed() const { return failed_; }
     int64_t VideoFrames() const { return videoFrames_; }
+    // End of the last frame written (100 ns): the video's length so far.
+    int64_t VideoEnd() const { return videoEnd_; }
 
 private:
     bool TryOpen(const std::wstring& path, bool hardware, bool codecParams, std::wstring& err);
@@ -95,12 +106,19 @@ private:
     ComPtr<IMFDXGIDeviceManager> devManager_;
     ComPtr<IMFVideoSampleAllocatorEx> allocator_;
     ComPtr<IMFSinkWriter> writer_;
+    ComPtr<ICodecAPI> codecApi_;  // the video encoder's, for forced keyframes; null if it has none
     DWORD videoStream_ = MAXDWORD, audioStream_ = MAXDWORD;
     std::wstring encoderName_;
     bool hardwareUsed_ = false;
     bool failed_ = false;
     bool started_ = false;
     int64_t videoFrames_ = 0;
+    int64_t videoEnd_ = 0;
+    std::vector<uint32_t> frameDur_;  // VFR: each frame's length as written (100 ns), for Finish to set in the file
+    ComPtr<IMFSample> held_;  // VFR: the frame waiting for the next one
+    int64_t heldTime_ = 0;
+    bool heldKey_ = false;
+    int64_t lastKey_ = INT64_MIN / 2;
 
     std::mutex audioMtx_;
     std::vector<int16_t> audioQueue_;

@@ -103,6 +103,7 @@ void Settings::Load() {
     vBitrateIdx = ReadInt(ini, L"VideoBitrate", vBitrateIdx, 0, _countof(kVideoBitrateOptions) - 1);
     vBitrateKbps = ReadInt(ini, L"VideoBitrateKbps", vBitrateKbps, kVideoBitrateMinKbps, kVideoBitrateMaxKbps);
     vRateCtrl = ReadInt(ini, L"VideoRateControl", vRateCtrl, 0, 1);
+    vFrameMode = ReadInt(ini, L"VideoFrameRateMode", vFrameMode, 0, 1);
     vKeyIdx = ReadInt(ini, L"VideoKeyframe", vKeyIdx, 0, _countof(kKeyframeOptions) - 1);
     vPresetIdx = ReadInt(ini, L"VideoPreset", vPresetIdx, 0, _countof(kPresetOptions) - 1);
     audio = ReadInt(ini, L"Audio", audio, 0, 1) != 0;
@@ -225,6 +226,7 @@ void Settings::Save() const {
     num(L"VideoBitrate", vBitrateIdx);
     num(L"VideoBitrateKbps", vBitrateKbps);
     num(L"VideoRateControl", vRateCtrl);
+    num(L"VideoFrameRateMode", vFrameMode);
     num(L"VideoKeyframe", vKeyIdx);
     num(L"VideoPreset", vPresetIdx);
     num(L"Audio", audio);

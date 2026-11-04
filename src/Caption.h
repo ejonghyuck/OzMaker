@@ -16,6 +16,10 @@ public:
     bool Make(std::wstring_view text, int pos, int w, int h);  // false (and nothing to lay over) on failure
     bool Empty() const { return px_.empty(); }
     void Blend(uint8_t* bgra) const;  // a w×h frame, rows w*4 bytes apart
+    // For laying it over on the GPU: the w×h picture (rows w*4 bytes apart) and the rows with something in them.
+    const uint8_t* Pixels() const { return px_.data(); }
+    int Top() const { return top_; }
+    int Bottom() const { return bottom_; }
 
 private:
     int w_ = 0, h_ = 0, top_ = 0, bottom_ = 0;  // rows with something in them

@@ -237,6 +237,7 @@ std::vector<std::wstring> Mp4Writer::Recover() {
 
 bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParams, std::wstring& err) {
     writer_.Reset();
+    codecApi_.Reset();
     videoStream_ = audioStream_ = MAXDWORD;
     ComPtr<IMFAttributes> wa;
     HRESULT hr = MFCreateAttributes(&wa, 3);
@@ -269,12 +270,15 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
         SetVideoBasics(vi.Get(), v_);
         vi->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
         ComPtr<IMFAttributes> params;
-        if (codecParams && SUCCEEDED(MFCreateAttributes(&params, 4))) {
+        if (codecParams && SUCCEEDED(MFCreateAttributes(&params, 5))) {
             params->SetUINT32(CODECAPI_AVEncCommonRateControlMode,
                               v_.cbr ? eAVEncCommonRateControlMode_CBR : eAVEncCommonRateControlMode_UnconstrainedVBR);
             params->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, v_.bitrate);
             params->SetUINT32(CODECAPI_AVEncMPVGOPSize, (UINT32)std::max(1, v_.gopFrames));
             params->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, (UINT32)std::clamp(v_.qualityVsSpeed, 0, 100));
+            // Variable frame rate: frames in the order shown, so Finish can set how long each lasts (B-frames would
+            // reorder them; Windows' software encoder uses them).
+            if (v_.vfr) params->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         }
         call = L"SetInputMediaType(video)";
         hr = writer_->SetInputMediaType(videoStream_, vi.Get(), params.Get());
@@ -317,6 +321,7 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             ComPtr<IMFTransform> t;
             if (FAILED(wx->GetTransformForStream(videoStream_, i, &cat, &t))) break;
             if (cat != MFT_CATEGORY_VIDEO_ENCODER) continue;
+            t.As(&codecApi_);
             ComPtr<IMFAttributes> ta;
             if (SUCCEEDED(t->GetAttributes(&ta)) && ta) {
                 wchar_t* s = nullptr;
@@ -342,6 +347,7 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
         err = wcscmp(call, L"BeginWriting") == 0 ? tr(L"동영상 파일을 쓰기 시작할 수 없습니다. (") + Hr(hr) + L")"
                                                  : util::Format(tr(L"%s를 시작할 수 없습니다. ("), stage) + Hr(hr) + L")";
         writer_.Reset();
+        codecApi_.Reset();
         DeleteFileW(path.c_str());
         videoStream_ = audioStream_ = MAXDWORD;
         return false;
@@ -396,17 +402,52 @@ ComPtr<IMFSample> Mp4Writer::Convert(ID3D11Texture2D* bgra) {
     return sample;
 }
 
-bool Mp4Writer::WriteVideo(IMFSample* sample, int64_t time, int64_t duration) {
+bool Mp4Writer::WriteVideo(IMFSample* sample, int64_t time, int64_t duration, bool key) {
     if (!writer_ || failed_) return false;
     if (!WriteAudioQueue()) return false;
     sample->SetSampleTime(time);
     sample->SetSampleDuration(duration);
+    if (key && codecApi_) {
+        // The request goes with the next frame the encoder takes in: first let it take every frame written before
+        // (a moment while recording, where frames come a tick apart at least; an export waits for it here).
+        MF_SINK_WRITER_STATISTICS st{sizeof(st)};
+        for (int i = 0; i < 50 && SUCCEEDED(writer_->GetStatistics(videoStream_, &st)) &&
+                        st.qwNumSamplesEncoded < st.qwNumSamplesReceived;
+             ++i)
+            Sleep(1);
+        VARIANT on;
+        VariantInit(&on);
+        on.vt = VT_UI4;
+        on.ulVal = 1;
+        codecApi_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &on);
+    }
     if (FAILED(writer_->WriteSample(videoStream_, sample))) {
         failed_ = true;
         return false;
     }
     ++videoFrames_;
+    videoEnd_ = time + duration;
+    if (v_.vfr) frameDur_.push_back((uint32_t)std::min<int64_t>(duration, UINT32_MAX));
     return true;
+}
+
+bool Mp4Writer::KeyDue(int64_t time) const {
+    return time - lastKey_ >= (int64_t)std::max(1, v_.gopFrames) * 10'000'000 / std::max(1, v_.fps);
+}
+
+bool Mp4Writer::HoldVideo(ComPtr<IMFSample> sample, int64_t time) {
+    if (!EndVideo(time)) return false;
+    held_ = std::move(sample);
+    heldTime_ = time;
+    heldKey_ = KeyDue(time);
+    if (heldKey_) lastKey_ = time;
+    return true;
+}
+
+bool Mp4Writer::EndVideo(int64_t end) {
+    if (!held_) return true;
+    ComPtr<IMFSample> s = std::move(held_);
+    return WriteVideo(s.Get(), heldTime_, std::max<int64_t>(1, end - heldTime_), heldKey_);
 }
 
 void Mp4Writer::PushAudio(const int16_t* pcm, size_t frames) {
@@ -457,6 +498,7 @@ bool Mp4Writer::Finish(std::wstring& err) {
         return false;
     }
     // After a write error the samples written before it are still good: finalize the file with those.
+    if (held_) EndVideo(heldTime_ + 10'000'000 / std::max(1, v_.fps));
     if (!failed_) WriteAudioQueue();
     HRESULT hr = videoFrames_ > 0 ? writer_->Finalize() : E_FAIL;
     if (FAILED(hr)) {
@@ -466,11 +508,17 @@ bool Mp4Writer::Finish(std::wstring& err) {
         return false;
     }
     Close();
+    bool plain = true;
     if (v_.fragmented) {
         std::wstring why;
-        if (!mp4::Unfragment(path_, why))
+        plain = mp4::Unfragment(path_, why);
+        if (!plain)
             notice_ = tr(L"동영상을 일반 MP4로 바꾸지 못했습니다(") + why + tr(L"). 대부분의 플레이어에서는 그대로 재생됩니다.");
     }
+    // Variable frame rate (#55): each frame as long as it was meant to be. Some encoders time such frames their own
+    // way (Windows' software H.264 encoder shows each one late by its own length).
+    std::wstring why;
+    if (v_.vfr && plain) mp4::SetVideoTiming(path_, frameDur_, why);
     Unmark();
     return true;
 }
@@ -483,7 +531,9 @@ void Mp4Writer::Abort() {
 }
 
 void Mp4Writer::Close() {
+    held_.Reset();
     writer_.Reset();
+    codecApi_.Reset();
     outViews_.clear();
     tex_.clear();
     inView_.Reset();
