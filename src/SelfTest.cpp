@@ -1236,6 +1236,16 @@ int App::RunSelfTest(const std::wstring& dir) {
         if (!Mp4Writer::FindEncoder(false, true).empty()) failures += ReplayRingCheck(dir, true, log);
         failures += ReplayRingCheck(dir, false, log);
     }
+    // Desktop duplication (#20) leaves the cursor out: it is drawn through GDI, the arrow and the inverting text
+    // cursor. Without a GDI-compatible texture no cursor is drawn (the recording goes on), so that only skips.
+    {
+        std::wstring detail;
+        const bool ok = Capture::CursorDrawCheck(detail);
+        const bool skip = !ok && (detail == L"no device" || detail == L"no GDI-compatible texture");
+        log(util::Format(L"cursor drawn for desktop duplication: %s %s", ok ? L"ok" : skip ? L"skipped" : L"FAIL",
+                         detail.c_str()));
+        if (!ok && !skip) ++failures;
+    }
     // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
     // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
     // without grain (PSNR). Read back with DecodeGif.
@@ -4363,13 +4373,17 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
                          v.processAudio ? L"window only" : L"system"));
     }
     o.clickFx = click;
+    // dda | wgc (anywhere after the mode): how a monitor is taken, desktop duplication or Windows.Graphics.Capture.
+    if (std::find(a.begin() + std::min<size_t>(a.size(), 7), a.end(), L"dda") != a.end()) o.screenVia = 1;
+    if (std::find(a.begin() + std::min<size_t>(a.size(), 7), a.end(), L"wgc") != a.end()) o.screenVia = 2;
     std::wstring err;
     double t0 = util::NowSeconds();
     if (!capture_.Start(o, nullptr, 0, err)) {
         log(L"FAIL: " + err);
         return 1;
     }
-    log(util::Format(L"start took %.0f ms", (util::NowSeconds() - t0) * 1000));
+    log(util::Format(L"start took %.0f ms, %s", (util::NowSeconds() - t0) * 1000,
+                     capture_.Duplicating() ? L"desktop duplication" : L"Windows.Graphics.Capture"));
     double begin = util::NowSeconds(), end = begin + seconds, clickAt = -1;
     int phase = 0;
     while (util::NowSeconds() < end) {
@@ -5436,6 +5450,135 @@ int App::RunEncoderTest(const std::wstring& dir) {
     return failures ? 2 : 0;
 }
 
+// Desktop duplication (#20: no yellow border on Windows 10), as a region over a topmost window of ours, so nothing
+// else is on it: kept as a clip and as an MP4, each must show the window's blocks of colour where they are, and the
+// square that blinks in its corner (the screen's changes come through).
+static int DuplicationCheck(HINSTANCE inst, const std::wstring& dir, Log& log) {
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = PatternProc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"OzMakerTestPattern";
+    RegisterClassExW(&wc);
+    g_patternPlain = false;
+    g_patternBlinks = 0;
+    HWND win = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, wc.lpszClassName,
+                               L"OzMaker Test Window", WS_POPUP, 40, 40, 480, 272, nullptr, nullptr, inst, nullptr);
+    if (!win) {
+        log(L"FAIL desktop duplication: no test window");
+        return 1;
+    }
+    ShowWindow(win, SW_SHOWNOACTIVATE);
+    SetTimer(win, 1, 300, nullptr);
+    // A white window over the second block, kept out of captures like the REC pill and the save notice: it must not
+    // show in what duplication takes either.
+    WNDCLASSEXW cc{sizeof(cc)};
+    cc.lpfnWndProc = DefWindowProcW;
+    cc.hInstance = inst;
+    cc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    cc.lpszClassName = L"OzMakerTestCover";
+    RegisterClassExW(&cc);
+    HWND cover = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, cc.lpszClassName, L"", WS_POPUP,
+                                 40 + 150, 40 + 48, 60, 40, nullptr, nullptr, inst, nullptr);
+    if (cover) {
+        SetWindowDisplayAffinity(cover, WDA_EXCLUDEFROMCAPTURE);
+        ShowWindow(cover, SW_SHOWNOACTIVATE);
+    }
+    auto pump = [](double seconds) {
+        const double end = util::NowSeconds() + seconds;
+        MSG msg;
+        while (util::NowSeconds() < end) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, 0);
+        }
+    };
+    pump(0.5);
+    RECT r;
+    GetWindowRect(win, &r);
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    // The blocks of colour (BGRA) at their centres, and whether the square in the corner shows.
+    auto blocks = [&](const uint8_t* px, int pw, int ph) {
+        int n = 0;
+        for (int i = 0; i < 8; ++i) {
+            const int x = pw * (2 * (i % 4) + 1) / 8, y = ph * (2 * (i / 4) + 1) / 4;
+            const uint8_t* p = px + ((size_t)y * pw + x) * 4;
+            const COLORREF c = kPatternColors[i];
+            n += std::abs(p[2] - GetRValue(c)) < 40 && std::abs(p[1] - GetGValue(c)) < 40 && std::abs(p[0] - GetBValue(c)) < 40;
+        }
+        return n;
+    };
+    auto square = [](const uint8_t* px, int pw, int ph) {
+        const int x = 28 * pw / 480, y = 28 * ph / 272;
+        const uint8_t* p = px + ((size_t)y * pw + x) * 4;
+        return p[0] > 200 && p[1] > 200 && p[2] > 200;
+    };
+    int failures = 0;
+    for (bool mp4 : {false, true}) {
+        CaptureOptions o;
+        o.source = CaptureSource::Region;
+        o.region = r;
+        o.monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        o.cursor = true;  // drawn only where the pointer is: one block may be under it
+        o.fps = 30;
+        o.screenVia = 1;
+        if (mp4) {
+            VideoOptions v;
+            v.path = dir + L"\\duplication.mp4";
+            v.video.hardware = true;
+            v.video.gopFrames = 60;
+            o.video = v;
+            o.maxEdge = 4096;
+        }
+        Capture cap;
+        std::wstring err;
+        if (!cap.Start(o, nullptr, 0, err)) {
+            log(L"FAIL desktop duplication: " + err);
+            ++failures;
+            continue;
+        }
+        const bool dup = cap.Duplicating();
+        pump(2.2);
+        const size_t frames = cap.Frames();
+        CaptureResult res = cap.Stop();
+        int best = 0, on = 0, off = 0, covered = 0;
+        size_t count = 0;
+        std::wstring got;
+        auto look = [&](const uint8_t* px, int pw, int ph) {
+            best = std::max(best, blocks(px, pw, ph));
+            (square(px, pw, ph) ? on : off)++;
+            const uint8_t* c = px + ((size_t)(68 * ph / 272) * pw + 180 * pw / 480) * 4;
+            covered += cover && std::min({c[0], c[1], c[2]}) > 200;
+        };
+        if (mp4) {
+            std::wstring verr;
+            if (auto vc = res.ok ? VideoClip::Open(res.path, verr) : nullptr) {
+                count = vc->Count();
+                auto rd = vc->NewReader();
+                for (size_t i = 0; i < count; i += 3)
+                    if (const uint8_t* px = rd->Get(i)) look(px, vc->Width(), vc->Height());
+                got = util::Format(L"%.2f s", vc->Seconds());
+            } else {
+                got = res.error + verr;
+            }
+        } else if (res.clip) {
+            count = res.clip->Count();
+            auto rd = res.clip->NewReader();
+            for (size_t i = 0; i < count; ++i)
+                if (const uint8_t* px = rd->Get(i)) look(px, res.clip->Width(), res.clip->Height());
+            got = util::Format(L"%dx%d", res.clip->Width(), res.clip->Height());
+        }
+        const bool ok = dup && count >= 3 && best >= 7 && on > 0 && off > 0 && covered == 0;
+        if (!ok) ++failures;
+        log(util::Format(L"%s desktop duplication (%s): %s, %zu frames (%zu taken) %s, blocks %d/8, square on %d off %d, "
+                         L"excluded window seen in %d",
+                         ok ? L"ok  " : L"FAIL", mp4 ? L"MP4" : L"clip", dup ? L"duplicated" : L"not duplicated", count,
+                         frames, got.c_str(), best, on, off, covered));
+    }
+    if (cover) DestroyWindow(cover);
+    DestroyWindow(win);
+    return failures;
+}
+
 int App::RunReplayTest(const std::wstring& dir) {
     testWindowsOnly_ = true;
     util::EnsureDir(dir);
@@ -5443,6 +5586,7 @@ int App::RunReplayTest(const std::wstring& dir) {
     int failures = 0;
     if (!Mp4Writer::FindEncoder(false, true).empty()) failures += ReplayRingCheck(dir, true, log);
     failures += ReplayRingCheck(dir, false, log);
+    failures += DuplicationCheck(inst_, dir, log);
 
     // The whole of it in the app: replay on for a program (the test window, in a process of its own: other windows
     // are left out), what it holds saved as the save key does, and again what is left once the program closed.
@@ -5477,6 +5621,10 @@ int App::RunReplayTest(const std::wstring& dir) {
         pump(8, [&] { return rpCap_.Running(); });
         check(rpCap_.Running() && ReplayState() == RpState::Holding && rpHeld_.name == settings_.rpTargets[0].name,
               L"replay app: holds the program once its window opens");
+        // Excluded from capture, the open window was drawn shifted and flickering: replay leaves it as it is.
+        DWORD affinity = WDA_MONITOR;
+        check(GetWindowDisplayAffinity(hwnd_, &affinity) && affinity == WDA_NONE,
+              L"replay app: the app window isn't excluded from capture while holding");
         pump(3.5, nullptr);
         ReplaySave();
         pump(8, [&] { return !rpSaving_; });

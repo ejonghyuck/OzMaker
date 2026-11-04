@@ -363,16 +363,12 @@ bool App::ReplayStart(const RpHeld& t, std::wstring& err) {
     rpClosed_ = {};  // the new stream takes the ring
     if (!rpCap_.Start(o, hwnd_, WM_APP_REPLAY_CLOSED, err)) return false;
     rpConfig_ = ReplayConfigKey();
-    SyncCaptureLook();
     return true;
 }
 
 void App::ReplayStop(bool keep) {
     const bool was = rpCap_.Running();
-    if (was) {
-        rpCap_.Stop();  // the last fragments go into the ring
-        SyncCaptureLook();
-    }
+    if (was) rpCap_.Stop();  // the last fragments go into the ring
     keep = keep && was && !rpHeld_.path.empty() && rpRing_.Held() >= 10'000'000;  // a second at least
     if (keep) {
         rpClosed_.path = rpHeld_.path;
@@ -400,17 +396,10 @@ void App::ReplayClear() {
     Invalidate();
 }
 
-// This window stays out of what is recorded or held (a monitor held shows it otherwise).
-void App::SyncCaptureLook() {
-    if (hwnd_ && rec_ != RecState::Recording)
-        SetWindowDisplayAffinity(hwnd_, rpCap_.Running() ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
-}
-
 void App::OnReplayClosed(bool failed) {
     if (!rpCap_.Running()) return;
     if (failed) {
         rpCap_.Stop();
-        SyncCaptureLook();
         ClearRing();
         rpPause_ = RpPause::Blocked;
         rpBlocked_ = tr(L"동영상 인코더가 멈췄습니다.");

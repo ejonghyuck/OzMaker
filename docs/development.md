@@ -8,7 +8,7 @@
 
 | 부분 | 구현 |
 |---|---|
-| 캡처 | Windows.Graphics.Capture. 창 캡처(가려져도 녹화), 모니터 캡처, 모니터 캡처 후 영역 크롭. ‘자동’이면 전체화면 게임 창은 모니터 캡처 후 창 영역 크롭 |
+| 캡처 | Windows.Graphics.Capture. 창 캡처(가려져도 녹화), 모니터 캡처, 모니터 캡처 후 영역 크롭. ‘자동’이면 전체화면 게임 창은 모니터 캡처 후 창 영역 크롭. Windows 10은 WGC의 노란 테두리를 끌 수 없어(`IsBorderRequired`가 없음) 모니터 캡처를 DXGI 데스크톱 복제(`DuplicateOutput1`, BGRA)로 함: 바뀔 때마다 `desk_`에 복사하고 프레임 레이트에 맞춰 넘김, 커서는 빠져 있어 GDI 호환 텍스처에 `DrawIconEx`로 그림(반전 커서 포함), 접근을 잃으면(모드 변경 · UAC · 잠금) 다시 엶. 모니터를 다른 GPU가 맡거나 회전된 화면이면 WGC로 |
 | 축소 | GPU에서 밉맵 + 4탭 박스 필터(녹화와 MP4 내보내기. 움짤 · WebM 내보내기는 CPU의 면적 리샘플) |
 | 움짤 임시 저장 | 이전 프레임과 XOR 후 Windows 내장 XPRESS 압축, `%TEMP%\OzMaker`의 임시 파일(키프레임 30장마다)과 디스크에 쓴 프레임을 하나씩 적는 작은 기록(`.idx`). 버리거나 저장하면 둘 다 지우고, 프로세스가 죽어 남은 것은 다음 실행 때 되살림. 1프레임 지연 읽기로 GPU가 멈추지 않음 |
 | 동영상 | 화면이 바뀔 때만 오는 프레임을 1/fps마다 샘플링해 고정 프레임 레이트로 만들고(가변은 아래), GPU 비디오 프로세서로 NV12(BT.709) 변환 → Media Foundation 싱크 라이터(H.264/HEVC 하드웨어 인코더 + AAC) → MP4. 영상이 GPU 메모리를 벗어나지 않음. 녹화하는 동안은 조각(fragmented) MP4로 써서 비정상 종료돼도 다 쓴 조각까지 남고(H.264만. Windows의 조각 MP4 싱크는 HEVC를 받지 않아 HEVC는 일반 MP4로 쓰며, 비정상 종료되면 남지 않음), 멈추면 그 자리에서 일반 MP4로 바꿈(모든 조각의 샘플 테이블을 담은 moov를 끝에 붙이고 조각 상자는 `free`로, 데이터는 옮기지 않음). 쓰는 중인 파일은 `%TEMP%\OzMaker`의 표시 파일이 가리키고, 남은 표시 파일은 다음 실행 때 같은 방법으로 바꿈 |
@@ -70,7 +70,7 @@ OzMaker.exe --selftest <dir>          # 합성 클립으로 저장소 왕복 + �
 OzMaker.exe --screenshot <dir> [light|contrast|en]   # 각 화면을 PNG로 렌더링(창 미리보기 자리는 파란색), 레이어 오류나 이름 없는 단추가 있으면 실패
                                       # light · contrast · en: 라이트 테마 · 대비 테마 · 영어로. en은 영어가 없는 글이 있어도 실패
 OzMaker.exe --readme-media <dir>      # README 그림(hero.gif와 기능 PNG 4장)을 화면 밖에서 그려 저장(아래 참고)
-OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute] [pause] [mic] [click] [vfr]
+OzMaker.exe --record-test <title> <sec> <dir> [fps] [maxEdge] [window|display|monitor|region] [clip|mp4|mp4hevc|mp4sw] [audio|mute] [pause] [mic] [click] [vfr] [dda|wgc]
                                       # mic: 기본 마이크를 섞어 녹음(방 소리가 녹음되므로 직접 실행할 때만)
                                       # click: 가짜 클릭 하나를 넣고 프레임에 클릭 강조가 보이는지 확인
                                       # vfr: 가변 프레임 레이트로 녹화하고 프레임 수 · 가장 긴 프레임 · 키프레임 간격 · 길이 확인
@@ -90,7 +90,7 @@ OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 
 테스트 명령은 Windows 설정과 관계없이 한국어 · 다크 테마로 그립니다(CI는 영어 Windows에서 돌아감). `--selftest`는 세 테마의 글씨 · 바탕 대비(4.5:1 이상)와 영어 표의 서식 필드도 검사합니다. 화면의 글을 바꾸면 `src/Lang.cpp`의 영어도 고치고 `--screenshot <dir> en`으로 확인하세요.
 
-`--selftest`는 순간 리플레이의 링 버퍼 자르기와 리플레이 설정의 저장 · 읽기도 봅니다(앱 전체 흐름은 `--replay-test`). `--selftest`는 MP4 내보내기의 GPU 크기 조절을 CPU 결과와 비교하고(같은 크기는 ±1, 줄이면 PSNR 38 dB 이상, 1920×1080 → 1280×720 한 장의 시간도 기록), 가변 프레임 레이트로 쓴 MP4 · WebM을 다시 읽어 프레임 시각과 키프레임을 봅니다. 0.6.4까지의 설정(최대 녹화 길이 → 녹화 타이머, H.264 → 코덱 자동)을 읽는 것, 설정 초기화가 남기는 것과 되돌리는 것, 코덱 자동이 고르는 코덱과 크기(가짜 인코더로)도 봅니다. 단축키 가져오기는 메시지 전용 창이 등록한 F23을 `SendInput`으로 눌러, 후크가 없을 때는 그 창이, 후크가 있을 때는 OzMaker만 받는지 확인합니다. 키 입력이 닿지 않는 데스크톱(잠긴 화면 등)에서는 건너뜁니다.
+`--selftest`는 순간 리플레이의 링 버퍼 자르기와 리플레이 설정의 저장 · 읽기, 데스크톱 복제용 커서 그리기(화살표와 반전되는 글자 커서)도 봅니다(앱 전체 흐름과 데스크톱 복제는 `--replay-test`: 맨 위에 띄운 테스트 창 영역을 클립과 MP4로 담아 색 블록 · 깜박이는 네모 · 캡처에서 뺀 창이 안 보이는지 확인). `--selftest`는 MP4 내보내기의 GPU 크기 조절을 CPU 결과와 비교하고(같은 크기는 ±1, 줄이면 PSNR 38 dB 이상, 1920×1080 → 1280×720 한 장의 시간도 기록), 가변 프레임 레이트로 쓴 MP4 · WebM을 다시 읽어 프레임 시각과 키프레임을 봅니다. 0.6.4까지의 설정(최대 녹화 길이 → 녹화 타이머, H.264 → 코덱 자동)을 읽는 것, 설정 초기화가 남기는 것과 되돌리는 것, 코덱 자동이 고르는 코덱과 크기(가짜 인코더로)도 봅니다. 단축키 가져오기는 메시지 전용 창이 등록한 F23을 `SendInput`으로 눌러, 후크가 없을 때는 그 창이, 후크가 있을 때는 OzMaker만 받는지 확인합니다. 키 입력이 닿지 않는 데스크톱(잠긴 화면 등)에서는 건너뜁니다.
 
 환경 변수 `OZMAKER_SETTINGS`에 경로를 주면 `%APPDATA%\OzMaker\settings.ini`(포터블이면 exe 옆의 `settings.ini`) 대신 그 파일을 씁니다(테스트용). `OZMAKER_UPDATE_URL`은 업데이트를 확인할 곳(주소 또는 폴더)을 바꿉니다.
 

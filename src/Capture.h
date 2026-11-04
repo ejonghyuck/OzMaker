@@ -33,6 +33,9 @@ struct CaptureOptions {
     int maxEdge = 0;             // 0 = original size, else longest edge limit in pixels
     int boxLong = 0, boxShort = 0;  // fit inside this box in either orientation (video presets); 0 = no limit
     std::optional<VideoOptions> video;
+    // How a monitor (Monitor, Region, monitorMode) is taken: 0 = desktop duplication where Windows.Graphics.Capture
+    // can't drop its yellow border (Windows 10), 1 = duplication wherever it works, 2 = Windows.Graphics.Capture.
+    int screenVia = 0;
 };
 
 struct CaptureResult {
@@ -72,9 +75,34 @@ public:
     size_t ClickFrames() const { return clickFrames_; }  // clip frames added for highlights (tests)
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
+    bool Duplicating() const { return dupThread_.joinable(); }  // the monitor comes through desktop duplication
+    // Tests: the cursor drawn the way duplication draws it, over grey; detail says what was found.
+    static bool CursorDrawCheck(std::wstring& detail);
 
 private:
     void OnFrame(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& pool);
+    // Under mtx_: whether a picture captured at qpc is taken (accept), or only kept under a click highlight (base);
+    // ts is its time on the recording's clock. Take hands a picture of the source (cw × ch) on to Process.
+    void Admit(int64_t qpc, int64_t& ts, bool& accept, bool& base);
+    void Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept);
+
+    // Desktop duplication (#20): Windows 10 draws a yellow border around what Windows.Graphics.Capture takes, and
+    // has no way to turn it off. Duplication has none. dupThread_ copies the screen into desk_ whenever it changes
+    // and hands it on at the frame rate, with the cursor drawn on by GDI (duplication leaves it out).
+    bool Duplicate();  // (re)opens dup_ on the monitor; false while it can't be duplicated
+    void DupLoop();
+    bool PushDesktop(int64_t& retryIn);  // false: too soon, again in retryIn (100 ns)
+    ID3D11Texture2D* WithCursor();       // under the device lock: desk_, or deskCur_ with the cursor drawn on it
+    HMONITOR dupMonitor_ = nullptr;
+    ComPtr<IDXGIOutputDuplication> dup_;
+    ComPtr<ID3D11Texture2D> desk_, deskCur_;
+    int deskW_ = 0, deskH_ = 0;
+    bool haveDesk_ = false;
+    HCURSOR cursor_ = nullptr;  // the last cursor drawn, its hotspot and size
+    POINT hotspot_{};
+    SIZE cursorSize_{};
+    std::thread dupThread_;
+    HANDLE dupStop_ = nullptr;
     bool SourceRect(int contentW, int contentH, RECT& r) const;
     void CoveredRects(const RECT& sr, std::vector<RECT>& out) const;
     bool Setup(int srcW, int srcH);

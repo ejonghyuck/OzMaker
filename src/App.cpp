@@ -555,8 +555,9 @@ void App::MinimizeMain() {
 
 void App::SetRecordingLook(bool on) {
     if (!hwnd_) return;
-    // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later).
-    SetWindowDisplayAffinity(hwnd_, on || rpCap_.Running() ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later). Not for
+    // replay, which runs while the window is open: excluded, the open window was drawn shifted and flickering.
+    SetWindowDisplayAffinity(hwnd_, on ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
     if (!taskbar_ &&
         SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&taskbar_))) &&
         FAILED(taskbar_->HrInit()))

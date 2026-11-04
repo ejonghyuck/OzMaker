@@ -321,7 +321,6 @@ private:
     void ReplayStop(bool keep);  // keep: what was held stays to be saved (the program closed)
     void ClearRing();
     void ReplayClear();  // the PC locked or went to sleep: nothing of what went by stays
-    void SyncCaptureLook();
     void OnReplayClosed(bool failed);
     void NoticePlace(RECT& rect, bool& full, bool& grabbed, bool& exclusive) const;
     void ReplaySave();  // the save key, 지금 저장, the tray menu
