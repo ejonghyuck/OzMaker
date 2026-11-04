@@ -7,6 +7,9 @@
 #include "ScalePS.h"
 #include "ScaleVS.h"
 
+#include <future>
+#include <winrt/Windows.Security.Authorization.AppCapabilityAccess.h>
+
 namespace wgc = winrt::Windows::Graphics::Capture;
 namespace wgdx = winrt::Windows::Graphics::DirectX;
 using winrt::Windows::Foundation::Metadata::ApiInformation;
@@ -32,7 +35,47 @@ bool OwnWindowAt(POINT pt) {
     if (h) GetWindowThreadProcessId(h, &pid);
     return pid == GetCurrentProcessId();
 }
+
+bool BorderToggle() {
+    try {
+        return ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
+                                                 L"IsBorderRequired");
+    } catch (...) {
+        return false;
+    }
+}
+
+std::once_flag g_borderOnce;
+std::shared_future<int> g_border;
 }  // namespace
+
+void Capture::RequestBorderless() {
+    std::call_once(g_borderOnce, [] {
+        std::promise<int> answer;
+        g_border = answer.get_future().share();
+        if (!BorderToggle()) {
+            answer.set_value(-2);
+            return;
+        }
+        std::thread([answer = std::move(answer)]() mutable {
+            int status = -1;
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                status = (int)wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless)
+                             .get();
+                winrt::uninit_apartment();
+            } catch (...) {
+            }
+            answer.set_value(status);
+        }).detach();
+    });
+}
+
+int Capture::BorderlessAccess(int waitMs) {
+    RequestBorderless();
+    if (g_border.wait_for(std::chrono::milliseconds(waitMs)) != std::future_status::ready) return -1;
+    return g_border.get();
+}
 
 Capture::~Capture() {
     if (running_) Stop();
@@ -93,8 +136,10 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             mon = opt.monitor;
         else if (opt.source == CaptureSource::Region)
             mon = opt.monitor ? opt.monitor : MonitorFromRect(&opt.region, MONITOR_DEFAULTTONEAREST);
-        const bool borderless = ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
-                                                                  L"IsBorderRequired");
+        // Windows 11 turns the border off only once the request was allowed; until then monitors go through
+        // duplication, as on Windows 10. The answer is usually in by now (asked at startup).
+        const bool toggle = BorderToggle();
+        const bool borderless = toggle && BorderlessAccess(500) == 4;  // AppCapabilityAccessStatus::Allowed
         bool duplicate = false;
         if (mon) {
             MONITORINFO mi{sizeof(mi)};
@@ -119,7 +164,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             if (ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
                                                   L"IsCursorCaptureEnabled"))
                 session_.IsCursorCaptureEnabled(opt.cursor);
-            if (borderless) {
+            if (toggle) {
                 try {
                     session_.IsBorderRequired(false);
                 } catch (...) {
@@ -349,6 +394,9 @@ bool Capture::Setup(int sw, int sh) {
     if (FAILED(dev_->CreateTexture2D(&td, nullptr, &out_)) ||
         FAILED(dev_->CreateRenderTargetView(out_.Get(), nullptr, &outRtv_)))
         return false;
+    haveClean_ = false;
+    clean_.Reset();
+    if (opt_.monitorMode && FAILED(dev_->CreateTexture2D(&td, nullptr, &clean_))) clean_.Reset();  // black then
     diffReady_ = diffPending_ = false;
     if (opt_.video && opt_.video->video.vfr) {
         // What the comparison needs. Without it every picture that may have changed counts as changed.
@@ -409,6 +457,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     const bool video = opt_.video.has_value();
     const bool same = sw - outW_ >= 0 && sw - outW_ <= 1 && sh - outH_ >= 0 && sh - outH_ <= 1;
     const bool mask = !covered.empty() && ctx1_;
+    const bool keep = clean_ != nullptr;  // out_ is also kept in clean_, so the picture always goes through it
     DeviceLock lock(mt_.Get());
 
     // Clip mode copies into the next staging texture (through out_ when it is scaled or masked). Video mode keeps
@@ -421,7 +470,8 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     if (same) {
         // Same size (an odd edge is trimmed by one pixel): plain copy, no resampling.
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)(sr.left + outW_), (UINT)(sr.top + outH_), 1};
-        ctx_->CopySubresourceRegion(video || mask || opt_.clickFx ? out_.Get() : staging, 0, 0, 0, 0, tex, 0, &box);
+        ctx_->CopySubresourceRegion(video || mask || keep || opt_.clickFx ? out_.Get() : staging, 0, 0, 0, 0, tex, 0,
+                                    &box);
     } else {
         float f = std::min((float)outW_ / sw, (float)outH_ / sh);
         int dw = std::clamp((int)std::lround(sw * f), 1, outW_);
@@ -492,7 +542,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         fxShown_ = DrawClicks(qpc);
         if (fxShown_) from = fx_.Get();
     }
-    if (!same || mask || opt_.clickFx) ctx_->CopyResource(staging, from);
+    if (!same || mask || keep || opt_.clickFx) ctx_->CopyResource(staging, from);
     pending_.push_back({ring_, ts});
     ring_ = (ring_ + 1) % kRing;
     // Read back with one frame of latency so Map() doesn't stall on the copy just issued.
@@ -529,9 +579,19 @@ void Capture::FinishFrame() {
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
         ++scaled_;
     }
-    if (!f.mask.empty()) {
+    if (!f.mask.empty() && haveClean_) {
+        // Another window over the game while it isn't in front (Alt+Tab): never in the recording, and not black
+        // either: the game as it was last seen with nothing over it.
+        for (const D3D11_RECT& r : f.mask) {
+            D3D11_BOX box{(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1};
+            ctx_->CopySubresourceRegion(out_.Get(), 0, r.left, r.top, 0, clean_.Get(), 0, &box);
+        }
+    } else if (!f.mask.empty()) {
         const float black[4] = {0, 0, 0, 1};
         ctx1_->ClearView(outRtv_.Get(), black, f.mask.data(), (UINT)f.mask.size());
+    } else if (clean_) {
+        ctx_->CopyResource(clean_.Get(), out_.Get());
+        haveClean_ = true;
     }
 }
 
@@ -1244,6 +1304,8 @@ void Capture::ReleaseGpu() {
     pending_.clear();
     out_.Reset();
     outRtv_.Reset();
+    clean_.Reset();
+    haveClean_ = false;
     mip_.Reset();
     mipSrv_.Reset();
     mipW_ = mipH_ = mipLevels_ = 0;

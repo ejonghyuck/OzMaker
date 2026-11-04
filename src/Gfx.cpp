@@ -58,11 +58,19 @@ bool Gfx::CreateSwapChain() {
     sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 2;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Scaling = DXGI_SCALING_NONE;
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    if (FAILED(factory->CreateSwapChainForHwnd(d3d_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_))) return false;
+    // Copied into the window (bit-block transfer) rather than flipped: while the window is kept out of a screen
+    // recording (WDA_EXCLUDEFROMCAPTURE), Windows 10 drew the flipped picture shifted up and left, with white strips
+    // right and below, and flickering. Copied in, it is composed like any other window. Flip only where that fails.
+    sd.BufferCount = 1;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.Scaling = DXGI_SCALING_STRETCH;
+    if (FAILED(factory->CreateSwapChainForHwnd(d3d_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_))) {
+        sd.BufferCount = 2;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.Scaling = DXGI_SCALING_NONE;
+        if (FAILED(factory->CreateSwapChainForHwnd(d3d_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_))) return false;
+    }
     factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
     return CreateTarget();
 }

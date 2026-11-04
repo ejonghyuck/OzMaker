@@ -58,6 +58,12 @@ public:
     ~Capture();
 
     static bool IsSupported();
+    // Windows 11 leaves the yellow border off only for an app that asked first; turning it off alone is ignored.
+    // RequestBorderless asks once, on a thread of its own (the answer is awaited, which the window's thread must not
+    // do). BorderlessAccess waits up to waitMs for the answer: an AppCapabilityAccessStatus (4 = allowed), -1 without
+    // one, -2 where the border can't be turned off at all (Windows 10).
+    static void RequestBorderless();
+    static int BorderlessAccess(int waitMs);
     // closedMsg is posted when the source goes away (wParam 0) or the video encoder fails (wParam 1).
     bool Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err);
     CaptureResult Stop();
@@ -87,7 +93,7 @@ private:
     void Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept);
 
     // Desktop duplication (#20): Windows 10 draws a yellow border around what Windows.Graphics.Capture takes, and
-    // has no way to turn it off. Duplication has none. dupThread_ copies the screen into desk_ whenever it changes
+    // has no way to turn it off (nor has Windows 11 when the request wasn't allowed). Duplication has none. dupThread_ copies the screen into desk_ whenever it changes
     // and hands it on at the frame rate, with the cursor drawn on by GDI (duplication leaves it out).
     bool Duplicate();  // (re)opens dup_ on the monitor; false while it can't be duplicated
     void DupLoop();
@@ -190,6 +196,10 @@ private:
         std::vector<D3D11_RECT> mask;
     } finish_;
     bool finishDue_ = false;
+    // monitorMode: the last picture with nothing over the window. What covers it while it isn't in front is filled
+    // from here instead of black (black only until there was such a picture).
+    ComPtr<ID3D11Texture2D> clean_;
+    bool haveClean_ = false;
     uint64_t shots_ = 0;  // video mode: frames Process took (under the device lock)
     // Variable frame rate (#55). Windows hands over frames of a window that hasn't changed too, so the ticker takes
     // the picture (Snapshot, into cand_) and compares it on the GPU with the last frame written (prev_): blocks with

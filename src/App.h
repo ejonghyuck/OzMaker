@@ -395,7 +395,7 @@ private:
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
-    int RunTestWindow(double seconds, bool capture);
+    int RunTestWindow(double seconds, bool capture, const RECT* cover = nullptr);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     int RunReadmeMedia(const std::wstring& dir);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);
@@ -438,6 +438,7 @@ private:
     RecState rec_ = RecState::Idle;
     RecTarget recTarget_;
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
+    bool recScreen_ = false;  // the recording takes the screen (a monitor, a region, a fullscreen game through it)
     std::wstring recNotice_;
     std::wstring stopReason_;  // why the recording stopped by itself (length limit, disk space), shown after it
     bool recPaused_ = false;

@@ -10,6 +10,7 @@
 //   --region-test <dir>                   the region picker's adjust mode, driven with synthetic input
 //   --preview-test <dir>                  the live window preview on screen, with the files list open over it;
 //                                         the window list following another process's window
+//   --test-window <sec> cover <x> <y> <w> <h>  a plain white window over others there, never in front (--replay-test)
 //   --test-window <sec> [capture]         a pattern window in a process of its own (for --preview-test); capture:
 //                                         grey, one Windows lets --record-test take, a white square blinking every 1.5 s
 //   --update-test <dir> [url|github]      the updater on a fake release folder (also part of --selftest); url: the
@@ -237,8 +238,25 @@ LRESULT CALLBACK PatternProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-// Pixels on screen (BGRX), for checking what DWM composited. Only ever our own window's area.
+// Whether only our own windows show over r (sampled densely). Another program in front, a game for one, must never be
+// grabbed: the test window being topmost doesn't keep a fullscreen game below it.
+bool OnlyOursOver(const RECT& r, DWORD alsoPid = 0) {
+    const DWORD self = GetCurrentProcessId();
+    for (int gy = 0; gy <= 16; ++gy)
+        for (int gx = 0; gx <= 16; ++gx) {
+            POINT pt{r.left + (r.right - 1 - r.left) * gx / 16, r.top + (r.bottom - 1 - r.top) * gy / 16};
+            HWND h = WindowFromPoint(pt);
+            DWORD pid = 0;
+            if (h) GetWindowThreadProcessId(h, &pid);
+            if (pid != self && (!alsoPid || pid != alsoPid)) return false;
+        }
+    return true;
+}
+
+// Pixels on screen (BGRX), for checking what DWM composited. Only ever our own window's area, and nothing when
+// another program's window is over it (before or after the grab): empty then.
 std::vector<uint32_t> GrabScreen(const RECT& r) {
+    if (!OnlyOursOver(r)) return {};
     int w = r.right - r.left, h = r.bottom - r.top;
     std::vector<uint32_t> px((size_t)w * h);
     HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
@@ -257,6 +275,7 @@ std::vector<uint32_t> GrabScreen(const RECT& r) {
     DeleteObject(bmp);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+    if (!OnlyOursOver(r)) return {};
     return px;
 }
 
@@ -1245,6 +1264,18 @@ int App::RunSelfTest(const std::wstring& dir) {
         log(util::Format(L"cursor drawn for desktop duplication: %s %s", ok ? L"ok" : skip ? L"skipped" : L"FAIL",
                          detail.c_str()));
         if (!ok && !skip) ++failures;
+    }
+    // Windows 11 leaves the yellow border off only for an app that asked (GraphicsCaptureAccess). The answer must
+    // come; if it isn't "allowed", monitor captures go through desktop duplication as on Windows 10.
+    {
+        const int s = Capture::BorderlessAccess(5000);
+        if (s == -2) {
+            log(L"borderless capture: skipped (Windows 10: the border can't be turned off)");
+        } else {
+            log(util::Format(L"borderless capture: %s (status %d%s)", s >= 0 ? L"ok" : L"FAIL, no answer in 5 s", s,
+                             s == 4 ? L", allowed" : L", not allowed: monitors go through duplication"));
+            if (s < 0) ++failures;
+        }
     }
     // GIF from grainy video (#23), light grain (±3) and heavier (±6): the size at each lossy level, how much of the
     // still background changes from frame to frame (the shimmer), and how close the frames stay to the picture
@@ -5531,6 +5562,11 @@ static int DuplicationCheck(HINSTANCE inst, const std::wstring& dir, Log& log) {
         }
         Capture cap;
         std::wstring err;
+        if (!OnlyOursOver(r)) {
+            log(L"FAIL desktop duplication: another program's window is over the test window, nothing taken");
+            ++failures;
+            break;
+        }
         if (!cap.Start(o, nullptr, 0, err)) {
             log(L"FAIL desktop duplication: " + err);
             ++failures;
@@ -5540,6 +5576,13 @@ static int DuplicationCheck(HINSTANCE inst, const std::wstring& dir, Log& log) {
         pump(2.2);
         const size_t frames = cap.Frames();
         CaptureResult res = cap.Stop();
+        if (!OnlyOursOver(r)) {
+            // It may have been in what was taken: nothing of it is looked at or kept.
+            if (res.video) DeleteFileW(res.path.c_str());
+            log(L"FAIL desktop duplication: another program's window came over the test window, what was taken is gone");
+            ++failures;
+            break;
+        }
         int best = 0, on = 0, off = 0, covered = 0;
         size_t count = 0;
         std::wstring got;
@@ -5579,11 +5622,243 @@ static int DuplicationCheck(HINSTANCE inst, const std::wstring& dir, Log& log) {
     return failures;
 }
 
+// Window capture of a window of ours that another window of ours covers in part while it isn't in front (Alt+Tab
+// out of a game): the covered part must come out as the window drew it, never black. Once drawn with GDI, once
+// through a flip-model swap chain like a game's (redrawn every frame). (Tried once at the size of the whole monitor
+// too, the same: left out, it hides the screen.)
+static int CoveredCaptureCheck(HINSTANCE inst, Log& log) {
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = PatternProc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"OzMakerTestPattern";
+    RegisterClassExW(&wc);
+    WNDCLASSEXW fc{sizeof(fc)};
+    fc.lpfnWndProc = DefWindowProcW;
+    fc.hInstance = inst;
+    fc.lpszClassName = L"OzMakerTestFlip";
+    RegisterClassExW(&fc);
+    WNDCLASSEXW cc{sizeof(cc)};
+    cc.lpfnWndProc = DefWindowProcW;
+    cc.hInstance = inst;
+    cc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    cc.lpszClassName = L"OzMakerTestCover";
+    RegisterClassExW(&cc);
+    g_patternPlain = false;
+    int failures = 0;
+    for (bool flip : {false, true}) {
+        const RECT wr{60, 60, 60 + 480, 60 + 272};
+        const int W = wr.right - wr.left, H = wr.bottom - wr.top;
+        // Windows won't capture a window that can't be activated: an ordinary one, shown without taking the focus.
+        HWND win = CreateWindowExW(0, flip ? fc.lpszClassName : wc.lpszClassName, L"OzMaker Test Window", WS_POPUP,
+                                   wr.left, wr.top, W, H, nullptr, nullptr, inst, nullptr);
+        ShowWindow(win, SW_SHOWNOACTIVATE);
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        ComPtr<ID3D11DeviceContext1> ctx1;
+        ComPtr<IDXGISwapChain1> swap;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (flip) {
+            D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                              D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+            ComPtr<IDXGIDevice> dxgi;
+            ComPtr<IDXGIAdapter> ad;
+            ComPtr<IDXGIFactory2> factory;
+            if (dev && SUCCEEDED(dev.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&ad)) &&
+                SUCCEEDED(ad->GetParent(IID_PPV_ARGS(&factory)))) {
+                DXGI_SWAP_CHAIN_DESC1 sd{};
+                sd.Width = W;
+                sd.Height = H;
+                sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                sd.SampleDesc.Count = 1;
+                sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                sd.BufferCount = 2;
+                sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+                factory->CreateSwapChainForHwnd(dev.Get(), win, &sd, nullptr, nullptr, &swap);
+                ctx.As(&ctx1);
+            }
+        }
+        // The game's frame: the eight blocks, drawn again each time like a game draws.
+        auto present = [&] {
+            if (!swap || !ctx1) return;
+            ComPtr<ID3D11Texture2D> back;
+            swap->GetBuffer(0, IID_PPV_ARGS(&back));
+            rtv.Reset();
+            dev->CreateRenderTargetView(back.Get(), nullptr, &rtv);
+            for (int i = 0; i < 8; ++i) {
+                const COLORREF c = kPatternColors[i];
+                const float col[4] = {GetRValue(c) / 255.f, GetGValue(c) / 255.f, GetBValue(c) / 255.f, 1.f};
+                const D3D11_RECT r{W * (i % 4) / 4, H * (i / 4) / 2, W * (i % 4 + 1) / 4, H * (i / 4 + 1) / 2};
+                ctx1->ClearView(rtv.Get(), col, &r, 1);
+            }
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            rtv.Reset();
+            swap->Present(1, 0);
+        };
+        auto pump = [&](double seconds) {
+            const double end = util::NowSeconds() + seconds;
+            MSG msg;
+            while (util::NowSeconds() < end) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+                present();
+                if (!swap) MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, 0);
+            }
+        };
+        pump(0.4);
+        // Over the second block, in front of the window (which isn't in front itself: it never takes the focus).
+        HWND cover = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, cc.lpszClassName, L"", WS_POPUP,
+                                     wr.left + W * 3 / 8 - 45, wr.top + H / 4 - 35, 90, 70, nullptr, nullptr, inst, nullptr);
+        ShowWindow(cover, SW_SHOWNOACTIVATE);
+        pump(0.3);
+        CaptureOptions o;
+        o.source = CaptureSource::Window;
+        o.target = win;
+        o.clientOnly = true;
+        o.cursor = false;
+        o.fps = 30;
+        Capture cap;
+        std::wstring err;
+        int black = 0, right = 0, white = 0, seen = 0, blocksBest = 0;
+        if (cap.Start(o, nullptr, 0, err)) {
+            pump(1.2);
+            CaptureResult res = cap.Stop();
+            if (res.clip) {
+                auto rd = res.clip->NewReader();
+                const int pw = res.clip->Width(), ph = res.clip->Height();
+                for (size_t i = 0; i < res.clip->Count(); ++i) {
+                    const uint8_t* px = rd->Get(i);
+                    if (!px) continue;
+                    const uint8_t* p = px + ((size_t)(ph / 4) * pw + pw * 3 / 8) * 4;
+                    int nb = 0;
+                    for (int b = 0; b < 8; ++b) {
+                        const uint8_t* q = px + ((size_t)(ph * (2 * (b / 4) + 1) / 4) * pw + pw * (2 * (b % 4) + 1) / 8) * 4;
+                        const COLORREF k = kPatternColors[b];
+                        nb += std::abs(q[2] - GetRValue(k)) < 40 && std::abs(q[1] - GetGValue(k)) < 40 &&
+                              std::abs(q[0] - GetBValue(k)) < 40;
+                    }
+                    blocksBest = std::max(blocksBest, nb);
+                    const COLORREF c = kPatternColors[1];
+                    ++seen;
+                    black += p[0] < 30 && p[1] < 30 && p[2] < 30;
+                    white += p[0] > 220 && p[1] > 220 && p[2] > 220;
+                    right += std::abs(p[2] - GetRValue(c)) < 40 && std::abs(p[1] - GetGValue(c)) < 40 &&
+                             std::abs(p[0] - GetBValue(c)) < 40;
+                }
+            }
+        } else {
+            log(L"FAIL covered window capture: " + err);
+        }
+        const bool ok = seen > 0 && right == seen;
+        if (!ok) ++failures;
+        log(util::Format(L"%s covered window capture (%s): %d frames, under the cover: %d as drawn, %d black, %d white, "
+                         L"blocks %d/8",
+                         ok ? L"ok  " : L"FAIL", flip ? L"flip-model swap chain" : L"GDI", seen, right, black, white,
+                         blocksBest));
+        DestroyWindow(cover);
+        swap.Reset();
+        DestroyWindow(win);
+    }
+
+    // Through the screen (monitorMode, the way a fullscreen game is taken), by desktop duplication and by
+    // Windows.Graphics.Capture: a window of ours over the target while it isn't in front must never show, and its
+    // place is the target as last seen with nothing over it, not black. The target stays topmost, so nothing but the
+    // cover is ever over it.
+    for (int via : {1, 2}) {
+        HWND win = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName, L"OzMaker Test Window", WS_POPUP, 60, 60, 480, 272,
+                                   nullptr, nullptr, inst, nullptr);
+        ShowWindow(win, SW_SHOWNOACTIVATE);
+        auto pump = [](double seconds) {
+            const double end = util::NowSeconds() + seconds;
+            MSG msg;
+            while (util::NowSeconds() < end) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+                MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, 0);
+            }
+        };
+        pump(0.4);
+        CaptureOptions o;
+        o.source = CaptureSource::Window;
+        o.target = win;
+        o.monitorMode = true;
+        o.clientOnly = true;
+        o.cursor = false;
+        o.fps = 30;
+        o.screenVia = via;
+        Capture cap;
+        std::wstring err;
+        RECT tr;
+        GetWindowRect(win, &tr);
+        if (!OnlyOursOver(tr)) {
+            log(L"FAIL covered screen capture: another program's window is over the test window, nothing taken");
+            ++failures;
+            DestroyWindow(win);
+            break;
+        }
+        if (!cap.Start(o, nullptr, 0, err)) {
+            log(L"FAIL covered screen capture: " + err);
+            ++failures;
+            DestroyWindow(win);
+            continue;
+        }
+        const bool dup = cap.Duplicating();
+        pump(0.6);
+        const size_t before = cap.Frames();
+        // The cover is another program's window (one of the target's own process would count as its popup).
+        std::wstring cmd = L"\"" + util::ExePath() + L"\" --test-window 1.6 cover 195 93 90 70";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        const bool spawned = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+        pump(0.5);  // it starts and shows
+        // Changes go on under the cover, so frames keep coming while it is there.
+        const size_t covered = cap.Frames();
+        SetTimer(win, 1, 200, nullptr);
+        pump(0.8);
+        const bool clear = OnlyOursOver(tr, spawned ? pi.dwProcessId : 0);  // only the cover may be another's
+        CaptureResult res = cap.Stop();
+        if (spawned) {
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        if (!clear) {
+            log(L"FAIL covered screen capture: another program's window came over the test window, nothing looked at");
+            ++failures;
+            DestroyWindow(win);
+            break;
+        }
+        int right = 0, black = 0, white = 0, after = 0;
+        if (res.clip) {
+            auto rd = res.clip->NewReader();
+            const int pw = res.clip->Width(), ph = res.clip->Height();
+            for (size_t i = std::min(covered + 2, res.clip->Count()); i < res.clip->Count(); ++i) {
+                const uint8_t* px = rd->Get(i);
+                if (!px) continue;
+                const uint8_t* p = px + ((size_t)(ph / 4) * pw + pw * 3 / 8) * 4;
+                const COLORREF c = kPatternColors[1];
+                ++after;
+                black += p[0] < 30 && p[1] < 30 && p[2] < 30;
+                white += p[0] > 220 && p[1] > 220 && p[2] > 220;
+                right += std::abs(p[2] - GetRValue(c)) < 40 && std::abs(p[1] - GetGValue(c)) < 40 &&
+                         std::abs(p[0] - GetBValue(c)) < 40;
+            }
+        }
+        const bool ok = spawned && after > 0 && right == after;
+        if (!ok) ++failures;
+        log(util::Format(L"%s covered screen capture (%s): %zu frames before the cover, %d after it: under it %d as last "
+                         L"seen, %d black, %d of the cover",
+                         ok ? L"ok  " : L"FAIL", dup ? L"desktop duplication" : L"Windows.Graphics.Capture", before, after,
+                         right, black, white));
+        DestroyWindow(win);
+    }
+    return failures;
+}
+
 int App::RunReplayTest(const std::wstring& dir) {
     testWindowsOnly_ = true;
     util::EnsureDir(dir);
     Log log(dir + L"\\replay-test.log");
     int failures = 0;
+    failures += CoveredCaptureCheck(inst_, log);
     if (!Mp4Writer::FindEncoder(false, true).empty()) failures += ReplayRingCheck(dir, true, log);
     failures += ReplayRingCheck(dir, false, log);
     failures += DuplicationCheck(inst_, dir, log);
@@ -6066,7 +6341,30 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
 // The live window preview as DWM shows it. A window of colour blocks is picked and the files list opened over the
 // preview: on screen (our window only, kept on top) the list must show where it is and the window everywhere else,
 // with the title bar hidden and shown, and closing the list must bring back the whole preview.
-int App::RunTestWindow(double seconds, bool capture) {
+int App::RunTestWindow(double seconds, bool capture, const RECT* cover) {
+    if (cover) {
+        // Another program's window over the one --replay-test takes through the screen, the way a browser is over
+        // a game after Alt+Tab: white, topmost, never in front.
+        WNDCLASSEXW cc{sizeof(cc)};
+        cc.lpfnWndProc = DefWindowProcW;
+        cc.hInstance = inst_;
+        cc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        cc.lpszClassName = L"OzMakerTestCover";
+        RegisterClassExW(&cc);
+        HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, cc.lpszClassName, L"", WS_POPUP,
+                                 cover->left, cover->top, cover->right - cover->left, cover->bottom - cover->top, nullptr,
+                                 nullptr, inst_, nullptr);
+        if (!h) return 1;
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+        const double end = util::NowSeconds() + seconds;
+        while (util::NowSeconds() < end) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+            MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, 0);
+        }
+        DestroyWindow(h);
+        return 0;
+    }
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = PatternProc;
     wc.hInstance = inst_;
@@ -6182,6 +6480,13 @@ int App::RunPreviewTest(const std::wstring& dir) {
         Invalidate();
         pump(0.8);
         auto base = GrabScreen(area);
+        if (base.empty()) {
+            check(false, mode + L": another program's window is over the test window, nothing was grabbed");
+            filesOpen_ = false;
+            Invalidate();
+            pump(0.3);
+            break;
+        }
         RECT dest, src;
         PreviewLayout(dest, src);
         const LONG dw = dest.right - dest.left, dh = dest.bottom - dest.top;
@@ -6213,6 +6518,13 @@ int App::RunPreviewTest(const std::wstring& dir) {
         Invalidate();
         pump(0.8);
         auto pop = GrabScreen(area);
+        if (pop.empty()) {
+            check(false, mode + L": another program's window is over the test window, nothing was grabbed");
+            filesOpen_ = false;
+            Invalidate();
+            pump(0.3);
+            break;
+        }
         Rect f = ui_.Floats().empty() ? Rect() : ui_.Floats()[0];  // the list's
         const float s = Scale();
         RECT hole{(LONG)std::floor(f.l * s), (LONG)std::floor(f.t * s), (LONG)std::ceil(f.r * s), (LONG)std::ceil(f.b * s)};
@@ -6250,6 +6562,13 @@ int App::RunPreviewTest(const std::wstring& dir) {
         Invalidate();
         pump(0.8);
         auto after = GrabScreen(area);
+        if (after.empty()) {
+            check(false, mode + L": another program's window is over the test window, nothing was grabbed");
+            filesOpen_ = false;
+            Invalidate();
+            pump(0.3);
+            break;
+        }
         int back = 0, backN = 0;
         for (LONG y = dest.top + 1; y < dest.bottom - 1; y += 3)
             for (LONG x = dest.left + 1; x < dest.right - 1; x += 3) {

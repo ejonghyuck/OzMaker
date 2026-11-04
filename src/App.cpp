@@ -110,6 +110,11 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--replay-test") return RunReplayTest(args[1]);
+    if (args.size() >= 7 && args[0] == L"--test-window" && args[2] == L"cover") {
+        const int x = _wtoi(args[3].c_str()), y = _wtoi(args[4].c_str());
+        const RECT r{x, y, x + _wtoi(args[5].c_str()), y + _wtoi(args[6].c_str())};
+        return RunTestWindow(_wtof(args[1].c_str()), false, &r);
+    }
     if (args.size() >= 2 && args[0] == L"--test-window")
         return RunTestWindow(_wtof(args[1].c_str()), args.size() >= 3 && args[2] == L"capture");
     if (args.size() >= 2 && args[0] == L"--update-test") return RunUpdateTest(args[1], args.size() >= 3 ? args[2] : L"");
@@ -180,6 +185,8 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     }
     if (!Capture::IsSupported())
         Toast(tr(L"이 Windows에서는 화면 캡처(Windows.Graphics.Capture)를 사용할 수 없습니다."), true);
+    else
+        Capture::RequestBorderless();  // answered before the first recording (Windows 11: no yellow border)
     if (!args.empty() && args[0].rfind(L"--", 0) != 0) OpenMediaFile(args[0]);  // "Open with", or a file dropped on the exe
     Loop();
     return 0;
@@ -555,9 +562,10 @@ void App::MinimizeMain() {
 
 void App::SetRecordingLook(bool on) {
     if (!hwnd_) return;
-    // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later). Not for
-    // replay, which runs while the window is open: excluded, the open window was drawn shifted and flickering.
-    SetWindowDisplayAffinity(hwnd_, on ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    // Opened while a screen is being recorded, the window doesn't end up in it (Windows 10 2004 and later). Only then:
+    // a window's own capture never shows other windows, and excluded, the open window was once drawn shifted and
+    // flickering (see Gfx::CreateSwapChain). Not for replay either, which runs while the window is open.
+    SetWindowDisplayAffinity(hwnd_, on && recScreen_ ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
     if (!taskbar_ &&
         SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&taskbar_))) &&
         FAILED(taskbar_->HrInit()))
@@ -1388,6 +1396,7 @@ void App::BeginCapture() {
                       : recTarget_.source == kSourceDisplay ? CaptureSource::Monitor : CaptureSource::Region;
     o.target = recTarget_.hwnd;
     o.monitorMode = window && UseMonitorCapture(recTarget_.hwnd);
+    recScreen_ = !window || o.monitorMode;
     o.monitor = recTarget_.monitor;
     o.region = recTarget_.rect;
     o.clientOnly = settings_.clientOnly;
