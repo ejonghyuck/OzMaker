@@ -9,4 +9,10 @@ namespace mp4 {
 // `empty`: the file holds no samples at all.
 bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty = nullptr);
 
+// Variable frame rate (#55): how long each video frame of a plain MP4 lasts, in 100 ns and the order written, so the
+// file has the times OzMaker meant whatever the encoder made of them, and the video starts with the sound. A new moov
+// takes the old one's place; no sample data moves. False, and the file as it was, when the frames don't match up or
+// the encoder reordered them (B-frames).
+bool SetVideoTiming(const std::wstring& path, const std::vector<uint32_t>& dur100ns, std::wstring& err);
+
 }  // namespace mp4

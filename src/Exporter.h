@@ -48,6 +48,13 @@ std::vector<PlannedFrame> PlanFrames(const Clip& s, size_t first, size_t last, d
                                      int direction = 0);
 // MP4: the source frame shown at each tick of a constant output rate.
 std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, double fps, double speed);
+// The plan as frames to encode: tick k shows for n ticks. Constant frame rate is one tick each. Variable (#55) makes
+// a source frame that repeats one frame, and starts a new one, a keyframe, once keyTicks have gone by since the last.
+struct VideoRun {
+    size_t k, n;
+    bool key;
+};
+std::vector<VideoRun> PlanVideoRuns(const std::vector<size_t>& plan, bool vfr, int keyTicks);
 
 // Size of an export without writing it: a few short stretches are encoded for real and scaled up to the whole
 // length (움짤), or bitrate × length (MP4). 0 when cancelled or on failure.

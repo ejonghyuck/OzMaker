@@ -305,7 +305,7 @@ private:
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
-    int RunTestWindow(double seconds);
+    int RunTestWindow(double seconds, bool capture);
     int RunUpdateTest(const std::wstring& dir, const std::wstring& base);
     int RunReadmeMedia(const std::wstring& dir);
     void DrawPreviewStandIn(ID2D1DeviceContext* dc);

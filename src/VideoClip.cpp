@@ -51,6 +51,18 @@ bool VideoReader::CreateReader(bool gpu) {
         rd_.Reset();
         return false;
     }
+    // Frames as the file times them: the video processor would otherwise put them out at the average rate of a
+    // variable frame rate video (#55), timed and picked on its own.
+    ComPtr<IMFSourceReaderEx> rx;
+    if (SUCCEEDED(rd_.As(&rx)))
+        for (DWORD i = 0;; ++i) {
+            GUID cat{};
+            ComPtr<IMFTransform> mft;
+            ComPtr<IMFAttributes> ma;
+            if (FAILED(rx->GetTransformForStream((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &cat, &mft))) break;
+            if (cat == MFT_CATEGORY_VIDEO_PROCESSOR && SUCCEEDED(mft->GetAttributes(&ma)) && ma)
+                ma->SetUINT32(MF_XVP_DISABLE_FRC, TRUE);
+        }
     ReadOutputType();
     return true;
 }

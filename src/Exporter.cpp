@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Exporter.h"
 #include "Caption.h"
+#include "GpuResize.h"
 #include "Mp4Cut.h"
 #include "Resize.h"
 #include "Util.h"
@@ -57,6 +58,21 @@ std::vector<size_t> PlanVideoFrames(const Clip& s, size_t first, size_t last, do
     for (size_t k = 0; k < n; ++k) {
         int64_t t = start + (int64_t)std::llround(k * step);
         out.push_back(std::clamp(s.IndexAt(t + tol), first, last));
+    }
+    return out;
+}
+
+std::vector<VideoRun> PlanVideoRuns(const std::vector<size_t>& plan, bool vfr, int keyTicks) {
+    std::vector<VideoRun> out;
+    size_t lastKey = 0;
+    for (size_t k = 0; k < plan.size(); ++k) {
+        const bool key = vfr && (k == 0 || k - lastKey >= (size_t)std::max(1, keyTicks));
+        if (vfr && !key && plan[k] == plan[k - 1]) {
+            ++out.back().n;
+            continue;
+        }
+        if (key) lastKey = k;
+        out.push_back({k, 1, key});
     }
     return out;
 }
@@ -404,8 +420,9 @@ bool Exporter::RunCut(const ExportJob& job, const std::wstring& tmp, ExportResul
     return RunMp4(job, tmp, res);
 }
 
-// Re-encodes the range at a constant frame rate: frames are cropped/scaled on the CPU (same path as the image
-// formats), uploaded, then converted to NV12 and encoded on the GPU. The clip's sound is cut to the same range.
+// Re-encodes the range at a constant or variable frame rate: frames are uploaded, cropped and scaled with the caption
+// on (GpuResizer; on the CPU like the other formats when that can't be set up), then converted to NV12 and encoded on
+// the GPU. The clip's sound is cut to the same range.
 bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResult& res) {
     const double rate = job.fpsLimit > 0 ? job.fpsLimit : job.clip->AverageFps();
     const int fps = std::clamp((int)std::lround(rate), 1, 120);
@@ -455,16 +472,21 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
     if (!w.Open(tmp, v, a, dev.Get(), res.error)) return false;
     res.audio = w.HasAudio();
     auto reader = job.clip->NewReader();
-    AreaResizer resizer;
-    std::vector<uint8_t> frame((size_t)W * H * 4);
     caption::Overlay cap;
     cap.Make(job.caption, job.captionPos, W, H);
     std::vector<int16_t> pcm;
     int64_t audioPushed = 0;
-    int cx = job.crop.left, cy = job.crop.top;
-    int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
+    const int cx = job.crop.left, cy = job.crop.top;
+    const int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
+    const int stride = job.clip->Width() * 4;
+    const bool alpha = job.clip->HasAlpha();
+    GpuResizer gpu;
+    const bool onGpu = gpu.Init(dev.Get(), tex.Get(), cw, ch, alpha, cap);
+    AreaResizer resizer;
+    std::vector<uint8_t> frame(onGpu ? 0 : (size_t)W * H * 4);
     size_t uploaded = SIZE_MAX;
-    for (size_t k = 0; k < plan.size(); ++k) {
+    for (const VideoRun& run : PlanVideoRuns(plan, v.vfr, v.gopFrames)) {
+        const size_t k = run.k;
         if (cancel_) {
             res.cancelled = true;
             w.Abort();
@@ -477,11 +499,16 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
                 w.Abort();
                 return false;
             }
-            const bool alpha = job.clip->HasAlpha();
-            resizer.Run(px, job.clip->Width() * 4, cx, cy, cw, ch, frame.data(), W, H, alpha);
-            cap.Blend(frame.data());
-            if (alpha) FinishAlpha(frame.data(), (size_t)W * H, true);
-            ctx->UpdateSubresource(tex.Get(), 0, nullptr, frame.data(), W * 4, 0);
+            if (onGpu) {
+                mt->Enter();  // the encoder works on the same context
+                gpu.Draw(ctx.Get(), px + (size_t)cy * stride + (size_t)cx * 4, stride);
+                mt->Leave();
+            } else {
+                resizer.Run(px, stride, cx, cy, cw, ch, frame.data(), W, H, alpha);
+                cap.Blend(frame.data());
+                if (alpha) FinishAlpha(frame.data(), (size_t)W * H, true);
+                ctx->UpdateSubresource(tex.Get(), 0, nullptr, frame.data(), W * 4, 0);
+            }
             uploaded = plan[k];
         }
         // The sample pool runs dry while the encoder is behind: wait for it.
@@ -490,7 +517,7 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
             Sleep(2);
             s = w.Convert(tex.Get());
         }
-        int64_t t0 = (int64_t)k * 10'000'000 / fps, t1 = (int64_t)(k + 1) * 10'000'000 / fps;
+        int64_t t0 = (int64_t)k * 10'000'000 / fps, t1 = (int64_t)(k + run.n) * 10'000'000 / fps;
         if (res.audio) {
             int64_t want = t1 * a.sampleRate / 10'000'000;
             if (want > audioPushed) {
@@ -501,21 +528,21 @@ bool Exporter::RunMp4(const ExportJob& job, const std::wstring& tmp, ExportResul
                 audioPushed = want;
             }
         }
-        if (!s || !w.WriteVideo(s.Get(), t0, t1 - t0)) {
+        if (!s || !w.WriteVideo(s.Get(), t0, t1 - t0, run.key)) {
             res.error = tr(L"동영상 인코더가 프레임을 받지 못했습니다.");
             w.Abort();
             return false;
         }
-        progress_ = 0.98f * (float)(k + 1) / plan.size();
+        progress_ = 0.98f * (float)(k + run.n) / plan.size();
     }
     if (!w.Finish(res.error)) return false;
-    res.frames = (int)plan.size();
+    res.frames = (int)w.VideoFrames();
     res.seconds = plan.size() / (double)fps;
     return true;
 }
 
-// VP9 + Opus on the CPU (#40): the frames as for MP4 (a constant rate, cropped and scaled, the caption on), and the
-// clip's sound cut to the range.
+// VP9 + Opus on the CPU (#40): the frames as for MP4 (cropped and scaled, the caption on, a constant or variable
+// rate), and the clip's sound cut to the range.
 bool Exporter::RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResult& res) {
     const double rate = job.fpsLimit > 0 ? job.fpsLimit : job.clip->AverageFps();
     const int fps = std::clamp((int)std::lround(rate), 1, 120);
@@ -553,7 +580,9 @@ bool Exporter::RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResu
     const int cx = job.crop.left, cy = job.crop.top;
     const int cw = job.crop.right - job.crop.left, ch = job.crop.bottom - job.crop.top;
     size_t made = SIZE_MAX;
-    for (size_t k = 0; k < plan.size(); ++k) {
+    int frames = 0;
+    for (const VideoRun& run : PlanVideoRuns(plan, job.video.vfr, fps * WebmWriter::kKeySeconds)) {
+        const size_t k = run.k;
         if (cancel_) {
             res.cancelled = true;
             w.Abort();
@@ -572,7 +601,7 @@ bool Exporter::RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResu
             made = plan[k];
         }
         if (res.audio) {
-            const int64_t want = (int64_t)(k + 1) * c.sampleRate / fps;
+            const int64_t want = (int64_t)(k + run.n) * c.sampleRate / fps;
             if (want > audioPushed) {
                 const size_t n = (size_t)(want - audioPushed);
                 pcm.resize(n * 2);
@@ -581,14 +610,15 @@ bool Exporter::RunWebm(const ExportJob& job, const std::wstring& tmp, ExportResu
                 audioPushed = want;
             }
         }
-        if (!w.AddVideo(frame.data(), res.error)) {
+        if (!w.AddVideo(frame.data(), res.error, (int)run.n, run.key)) {
             w.Abort();
             return false;
         }
-        progress_ = 0.98f * (float)(k + 1) / plan.size();
+        ++frames;
+        progress_ = 0.98f * (float)(k + run.n) / plan.size();
     }
     if (!w.Finish(res.error)) return false;
-    res.frames = (int)plan.size();
+    res.frames = frames;
     res.seconds = plan.size() / (double)fps;
     return true;
 }
