@@ -36,6 +36,7 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name,
                   const wchar_t* ext, const wchar_t* filterName, std::wstring& out);
 bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out);
+bool PickExeFile(HWND owner, std::wstring& out);  // a program (.exe), for 순간 리플레이's list
 // By the extension: a video, or a 움짤 (GIF, WebP, AVIF). The editor opens both.
 bool IsVideoPath(const std::wstring& path);
 bool IsAnimPath(const std::wstring& path);

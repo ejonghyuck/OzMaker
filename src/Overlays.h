@@ -81,6 +81,47 @@ private:
     HWND frame_[4] = {};
 };
 
+// 순간 리플레이's notice that a replay was saved (#20), over the top middle of what was held, like the REC pill: never
+// in recordings and never taking the focus. With 편집 and 폴더 only when the mouse is free; while a game holds the
+// mouse it has no buttons, lets clicks through to the game and goes after 3 s.
+class ReplayNotice {
+public:
+    struct Content {
+        std::wstring title, sub;
+        bool ok = true;        // a check; else a warning sign
+        bool buttons = false;  // 편집 · 폴더
+    };
+    enum : int { kEdit = 1, kFolder = 2 };
+    void Init(HINSTANCE inst, ID2D1Factory1* factory);
+    // target: what was held, screen pixels; full: it fills its monitor. onButton gets kEdit or kFolder.
+    void Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton);
+    void Hide();
+    bool Visible() const { return shown_; }
+    // Screenshot tests: the notice drawn at the origin without a window; hover: the button under the pointer.
+    void PaintTest(Painter& p, const Content& c, int hover);
+    static float Width(const Content& c);  // DIPs
+    static constexpr float kHeight = 56;
+
+private:
+    static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT Handle(HWND, UINT, WPARAM, LPARAM);
+    void Paint(Painter& p);
+    Rect ButtonRect(int b) const;
+    int ButtonAt(float x, float y) const;
+    void Redraw();
+
+    HINSTANCE inst_ = nullptr;
+    ID2D1Factory1* factory_ = nullptr;
+    LayeredWindow win_;
+    Content c_;
+    RECT rect_{};
+    float scale_ = 1, width_ = 0;
+    int hover_ = 0;
+    bool shown_ = false, tracking_ = false;
+    DWORD ms_ = 0;
+    std::function<void(int)> onButton_;
+};
+
 // Fullscreen click-to-pick window chooser.
 class PickerOverlay {
 public:

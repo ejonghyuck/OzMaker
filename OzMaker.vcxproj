@@ -63,7 +63,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;imm32.lib;winhttp.lib;bcrypt.lib;dbghelp.lib;uiautomationcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;dwmapi.lib;cabinet.lib;shcore.lib;winmm.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mmdevapi.lib;avrt.lib;windowsapp.lib;comctl32.lib;imm32.lib;winhttp.lib;bcrypt.lib;dbghelp.lib;uiautomationcore.lib;version.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <FxCompile>
       <ShaderModel>5.0</ShaderModel>
@@ -116,6 +116,8 @@
     <ClCompile Include="src\Mp4Writer.cpp" />
     <ClCompile Include="src\Mp4Cut.cpp" />
     <ClCompile Include="src\Mp4Unfragment.cpp" />
+    <ClCompile Include="src\Replay.cpp" />
+    <ClCompile Include="src\AppReplay.cpp" />
     <ClCompile Include="src\Gfx.cpp" />
     <ClCompile Include="src\KeyHook.cpp" />
     <ClCompile Include="src\Lang.cpp" />
@@ -154,6 +156,7 @@
     <ClInclude Include="src\Mp4Box.h" />
     <ClInclude Include="src\Mp4Cut.h" />
     <ClInclude Include="src\Mp4Unfragment.h" />
+    <ClInclude Include="src\Replay.h" />
     <ClInclude Include="src\Gfx.h" />
     <ClInclude Include="src\KeyHook.h" />
     <ClInclude Include="src\Overlays.h" />

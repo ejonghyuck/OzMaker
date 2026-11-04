@@ -77,9 +77,11 @@ void App::DrawFrame(Rect client) {
     if (screen_ == Screen::Settings || rec_ != RecState::Idle) filesOpen_ = false;
     if (rec_ != RecState::Idle) updateOpen_ = false;
     if (screen_ != Screen::Home) timerOpen_ = false;
+    if (screen_ != Screen::Replay) rpAddOpen_ = false, rpProgMenu_ = rpFileMenu_ = rpRenaming_ = -1;
     const bool modal = question_.has_value();
     if (modal) menu_ = {};
-    const bool popover = !modal && (filesOpen_ || updateOpen_ || timerOpen_ || menu_.owner);
+    const bool rpFloat = rpAddOpen_ || rpProgMenu_ >= 0 || rpFileMenu_ >= 0;
+    const bool popover = !modal && (filesOpen_ || updateOpen_ || timerOpen_ || menu_.owner || rpFloat);
     menu_.seen = false;
     // An Alert's buttons lie over the page (the record button is under it on Home): while the pointer is on the
     // alert, where it was drawn last frame, the page under it takes no input.
@@ -93,6 +95,7 @@ void App::DrawFrame(Rect client) {
         case Screen::Home: DrawHome(r); break;
         case Screen::Editor: DrawEditor(r); break;
         case Screen::Settings: DrawSettings(r); break;
+        case Screen::Replay: DrawReplay(r); break;
     }
     // Floating surfaces last, each in a float: that is what keeps them above the page and the live window preview
     // (a DWM thumbnail, which DWM draws above everything here) out from under them. See Ui::BeginFloat.
@@ -108,6 +111,10 @@ void App::DrawFrame(Rect client) {
             DrawTimerPopover(client);
         else if (menu_.owner)
             DrawMenuPopover(client);
+        else if (rpAddOpen_)
+            DrawReplayAddPopover(client);
+        else if (rpFloat)
+            DrawReplayMenus(client);
         ui_.EndFloat();
     }
     if (modal) {
@@ -245,6 +252,8 @@ void App::DrawHeader(Rect r) {
         hkConflict_ = {};
         if (settingsReturn_ == Screen::Editor) {
             ResumeEditor();
+        } else if (settingsReturn_ == Screen::Replay) {
+            OpenReplayTab();
         } else {
             screen_ = Screen::Home;
             RefreshWindows();
@@ -255,21 +264,26 @@ void App::DrawHeader(Rect r) {
 
 void App::DrawTabs(Rect r) {
     const float tabW = 120, tabH = 30, pad = 3, gap = 2;
-    Rect box = Rect::Centered(r.CX(), r.CY(), tabW * 2 + gap + pad * 2, tabH + pad * 2);
+    Rect box = Rect::Centered(r.CX(), r.CY(), tabW * 3 + gap * 2 + pad * 2, tabH + pad * 2);
     ui_.Fill(box, Surface, 11);
     ui_.Stroke(box.Inset(0.5f), Border, 11);
     // Not while a countdown runs or a file is being saved: the editor has to stay as it is for that.
     const bool en = rec_ == RecState::Idle && !exporter_.Busy();
-    ui_.Declare(HashId("hdr.tabs"), box, Role::Group, tr(L"녹화 · 편집"));
-    for (int i = 0; i < 2; ++i) {
-        const Screen tab = i == 0 ? Screen::Home : Screen::Editor;
-        const wchar_t* label = i == 0 ? tr(L"녹화") : tr(L"편집");
+    ui_.Declare(HashId("hdr.tabs"), box, Role::Group, tr(L"녹화 · 편집 · 리플레이"));
+    const RpState rp = ReplayState();
+    for (int i = 0; i < 3; ++i) {
+        const Screen tab = i == 0 ? Screen::Home : i == 1 ? Screen::Editor : Screen::Replay;
+        const wchar_t* label = i == 0 ? tr(L"녹화") : i == 1 ? tr(L"편집") : tr(L"리플레이");
         Rect t = Rect::XYWH(box.l + pad + i * (tabW + gap), box.t + pad, tabW, tabH);
         const UiId id = HashId("hdr.tab", (uint32_t)i);
         const bool on = screen_ == tab;
         const bool clicked = ui_.Click(id, t, en && !on);
-        if (UiNode* n = ui_.Describe(id, label, Role::Tab))
-            n->enabled = en, n->on = on, n->pos = i, n->count = 2, n->group = HashId("hdr.tabs");
+        const std::wstring spoken = i < 2 ? std::wstring(label)
+                                    : rp == RpState::Holding ? std::wstring(label) + tr(L", 담는 중")
+                                    : rp == RpState::Waiting ? std::wstring(label) + tr(L", 기다리는 중")
+                                                             : std::wstring(label);
+        if (UiNode* n = ui_.Describe(id, spoken, Role::Tab))
+            n->enabled = en, n->on = on, n->pos = i, n->count = 3, n->group = HashId("hdr.tabs");
         const float hv = ui_.Anim(id, en && !on && ui_.Hover(t) ? 1.f : 0.f);
         if (on) {
             ui_.Fill(t, Contrast() ? Accent : Surface3, 8);
@@ -280,7 +294,12 @@ void App::DrawTabs(Rect r) {
         if (i == 0)
             ui_.Circle(x + iw / 2, t.CY(), 4.5f, fg);
         else
-            ui_.Icon(Rect::XYWH(x, t.t, iw, t.H()), icon::Cut, 13.f, fg);
+            ui_.Icon(Rect::XYWH(x, t.t, iw, t.H()), i == 1 ? icon::Cut : icon::Replay, 13.f, fg);
+        if (i == 2 && (rp == RpState::Holding || rp == RpState::Waiting)) {
+            // Red while it holds what goes by, grey while it waits for a program.
+            ui_.Circle(t.r - 12, t.t + 9, 3.5f, Contrast() ? fg : rp == RpState::Holding ? Rec : TextFaint);
+            ui_.Tooltip(id, t, rp == RpState::Holding ? tr(L"리플레이 담는 중") : tr(L"리플레이 기다리는 중"));
+        }
         ui_.Text(Rect(x + iw + 7, t.t, t.r, t.b), label, 13.f, fg, Bold());
         if (i == 1 && clip_) {
             // A file is open in the 편집 tab, waiting there.
@@ -288,10 +307,16 @@ void App::DrawTabs(Rect r) {
             ui_.Tooltip(id, t, tr(L"열린 파일: ") + ClipTitle());
         }
         if (clicked) {
-            if (i == 0)
-                CloseEditor();
-            else
+            if (i == 0) {
+                if (screen_ == Screen::Editor)
+                    CloseEditor();
+                else
+                    screen_ = Screen::Home, RefreshWindows();
+            } else if (i == 1) {
                 ResumeEditor();
+            } else {
+                OpenReplayTab();
+            }
         }
     }
 }
@@ -303,7 +328,7 @@ void App::DrawToast(Rect client) {
     if (visible && !toastSticky_) RequestWake(toastUntil_);
     if (a <= 0.01f) return;
     // An Alert keeps its buttons at the right: the settings tab that fixes it, if any, then close.
-    static const wchar_t* const kTabNames[kTabCount] = {L"일반", L"녹화", L"동영상", L"소리", L"정보"};
+    static const wchar_t* const kTabNames[kTabCount] = {L"일반", L"녹화", L"동영상", L"소리", L"정보", L"리플레이"};
     const std::wstring act = toastSticky_ && toastTab_ >= 0 && toastTab_ < kTabCount
                                  ? util::Format(tr(L"%s 설정 열기"), tr(kTabNames[toastTab_]))
                                  : std::wstring();
@@ -1432,6 +1457,833 @@ void App::DrawMenuPopover(Rect client) {
         menu_.keys = true;
         Invalidate();
     }
+}
+
+// ---------------------------------------------------------------- 리플레이 (#20)
+
+namespace {
+
+bool SamePathI(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) == 0; }
+
+// A program without an icon (not found, or made up for the screenshots): its first letter on a color of its name.
+D2D1_COLOR_F LetterColor(std::wstring_view name) {
+    static constexpr uint32_t kColors[] = {0xD9573E, 0x3E7FD9, 0x2F9A66, 0x7A5AF8, 0xB45309, 0x0E7490, 0xBE185D, 0x5B6474};
+    uint32_t h = 2166136261u;
+    for (wchar_t c : name) h = (h ^ c) * 16777619u;
+    return Hex(kColors[h % _countof(kColors)]);
+}
+
+std::wstring LenName(int seconds) {
+    return seconds < 60 ? util::Format(tr(L"%d초"), seconds) : util::Format(tr(L"%d분"), seconds / 60);
+}
+
+SYSTEMTIME LocalTime(uint64_t fileTime) {
+    FILETIME ft{(DWORD)fileTime, (DWORD)(fileTime >> 32)}, local;
+    SYSTEMTIME st{};
+    FileTimeToLocalFileTime(&ft, &local);
+    FileTimeToSystemTime(&local, &st);
+    return st;
+}
+
+uint64_t NowFileTime() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return (uint64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime;
+}
+
+}  // namespace
+
+// A program's icon from its exe, else its letter; a monitor's number.
+void App::DrawTargetIcon(const Rect& ic, const std::wstring& exe, std::wstring_view name, int monitor) {
+    const float rad = ic.W() / 4;
+    if (monitor) {
+        ui_.Fill(ic, Surface3, rad);
+        ui_.Text(ic, std::to_wstring(monitor), ic.W() * 0.42f, TextDim, Bold(AlignCenter));
+        return;
+    }
+    if (ID2D1Bitmap* bmp = exe.empty() ? nullptr : ExeIcon(exe)) {
+        ui_.Painted(ic);
+        gfx_.DC()->DrawBitmap(bmp, ic, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+        return;
+    }
+    ui_.Fill(ic, Contrast() ? Surface3 : LetterColor(name), rad);
+    if (Contrast()) ui_.Stroke(ic.Inset(0.5f), Border, rad);
+    const std::wstring letter(1, name.empty() ? L'?' : (wchar_t)towupper(name[0]));
+    TextStyle st = Bold(AlignCenter);
+    st.weight = kBold;
+    ui_.Text(ic, letter, ic.W() * 0.44f, Contrast() ? TextColor : White, st);
+}
+
+std::wstring App::TargetName(const ReplayTarget& t) const {
+    if (!t.monitor) return t.name;
+    for (const MonitorDesc& m : monitors_)
+        if (_wcsicmp(m.device.c_str(), t.path.c_str()) == 0) return util::Format(tr(L"전체 화면 · 화면 %d"), m.number);
+    return tr(L"전체 화면 · 연결되지 않은 모니터");
+}
+
+bool App::TargetRuns(const ReplayTarget& t) const {
+    if (t.monitor)
+        return std::any_of(monitors_.begin(), monitors_.end(),
+                           [&](const MonitorDesc& m) { return _wcsicmp(m.device.c_str(), t.path.c_str()) == 0; });
+    if (rpRunningForTest_ >= 0) return SamePathI(t.path, settings_.rpTargets[rpRunningForTest_].path);
+    return std::any_of(windows_.begin(), windows_.end(), [&](const WinInfo& w) { return SamePathI(w.exePath, t.path); });
+}
+
+bool App::TargetHeld(const ReplayTarget& t) const {
+    if (rpStateForTest_ >= 0)
+        return rpRunningForTest_ >= 0 && &t == &settings_.rpTargets[rpRunningForTest_] &&
+               (rpStateForTest_ == (int)RpState::Holding || rpStateForTest_ == (int)RpState::Paused);
+    return !rpHeld_.path.empty() && rpHeld_.monitor == t.monitor && SamePathI(rpHeld_.path, t.path);
+}
+
+void App::DrawReplay(Rect r) {
+    r.CutTop(20);
+    DrawReplayStrip(r.CutTop(76));
+    r.CutTop(16);
+    Rect left = r.CutLeft(340);
+    r.CutLeft(20);
+    DrawReplayPrograms(left);
+    DrawReplayFiles(r);
+}
+
+// What replay is doing, in one line, with what can be done about it.
+void App::DrawReplayStrip(Rect r) {
+    const RpState st = ReplayState();
+    const double len = kReplayLenOptions[settings_.rpLenIdx];
+    const std::wstring key = util::HotkeyToString(settings_.rpHkMods, settings_.rpHkVk);
+    std::wstring names;
+    for (const ReplayTarget& t : settings_.rpTargets)
+        if (t.on) names += (names.empty() ? L"" : L" · ") + TargetName(t);
+    const std::wstring held = rpStateForTest_ >= 0 && rpRunningForTest_ >= 0 ? TargetName(settings_.rpTargets[rpRunningForTest_])
+                              : !rpHeld_.name.empty()                       ? rpHeld_.name
+                                                                            : std::wstring();
+    const bool closed = !rpClosed_.path.empty();
+    std::wstring title, sub;
+    enum { kNone, kAdd, kOn, kSave } primary = kNone;
+    bool offBtn = false;
+    switch (st) {
+        case RpState::NoTarget:
+            title = tr(L"리플레이를 켤 프로그램을 고르세요");
+            sub = tr(L"게임을 켠 채로 추가하면, 다음부터 그 게임이 실행될 때마다 알아서 담습니다");
+            primary = kAdd;
+            break;
+        case RpState::Off:
+            title = tr(L"리플레이 꺼짐");
+            sub = names.empty() ? tr(L"켜 둔 프로그램이 없습니다 · 왼쪽 목록에서 켜세요")
+                                : tr(L"켜면 이 프로그램이 실행될 때 담기 시작합니다 · ") + names;
+            primary = kOn;
+            break;
+        case RpState::Waiting:
+            title = tr(L"기다리는 중");
+            if (closed)
+                sub = util::Format(tr(L"%s 닫힘 · 담아 둔 장면(%s)은 5분 동안 남겨 둡니다"), rpClosed_.name.c_str(),
+                                   util::FormatClock(ReplayHeldSeconds(), false).c_str());
+            else
+                sub = names.empty() ? tr(L"켜 둔 프로그램이 없습니다 · 왼쪽 목록에서 켜세요")
+                                    : tr(L"실행되면 바로 담기 시작합니다 · ") + names;
+            primary = closed ? kSave : kNone;
+            offBtn = true;
+            break;
+        case RpState::Paused:
+            if (rec_ != RecState::Idle || (rpStateForTest_ == (int)RpState::Paused && rpPause_ == RpPause::None)) {
+                title = tr(L"멈춤");
+                sub = tr(L"녹화하는 동안은 쉽니다 · 녹화를 멈추면 처음부터 다시 담습니다");
+            } else if (rpLocked_ || rpAsleep_) {
+                title = tr(L"멈춤");
+                sub = tr(L"PC가 잠겨 있습니다 · 잠금을 풀면 처음부터 다시 담습니다");
+            } else if (rpPause_ == RpPause::Minimized) {
+                title = tr(L"멈춤 · ") + held;
+                sub = tr(L"창이 최소화되어 있습니다 · 창을 다시 열면 이어서 담습니다");
+            } else {
+                title = tr(L"담을 수 없음 · ") + held;
+                sub = rpBlocked_.empty() ? tr(L"Windows가 이 창을 담지 못하게 막았습니다 · 관리자 권한으로 실행 중인 게임일 수 있습니다")
+                                         : rpBlocked_;
+            }
+            offBtn = true;
+            break;
+        case RpState::Holding:
+            title = tr(L"담는 중 · ") + held;
+            sub = util::Format(tr(L"방금 지나간 %s까지 메모리에 담습니다 · 저장하면 오른쪽 목록에 쌓입니다"), LenName((int)len).c_str());
+            primary = kSave;
+            offBtn = true;
+            break;
+    }
+    if ((st == RpState::Holding || st == RpState::Waiting) && settings_.rpOn && !replayHotkeyOk_)
+        sub = tr(L"⚠ 저장 단축키를 다른 프로그램이 쓰고 있습니다 · 설정 › 리플레이에서 바꾸세요");
+
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), st == RpState::Holding && !Contrast() ? WithAlpha(Rec, 0.45f) : Border, 14);
+    ui_.Declare(HashId("rp.strip"), r, Role::Group, title + L". " + sub);
+    Rect in = r.Inset(18, 0);
+    // The state's mark: a red dot while it holds, a ring while it waits, ❚❚ while it rests.
+    const float cx = in.l + 19, cy = r.CY();
+    in.CutLeft(38 + 14);
+    ui_.Circle(cx, cy, 19, Surface2);
+    if (st == RpState::Holding) {
+        ui_.Circle(cx, cy, 10, WithAlpha(Rec, 0.22f));
+        ui_.Circle(cx, cy, 6, Rec);
+    } else if (st == RpState::Waiting) {
+        ui_.Circle(cx, cy, 6.5f, TextDim);
+        ui_.Circle(cx, cy, 4.5f, Surface2);
+    } else if (st == RpState::Paused) {
+        ui_.Fill(Rect::XYWH(cx - 5, cy - 6, 3.5f, 12), Warning, 1);
+        ui_.Fill(Rect::XYWH(cx + 1.5f, cy - 6, 3.5f, 12), Warning, 1);
+    } else {
+        ui_.Circle(cx, cy, 6, TextFaint);
+    }
+
+    // From the right: 끄기, the main button, the meter; the text takes what is left.
+    const float btnH = 40;
+    Rect right = in;
+    Rect off, main, meter;
+    if (offBtn) {
+        off = right.CutRight(ui_.Measure(tr(L"끄기"), 13.f, kSemibold) + 32);
+        right.CutRight(8);
+    }
+    const std::wstring mainLabel = primary == kAdd  ? tr(L"+ 프로그램 추가")
+                                   : primary == kOn ? tr(L"리플레이 켜기")
+                                   : rpSaving_      ? tr(L"저장하는 중…")
+                                                    : tr(L"지금 저장");
+    const float keyW = primary == kSave && replayHotkeyOk_ ? ui_.Measure(key, 11.5f, kSemibold) + 14 : 0;
+    if (primary != kNone) {
+        main = right.CutRight(ui_.Measure(mainLabel, 13.f, kSemibold) + 40 + (primary == kSave ? 22 : 0) + (keyW ? keyW + 8 : 0));
+        right.CutRight(14);
+    }
+    if (st == RpState::Holding) {
+        meter = right.CutRight(120 + 10 + ui_.Measure(L"0:00 / 0:00", 12.5f) + 4);
+        right.CutRight(18);
+    }
+    const bool mic = st == RpState::Holding && settings_.rpMic;
+    const std::wstring micTag = tr(L"마이크 포함");
+    const float micW = mic ? ui_.Measure(micTag, 11.f, kBold) + 14 : 0;
+    const float titleW = std::min(right.W() - micW - (mic ? 8 : 0), ui_.Measure(title, 15.f, kSemibold) + 2);
+    ui_.PushClip(right);
+    ui_.Text(Rect(right.l, r.t + 14, right.l + titleW, r.t + 40), title, 15.f, TextColor, Bold());
+    if (mic) {
+        Rect chip = Rect::XYWH(right.l + titleW + 8, r.t + 18, micW, 18);
+        ui_.Fill(chip, WithAlpha(Warning, Contrast() ? 0.f : 0.14f), 6);
+        if (Contrast()) ui_.Stroke(chip.Inset(0.5f), Warning, 6);
+        TextStyle ts = Bold(AlignCenter);
+        ts.weight = kBold;
+        ui_.Text(chip, micTag, 11.f, Warning, ts);
+    }
+    ui_.Text(Rect(right.l, r.t + 40, right.r, r.b - 14), sub, 12.5f, TextDim);
+    ui_.PopClip();
+    if (st == RpState::Holding) {
+        const double got = ReplayHeldSeconds();
+        Rect bar = Rect::XYWH(meter.l, meter.CY() - 3, 120, 6);
+        ui_.Fill(bar, Surface3, 3);
+        if (Contrast()) ui_.Stroke(bar.Inset(-0.5f), Border, 3.5f);
+        ui_.Fill(Rect(bar.l, bar.t, bar.l + bar.W() * (float)std::clamp(got / len, 0.0, 1.0), bar.b), Rec, 3);
+        TextStyle ts;
+        ts.tabular = true;
+        ui_.Text(Rect(bar.r + 10, meter.t, meter.r, meter.b),
+                 util::FormatClock(got, false) + L" / " + util::FormatClock(len, false), 12.5f, TextDim, ts);
+        RequestWake(ui_.Now() + 0.5);
+    }
+    if (primary != kNone) {
+        Rect b = Rect::Centered(main.CX(), r.CY(), main.W(), btnH);
+        const UiId id = HashId("rp.main");
+        const bool en = primary != kSave || !rpSaving_;
+        if (primary == kSave) {
+            // 지금 저장 with its key in a chip.
+            if (ui_.Button(id, b, L"", BtnStyle::Primary, 0, en) && en) ReplaySave();
+            ui_.Describe(id, keyW ? mainLabel + L", " + key : mainLabel);
+            const D2D1_COLOR_F fg = en ? OnFill : P.Disabled;
+            float x = std::round(b.CX() - (14 + 8 + ui_.Measure(mainLabel, 13.f, kSemibold) + (keyW ? 8 + keyW : 0)) / 2);
+            ui_.Icon(Rect::XYWH(x, b.t, 14, b.H()), icon::Save, 13.f, fg);
+            x += 22;
+            const float lw = ui_.Measure(mainLabel, 13.f, kSemibold);
+            ui_.Text(Rect(x, b.t, x + lw + 2, b.b), mainLabel, 13.f, fg, Bold());
+            if (keyW) {
+                Rect chip = Rect::XYWH(x + lw + 8, b.CY() - 10, keyW, 20);
+                ui_.Fill(chip, Contrast() ? Bg : WithAlpha(Black, 0.22f), 6);
+                if (Contrast()) ui_.Stroke(chip.Inset(0.5f), Border, 6);
+                ui_.Text(chip, key, 11.5f, Contrast() ? TextColor : fg, Bold(AlignCenter));
+            }
+        } else if (ui_.Button(id, b, mainLabel, BtnStyle::Primary, primary == kOn ? icon::Replay : 0, true, 13.f)) {
+            if (primary == kOn) {
+                SetReplayOn(true);
+            } else {
+                rpAddOpen_ = true;
+                RefreshWindows();
+                ListRunningPrograms();
+            }
+        }
+    }
+    if (offBtn && ui_.Button(HashId("rp.off"), Rect::Centered(off.CX(), r.CY(), off.W(), btnH), tr(L"끄기"),
+                             BtnStyle::Secondary, 0, true, 13.f))
+        SetReplayOn(false);
+}
+
+void App::DrawReplayPrograms(Rect r) {
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), Border, 14);
+    Rect in = r.Inset(14);
+    Rect head = in.CutTop(30);
+    const auto& targets = settings_.rpTargets;
+    ui_.Text(head, tr(L"리플레이를 켤 프로그램"), 14.f, TextColor, Bold());
+    if (!targets.empty())
+        ui_.Text(head, util::Format(tr(L"%zu개"), targets.size()), 12.f, TextFaint, Align(AlignEnd));
+    in.CutTop(6);
+
+    // 공통 설정 at the bottom: what every program is held with, and the way to it.
+    Rect sum = in.CutBottom(56);
+    in.CutBottom(10);
+    {
+        const UiId id = HashId("rp.sum");
+        const bool clicked = ui_.Click(id, sum);
+        const std::wstring line = LenName(kReplayLenOptions[settings_.rpLenIdx]) + L" · " +
+                                  util::Format(L"%dfps", kVideoFpsOptions[settings_.rpFpsIdx]) + L" · " +
+                                  (settings_.rpAudio ? tr(L"소리 켬") : tr(L"소리 끔")) + L" · " +
+                                  (settings_.rpMic ? tr(L"마이크 켬") : tr(L"마이크 끔"));
+        ui_.Describe(id, tr(L"공통 설정, ") + line);
+        const float hv = ui_.Anim(id, ui_.Hover(sum) ? 1.f : 0.f);
+        ui_.Fill(sum, Mix(Surface2, Surface3, hv), 10);
+        if (Contrast()) ui_.Stroke(sum.Inset(0.5f), Border, 10);
+        ui_.Text(Rect(sum.l + 14, sum.t + 9, sum.r - 34, sum.CY() + 1), tr(L"공통 설정"), 12.5f, TextColor, Bold());
+        ui_.Text(Rect(sum.l + 14, sum.CY() + 1, sum.r - 34, sum.b - 9), line, 12.f, TextFaint);
+        ui_.Icon(Rect(sum.r - 34, sum.t, sum.r - 12, sum.b), icon::Next, 11.f, TextDim);
+        if (clicked) OpenSettings(kTabReplay);
+    }
+
+    Rect list = in;
+    const float rowH = 56, step = 60, addH = 40;
+    TextStyle wrap;
+    wrap.wrap = true;
+    wrap.v = AlignStart;
+    const float content = targets.size() * step + addH + (targets.empty() ? 70 : 0);
+    const float maxScroll = std::max(0.f, content - list.H());
+    if (ui_.Hover(list) && ui_.In().wheel != 0) rpProgScroll_ -= ui_.In().wheel * step * 1.5f;
+    ui_.KeepInView(list, rpProgScroll_);
+    rpProgScroll_ = std::clamp(rpProgScroll_, 0.f, maxScroll);
+    const float scroll = ui_.Anim(HashId("rp.progScroll"), rpProgScroll_, 22.f);
+    ui_.PushClip(list);
+    const float w = list.W() - (maxScroll > 0 ? 8 : 0);
+    float y = list.t - scroll;
+    for (size_t i = 0; i < targets.size(); ++i, y += step) {
+        ReplayTarget& t = settings_.rpTargets[i];
+        Rect row = Rect::XYWH(list.l, y, w, rowH);
+        const std::wstring name = TargetName(t);
+        const bool held = settings_.rpOn && TargetHeld(t);
+        const bool runs = TargetRuns(t);
+        const bool closedHere = !rpClosed_.path.empty() && !t.monitor && SamePathI(rpClosed_.path, t.path);
+        std::wstring status;
+        D2D1_COLOR_F tint = TextFaint;
+        const RpState st = ReplayState();
+        if (!settings_.rpOn) {
+            status = runs ? tr(L"실행 중") : tr(L"실행 안 함");
+        } else if (held && st == RpState::Paused) {
+            status = rpPause_ == RpPause::Blocked ? tr(L"담을 수 없음") : tr(L"멈춤");
+            if (rpPause_ == RpPause::Minimized) status = tr(L"최소화됨 · 멈춤");
+            tint = Warning;
+        } else if (held && st == RpState::Holding) {
+            status = tr(L"담는 중");
+            tint = RecHi;
+        } else if (closedHere) {
+            status = util::Format(tr(L"닫힘 · 담아 둔 %s 남겨 둠"), util::FormatClock(ReplayHeldSeconds(), false).c_str());
+            tint = Warning;
+        } else if (!t.on) {
+            status = tr(L"꺼 둠");
+        } else {
+            status = runs ? tr(L"실행 중 · 대기") : tr(L"실행 안 함 · 기다리는 중");
+        }
+        const UiId rid = HashId("rp.prog", (uint32_t)i);
+        ui_.Declare(rid, row, Role::Item, name + L", " + status);
+        if (row.b < list.t || row.t > list.b) continue;
+        const bool sel = held && st == RpState::Holding;
+        if (sel) {
+            ui_.Fill(row, Contrast() ? Surface2 : Mix(Surface2, Accent, 0.16f), 10);
+            ui_.Stroke(row.Inset(0.75f), WithAlpha(Accent, 0.85f), 10, 1.5f);
+        } else if (ui_.Hover(row)) {
+            ui_.Fill(row, Surface2, 10);
+        }
+        int number = 0;
+        if (t.monitor)
+            for (const MonitorDesc& m : monitors_)
+                if (_wcsicmp(m.device.c_str(), t.path.c_str()) == 0) number = m.number;
+        DrawTargetIcon(Rect::XYWH(row.l + 10, row.CY() - 16, 32, 32), t.monitor ? L"" : t.path, name,
+                       t.monitor ? std::max(1, number) : 0);
+        Rect more = Rect::Centered(row.r - 22, row.CY(), 30, 30);
+        Rect tog = Rect::Centered(more.l - 4 - 22, row.CY(), 44, 24);
+        Rect text(row.l + 54, row.t, tog.l - 10, row.b);
+        ui_.PushClip(text);
+        ui_.Text(Rect(text.l, row.t + 8, text.r, row.CY() + 2), name, 13.5f, TextColor, Bold());
+        TextStyle ss;
+        if (tint.r != TextFaint.r || tint.g != TextFaint.g) ss.weight = kSemibold;
+        ui_.Text(Rect(text.l, row.CY() + 2, text.r, row.b - 8), status, 12.f, tint, ss);
+        ui_.PopClip();
+        ui_.Name(name);
+        if (ui_.Toggle(HashId("rp.progOn", (uint32_t)i), tog, t.on)) {
+            settings_.Save();
+            if (settings_.rpOn) ReplayTick();
+        }
+        ui_.Name({});
+        if (ui_.IconButton(HashId("rp.progMore", (uint32_t)i), more, icon::More, tr(L"더 보기"), true, 13.f)) {
+            rpProgMenu_ = (int)i;
+            rpFileMenu_ = -1;
+            rpMenuAnchor_ = more;
+        }
+        if (rpProgMenu_ == (int)i) rpMenuAnchor_ = more;  // it follows the row as it scrolls
+    }
+    Rect add = Rect::XYWH(list.l, y, w, addH);
+    if (ui_.Button(HashId("rp.add"), add, tr(L"+ 프로그램 추가"), BtnStyle::Secondary, 0, true, 13.f)) {
+        rpAddBtn_ = add;
+        rpAddOpen_ = true;
+        RefreshWindows();
+        ListRunningPrograms();
+    }
+    rpAddBtn_ = add;  // the popover opens under it, from the strip's button too
+    if (targets.empty())
+        ui_.Text(Rect(list.l + 4, add.b + 12, list.r - 4, add.b + 70),
+                 tr(L"게임이나 앱을 켠 채로 추가하세요. 실행하지 않은 게임은 exe 파일로 넣을 수 있습니다."), 12.f,
+                 TextFaint, wrap);
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(30.f, list.H() * list.H() / content);
+        float ty = list.t + (list.H() - th) * (scroll / maxScroll);
+        ui_.Fill(Rect::XYWH(list.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
+    }
+}
+
+void App::DrawReplayFiles(Rect r) {
+    ui_.Fill(r, Surface, 14);
+    ui_.Stroke(r.Inset(0.5f), Border, 14);
+    Rect in = r.Inset(14);
+    Rect head = in.CutTop(34);
+    const float tw = ui_.Measure(tr(L"저장한 리플레이"), 14.f, kSemibold) + 4;
+    ui_.Text(head.CutLeft(tw), tr(L"저장한 리플레이"), 14.f, TextColor, Bold());
+    uint64_t total = 0;
+    std::vector<std::wstring> programs;
+    for (const ReplayFile& f : rpFiles_) {
+        total += f.bytes;
+        if (std::none_of(programs.begin(), programs.end(), [&](const std::wstring& p) { return SamePathI(p, f.program); }))
+            programs.push_back(f.program);
+    }
+    if (!rpFiles_.empty()) {
+        head.CutLeft(10);
+        ui_.Text(head, util::Format(tr(L"%zu개 · %s"), rpFiles_.size(), util::FormatBytes(total).c_str()), 12.f, TextFaint);
+    }
+    // Which program's: a list, as there may be many (#53's dropdown).
+    if (programs.size() > 1) {
+        std::vector<MenuItem> items{{tr(L"모든 프로그램"), 0}};
+        int value = 0;
+        for (size_t i = 0; i < programs.size(); ++i) {
+            items.push_back({programs[i], (int)i + 1, i == 0});
+            if (SamePathI(programs[i], rpFilter_)) value = (int)i + 1;
+        }
+        Rect dd = Rect::Centered(head.r - 100, head.CY(), 200, 32);
+        if (Dropdown(HashId("rp.filter"), dd, value ? programs[value - 1] : std::wstring(tr(L"모든 프로그램")),
+                     tr(L"프로그램"), std::move(items), value, TextColor)) {
+            rpFilter_ = value ? programs[value - 1] : L"";
+            rpFileScroll_ = 0;
+        }
+    }
+    in.CutTop(8);
+    // The folder they are read from, along the bottom.
+    Rect foot = in.CutBottom(40);
+    in.CutBottom(6);
+    {
+        ui_.Line(foot.l, foot.t + 0.5f, foot.r, foot.t + 0.5f, Border);
+        const std::wstring open = tr(L"폴더 열기");
+        Rect b = foot.CutRight(ui_.Measure(open, 12.5f, kSemibold) + 44);
+        if (ui_.Button(HashId("rp.openDir"), Rect::Centered(b.CX(), foot.CY() + 3, b.W(), 32), open, BtnStyle::Secondary,
+                       icon::Folder, true, 12.5f)) {
+            util::EnsureDir(ReplayDir());
+            util::ShellOpen(ReplayDir());
+        }
+        foot.CutRight(10);
+        ui_.PushClip(foot);
+        ui_.Text(Rect(foot.l + 2, foot.t + 3, foot.r, foot.b + 3), ReplayDir(), 12.f, TextFaint);
+        ui_.PopClip();
+    }
+
+    Rect list = in;
+    if (rpFiles_.empty()) {
+        Rect c = Rect::Centered(list.CX(), list.CY() - 10, std::min(list.W() - 40, 540.f), 110);
+        ui_.Circle(c.CX(), c.t + 22, 22, Surface2);
+        ui_.Icon(Rect::Centered(c.CX(), c.t + 22, 44, 44), icon::Replay, 18.f, TextDim);
+        const bool any = !settings_.rpTargets.empty();
+        ui_.Text(Rect(c.l, c.t + 54, c.r, c.t + 76), any ? tr(L"아직 저장한 리플레이가 없습니다") : tr(L"저장한 리플레이가 여기에 모입니다"),
+                 14.f, TextColor, Bold(AlignCenter));
+        TextStyle st = Align(AlignCenter, AlignStart);
+        st.wrap = true;
+        const std::wstring tip = any ? util::Format(tr(L"담는 중일 때 저장 단축키(%s)를 누르면 방금 지나간 장면(%s)이 여기에 저장됩니다."),
+                                                    util::HotkeyToString(settings_.rpHkMods, settings_.rpHkVk).c_str(),
+                                                    LenName(kReplayLenOptions[settings_.rpLenIdx]).c_str())
+                                     : std::wstring(tr(L"왼쪽에서 리플레이를 켤 프로그램을 먼저 고르세요."));
+        ui_.Text(Rect(c.l, c.t + 80, c.r, c.b + 20), tip, 12.5f, TextFaint, st);
+        return;
+    }
+
+    // Grouped by the day they were saved, newest first.
+    const SYSTEMTIME today = LocalTime(NowFileTime());
+    const SYSTEMTIME yesterday = LocalTime(NowFileTime() - 864000000000ull);
+    auto dayName = [&](const SYSTEMTIME& t) -> std::wstring {
+        if (t.wYear == today.wYear && t.wMonth == today.wMonth && t.wDay == today.wDay) return tr(L"오늘");
+        if (t.wYear == yesterday.wYear && t.wMonth == yesterday.wMonth && t.wDay == yesterday.wDay) {
+            std::wstring d = tr(L"어제");  // "yesterday" in English, which starts a heading here
+            if (!d.empty()) d[0] = (wchar_t)towupper(d[0]);
+            return d;
+        }
+        static const wchar_t* const kMonths[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
+                                                 L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+        std::wstring d = Language() == Lang::English ? util::Format(L"%s %d", kMonths[(t.wMonth + 11) % 12], t.wDay)
+                                                     : util::Format(L"%d월 %d일", t.wMonth, t.wDay);
+        if (t.wYear != today.wYear) d = util::Format(L"%d. ", t.wYear) + d;
+        return d;
+    };
+    const float rowH = 52, groupH = 30;
+    struct Line {
+        size_t file;  // SIZE_MAX: a day's heading
+        std::wstring day;
+    };
+    std::vector<Line> lines;
+    std::wstring day;
+    for (size_t i = 0; i < rpFiles_.size(); ++i) {
+        if (!rpFilter_.empty() && !SamePathI(rpFiles_[i].program, rpFilter_)) continue;
+        std::wstring d = dayName(LocalTime(rpFiles_[i].written));
+        if (d != day) lines.push_back({SIZE_MAX, day = d});
+        lines.push_back({i, {}});
+    }
+    float content = 0;
+    for (const Line& l : lines) content += l.file == SIZE_MAX ? groupH : rowH + 2;
+    const float maxScroll = std::max(0.f, content - list.H());
+    if (ui_.Hover(list) && ui_.In().wheel != 0) rpFileScroll_ -= ui_.In().wheel * rowH * 2;
+    ui_.KeepInView(list, rpFileScroll_);
+    rpFileScroll_ = std::clamp(rpFileScroll_, 0.f, maxScroll);
+    const float scroll = ui_.Anim(HashId("rp.fileScroll"), rpFileScroll_, 22.f);
+    ui_.PushClip(list);
+    const float w = list.W() - (maxScroll > 0 ? 8 : 0);
+    const uint64_t now = NowFileTime();
+    float y = list.t - scroll;
+    for (const Line& l : lines) {
+        if (l.file == SIZE_MAX) {
+            if (y + groupH >= list.t && y <= list.b)
+                ui_.Text(Rect(list.l + 6, y + 8, list.l + w, y + groupH), l.day, 12.f, TextFaint, Bold());
+            y += groupH;
+            continue;
+        }
+        const size_t i = l.file;
+        const ReplayFile& f = rpFiles_[i];
+        Rect row = Rect::XYWH(list.l, y, w, rowH);
+        y += rowH + 2;
+        const SYSTEMTIME t = LocalTime(f.written);
+        const bool fresh = SamePathI(f.path, rpNewPath_);
+        const std::wstring title = f.program + util::Format(L" · %02d:%02d", t.wHour, t.wMinute);
+        const std::wstring sub = util::FormatClock(f.seconds, false) + L" · " + util::FormatBytes(f.bytes) + L" · " +
+                                 util::FormatAgo(now > f.written ? (now - f.written) / 1e7 : 0);
+        const UiId rid = HashId("rp.file", (uint32_t)i);
+        ui_.Declare(rid, row, Role::Item, title + L", " + sub);
+        if (row.b < list.t || row.t > list.b) continue;
+        if (fresh)
+            ui_.Fill(row, Contrast() ? Surface2 : Mix(Surface2, Accent, 0.14f), 10);
+        else if (ui_.Hover(row))
+            ui_.Fill(row, Surface2, 10);
+        // The program's icon, when one in the list has this name.
+        std::wstring exe;
+        for (const ReplayTarget& rt : settings_.rpTargets)
+            if (!rt.monitor && SamePathI(util::SafeFileName(rt.name, 60), f.program)) exe = rt.path;
+        DrawTargetIcon(Rect::XYWH(row.l + 10, row.CY() - 14, 28, 28), exe, f.program, 0);
+        Rect more = Rect::Centered(row.r - 22, row.CY(), 30, 30);
+        Rect folder = Rect::Centered(more.l - 4 - 15, row.CY(), 30, 30);
+        const std::wstring edit = tr(L"편집");
+        const float ew = ui_.Measure(edit, 12.5f, kSemibold) + 46;
+        Rect editR = Rect::XYWH(folder.l - 8 - ew, row.CY() - 15, ew, 30);
+        Rect text(row.l + 50, row.t, editR.l - 10, row.b);
+        if (rpRenaming_ == (int)i) {
+            const UiId fid = HashId("rp.rename");
+            const bool esc = ui_.In().Key(VK_ESCAPE), enter = ui_.In().Key(VK_RETURN);
+            ui_.Name(tr(L"새 이름"));
+            ui_.TextField(fid, Rect(text.l, row.t + 6, text.r, row.t + 30), rpRenameText_, L"", 120);
+            ui_.Name({});
+            const bool focused = ui_.FocusedField() == fid;
+            if (esc) {
+                rpRenaming_ = -1;
+            } else if (enter || (rpRenameFocused_ && !focused)) {
+                rpRenaming_ = -1;
+                RenameReplay(i, rpRenameText_);
+                break;  // the list changed
+            }
+            rpRenameFocused_ = focused;
+        } else {
+            ui_.PushClip(text);
+            const float titleW = ui_.Measure(title, 13.f, kSemibold) + 2;
+            ui_.Text(Rect(text.l, row.t + 7, text.l + titleW, row.CY() + 2), title, 13.f, TextColor, Bold());
+            if (fresh) {
+                const std::wstring tag = tr(L"새로");
+                Rect chip = Rect::XYWH(text.l + titleW + 6, row.t + 9, ui_.Measure(tag, 10.5f, kBold) + 12, 17);
+                ui_.Fill(chip, WithAlpha(Accent, Contrast() ? 0.f : 0.18f), 6);
+                if (Contrast()) ui_.Stroke(chip.Inset(0.5f), AccentHi, 6);
+                TextStyle ts = Bold(AlignCenter);
+                ts.weight = kBold;
+                ui_.Text(chip, tag, 10.5f, AccentHi, ts);
+            }
+            ui_.PopClip();
+        }
+        ui_.PushClip(text);
+        ui_.Text(Rect(text.l, row.CY() + 2, text.r, row.b - 7), sub, 12.f, TextFaint);
+        ui_.PopClip();
+        if (ui_.Button(HashId("rp.edit", (uint32_t)i), editR, edit, fresh ? BtnStyle::Primary : BtnStyle::Secondary,
+                       icon::Cut, rec_ == RecState::Idle, 12.5f)) {
+            EditReplay(f.path);
+            break;
+        }
+        if (ui_.IconButton(HashId("rp.folder", (uint32_t)i), folder, icon::Folder, tr(L"폴더에서 보기"), true, 13.f))
+            util::OpenFolderAndSelect(f.path);
+        if (ui_.IconButton(HashId("rp.fileMore", (uint32_t)i), more, icon::More, tr(L"더 보기"), true, 13.f)) {
+            rpFileMenu_ = (int)i;
+            rpProgMenu_ = -1;
+        }
+        if (rpFileMenu_ == (int)i) rpMenuAnchor_ = more;
+        if (ui_.Hover(row) && !ui_.Hover(editR) && !ui_.Hover(folder) && !ui_.Hover(more)) ui_.Tooltip(rid, row, f.path);
+    }
+    ui_.PopClip();
+    if (maxScroll > 0) {
+        float th = std::max(30.f, list.H() * list.H() / content);
+        float ty = list.t + (list.H() - th) * (scroll / maxScroll);
+        ui_.Fill(Rect::XYWH(list.r - 4, ty, 4, th), WithAlpha(TextFaint, 0.5f), 2);
+    }
+}
+
+// Under 프로그램 추가: the programs that show a window now, an exe to pick, and the monitors.
+void App::DrawReplayAddPopover(Rect client) {
+    const auto& in = ui_.In();
+    const float W = std::min(380.f, client.W() - 40), itemH = 50, labelH = 28;
+    std::vector<const MonitorDesc*> mons;
+    for (const MonitorDesc& m : monitors_)
+        if (std::none_of(settings_.rpTargets.begin(), settings_.rpTargets.end(), [&](const ReplayTarget& t) {
+                return t.monitor && _wcsicmp(t.path.c_str(), m.device.c_str()) == 0;
+            }))
+            mons.push_back(&m);
+    const std::wstring note = tr(L"목록에는 창이 보이는 프로그램만 나옵니다. 고른 프로그램의 exe 경로와 이름 · 아이콘만 기억하고, 창 제목은 남기지 않습니다.");
+    TextStyle wrap;
+    wrap.wrap = true;
+    wrap.v = AlignStart;
+    DWRITE_TEXT_METRICS m{};
+    float noteH = 34;
+    if (auto lay = Fonts::Layout(note, 11.5f, wrap, W - 32, 200); lay && SUCCEEDED(lay->GetMetrics(&m)))
+        noteH = std::ceil(m.height);
+    const float listH = labelH + std::max<size_t>(rpRunning_.size(), 0) * itemH + (rpRunning_.empty() ? 34 : 0) + itemH +
+                        (mons.empty() ? 0 : labelH + mons.size() * itemH);
+    // Beside the list it adds to, over the saved replays, as high as it fits.
+    const float headH = 44;
+    const float want = headH + listH + 12 + noteH + 16;
+    const float top = std::clamp(rpAddBtn_.t - 60, client.t + 72, std::max(client.t + 72, client.b - 12 - want));
+    const float H = std::min(want, client.b - 12 - top);
+    Rect box = Rect::XYWH(std::clamp(rpAddBtn_.r + 26, client.l + 12, client.r - 12 - W), top, W, H);
+    const bool outside = !box.Contains(in.mx, in.my);
+    if ((in.pressed && outside && !rpAddBtn_.Contains(in.mx, in.my)) || in.Key(VK_ESCAPE)) {
+        rpAddOpen_ = false;
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Shadow, 0.45f), 14);
+    ui_.Fill(box, Surface2, 12);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 12);
+    ui_.Declare(HashId("rp.addBox"), box, Role::Group, tr(L"리플레이를 켤 프로그램 추가"));
+    Rect c = box.Inset(8);
+    Rect head = c.CutTop(headH - 8);
+    ui_.Text(Rect(head.l + 8, head.t, head.r - 36, head.b), tr(L"리플레이를 켤 프로그램 추가"), 13.5f, TextColor, Bold());
+    if (ui_.IconButton(HashId("rp.addClose"), Rect::Centered(head.r - 16, head.CY(), 28, 28), icon::Close, tr(L"닫기"), true, 11.f)) {
+        rpAddOpen_ = false;
+        return;
+    }
+    Rect foot = c.CutBottom(noteH + 12);
+    ui_.Line(foot.l + 4, foot.t + 0.5f, foot.r - 4, foot.t + 0.5f, Border);
+    ui_.Text(Rect(foot.l + 8, foot.t + 9, foot.r - 8, foot.b), note, 11.5f, TextFaint, wrap);
+
+    Rect list = c;
+    const float maxScroll = std::max(0.f, listH - list.H());
+    if (!outside && in.wheel != 0) rpAddScroll_ -= in.wheel * 60;
+    ui_.KeepInView(list, rpAddScroll_);
+    rpAddScroll_ = std::clamp(rpAddScroll_, 0.f, maxScroll);
+    ui_.PushClip(list);
+    Rect cur(list.l, list.t - rpAddScroll_, list.r, list.t - rpAddScroll_ + listH);
+    auto label = [&](std::wstring_view s) { ui_.Text(cur.CutTop(labelH).Inset(8, 0), s, 12.f, TextFaint, Bold()); };
+    auto item = [&](UiId id, std::wstring_view name, std::wstring_view sub, D2D1_COLOR_F subInk,
+                    const std::function<void(Rect)>& drawIcon) {
+        Rect r = cur.CutTop(itemH);
+        const bool clicked = ui_.Click(id, r);
+        ui_.Describe(id, std::wstring(name) + L", " + std::wstring(sub), Role::Item);
+        if (ui_.Hover(r) || (ui_.FocusRing() && ui_.KeyboardFocus() == id)) ui_.Fill(r, Surface3, 8);
+        drawIcon(Rect::XYWH(r.l + 8, r.CY() - 14, 28, 28));
+        Rect t(r.l + 46, r.t, r.r - 8, r.b);
+        ui_.PushClip(t);
+        ui_.Text(Rect(t.l, r.t + 6, t.r, r.CY() + 2), name, 13.f, TextColor, Bold());
+        ui_.Text(Rect(t.l, r.CY() + 1, t.r, r.b - 6), sub, 12.f, subInk);
+        ui_.PopClip();
+        return clicked;
+    };
+    label(tr(L"지금 실행 중"));
+    if (rpRunning_.empty())
+        ui_.Text(cur.CutTop(34).Inset(8, 0), tr(L"목록에 없는 실행 중인 프로그램이 없습니다"), 12.f, TextFaint);
+    for (size_t i = 0; i < rpRunning_.size(); ++i) {
+        const RunningProgram& p = rpRunning_[i];
+        const std::wstring sub = util::FileNameOf(p.path) + (p.full ? tr(L" · 전체 화면으로 실행 중") : L"");
+        if (item(HashId("rp.addRun", (uint32_t)i), p.name, sub, p.full ? AccentHi : TextFaint,
+                 [&](Rect ic) { DrawTargetIcon(ic, p.path, p.name, 0); })) {
+            ReplayTarget t{false, p.path, p.name, true};
+            rpAddOpen_ = false;
+            ui_.PopClip();
+            AddReplayTarget(std::move(t));
+            return;
+        }
+    }
+    if (item(HashId("rp.addExe"), tr(L"exe 파일 찾아보기…"), tr(L"실행하지 않은 게임은 실행 파일로 넣습니다"), TextFaint,
+             [&](Rect ic) {
+                 ui_.Fill(ic, Surface3, 7);
+                 ui_.Icon(ic, icon::Folder, 13.f, TextDim);
+             })) {
+        rpAddOpen_ = false;
+        ui_.PopClip();
+        BrowseReplayProgram();
+        return;
+    }
+    if (!mons.empty()) label(tr(L"프로그램이 아닌 대상"));
+    for (size_t i = 0; i < mons.size(); ++i) {
+        const MonitorDesc& md = *mons[i];
+        const std::wstring sub = util::Format(L"%d × %d", md.rect.right - md.rect.left, md.rect.bottom - md.rect.top) +
+                                 (md.primary ? tr(L" · 주 모니터") : L"") + tr(L" · 프로그램이 하나도 실행되지 않을 때 담습니다");
+        if (item(HashId("rp.addMon", (uint32_t)i), util::Format(tr(L"전체 화면 · 화면 %d"), md.number), sub, TextFaint,
+                 [&](Rect ic) { DrawTargetIcon(ic, L"", L"", md.number); })) {
+            ReplayTarget t{true, md.device, L"", true};
+            rpAddOpen_ = false;
+            ui_.PopClip();
+            AddReplayTarget(std::move(t));
+            return;
+        }
+    }
+    ui_.PopClip();
+}
+
+// The ⋯ menus of the two lists.
+void App::DrawReplayMenus(Rect client) {
+    const auto& in = ui_.In();
+    struct Item {
+        std::wstring text;
+        bool danger;
+    };
+    std::vector<Item> items;
+    if (rpProgMenu_ >= 0) items = {{tr(L"목록에서 빼기"), false}};
+    if (rpFileMenu_ >= 0) items = {{tr(L"이름 바꾸기"), false}, {tr(L"휴지통으로 버리기"), true}};
+    float w = 0;
+    for (const Item& it : items) w = std::max(w, ui_.Measure(it.text, 13.f) + 36);
+    const float itemH = 34, pad = 5, h = pad * 2 + items.size() * itemH;
+    float top = rpMenuAnchor_.b + 4;
+    if (top + h > client.b - 8) top = rpMenuAnchor_.t - 4 - h;
+    Rect box = Rect::XYWH(std::clamp(rpMenuAnchor_.r - w, client.l + 12, client.r - 12 - w), top, w, h);
+    auto close = [&] {
+        rpProgMenu_ = rpFileMenu_ = -1;
+        Invalidate();
+    };
+    if ((in.pressed && !box.Contains(in.mx, in.my)) || in.Key(VK_ESCAPE)) {
+        close();
+        return;
+    }
+    ui_.Fill(box.Offset(0, 6), WithAlpha(Shadow, 0.45f), 12);
+    ui_.Fill(box, Surface2, 10);
+    ui_.Stroke(box.Inset(0.5f), BorderStrong, 10);
+    ui_.Declare(HashId("rp.menu"), box, Role::Group, tr(L"더 보기"));
+    Rect c = box.Inset(pad);
+    for (size_t k = 0; k < items.size(); ++k) {
+        Rect row = c.CutTop(itemH);
+        const UiId id = HashId("rp.menuItem", (uint32_t)k);
+        const bool clicked = ui_.Click(id, row);
+        ui_.Describe(id, items[k].text, Role::Item);
+        if (ui_.Hover(row) || (ui_.FocusRing() && ui_.KeyboardFocus() == id)) ui_.Fill(row, Surface3, 6);
+        ui_.Text(Rect(row.l + 12, row.t, row.r - 8, row.b), items[k].text, 13.f, items[k].danger ? RecHi : TextColor);
+        if (!clicked) continue;
+        const int prog = rpProgMenu_, file = rpFileMenu_;
+        close();
+        if (prog >= 0) {
+            RemoveReplayTarget((size_t)prog);
+        } else if (file >= 0 && (size_t)file < rpFiles_.size() && k == 0) {
+            rpRenaming_ = file;
+            rpRenameFocused_ = false;
+            std::wstring stem = util::FileNameOf(rpFiles_[file].path);
+            if (stem.size() > 4) stem.resize(stem.size() - 4);
+            rpRenameText_ = stem;
+            ui_.Focus(HashId("rp.rename"));
+        } else if (file >= 0 && (size_t)file < rpFiles_.size()) {
+            TrashReplay((size_t)file);
+        }
+        return;
+    }
+}
+
+// 저장 단축키's row is the same as the 녹화 tab's (HotkeyRow).
+void App::SettingsReplay(Rect& area, bool& changed) {
+    bool on = settings_.rpOn;
+    SettingRow(area, tr(L"순간 리플레이"),
+               on ? tr(L"켜져 있습니다 · 리플레이 탭의 프로그램이 실행되면 방금 지나간 장면을 메모리에 담습니다")
+                  : tr(L"켜 두면 리플레이 탭에 고른 프로그램이 실행될 때마다 방금 지나간 장면을 메모리에 담습니다"),
+               60, [&](Rect c) {
+                   if (ui_.Toggle(HashId("set.rpOn"), Rect::Centered(c.r - 22, c.CY(), 44, 24), on)) SetReplayOn(on);
+               });
+    // What it holds costs memory: the bitrate times the length (and the keyframe interval it keeps over).
+    int sw = 1920, sh = 1080;
+    if (rpCap_.Running() && rpCap_.OutWidth() > 0) {
+        sw = rpCap_.OutWidth();
+        sh = rpCap_.OutHeight();
+    } else {
+        for (const MonitorDesc& m : monitors_)
+            if (m.primary) sw = m.rect.right - m.rect.left, sh = m.rect.bottom - m.rect.top;
+        float f = 1;
+        if (int res = kVideoResOptions[settings_.rpResIdx]) {
+            f = std::min(f, std::min((float)res / std::min(sw, sh), (float)res * 16 / 9 / std::max(sw, sh)));
+        }
+        f = std::min(f, 4096.f / std::max(sw, sh));
+        sw = (int)std::lround(sw * f / 2) * 2;
+        sh = (int)std::lround(sh * f / 2) * 2;
+    }
+    const int fps = kVideoFpsOptions[settings_.rpFpsIdx];
+    const uint64_t bps = (settings_.VideoBitrate() ? settings_.VideoBitrate() : Mp4Writer::AutoBitrate(sw, sh, fps, false)) +
+                         (settings_.rpAudio || settings_.rpMic ? kAudioBitrateOptions[settings_.aBitrateIdx] * 1000 : 0);
+    const uint64_t bytes = bps / 8 * (kReplayLenOptions[settings_.rpLenIdx] + kKeyframeOptions[settings_.vKeyIdx] + 2);
+    SettingRow(area, tr(L"리플레이 길이"),
+               util::Format(tr(L"메모리 약 %s · %d×%d %dfps 기준"), util::FormatBytes(bytes).c_str(), sw, sh, fps), 330,
+               [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.rpLen"), c,
+                                            {LenName(15), LenName(30), LenName(60), LenName(120), LenName(300)},
+                                            settings_.rpLenIdx);
+               });
+    SettingRow(area, tr(L"프레임"), tr(L"게임은 60이면 충분합니다 · 켜 둔 채 바꾸면 처음부터 다시 담습니다"), 230, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.rpFps"), c, {L"24", L"30", L"60"}, settings_.rpFpsIdx);
+    });
+    SettingRow(area, tr(L"해상도"), tr(L"원본보다 크게 키우지는 않습니다 · 낮추면 메모리를 덜 씁니다"), 380, [&](Rect c) {
+        changed |= ui_.Segmented(HashId("set.rpRes"), c, {tr(L"원본"), L"2160p", L"1440p", L"1080p", L"720p"},
+                                 settings_.rpResIdx);
+    });
+    SettingRow(area, tr(L"소리"), tr(L"게임 · 앱 소리를 함께 담습니다"), 60, [&](Rect c) {
+        changed |= ui_.Toggle(HashId("set.rpAudio"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.rpAudio);
+    });
+    SettingRow(area, tr(L"마이크"),
+               settings_.rpMic ? tr(L"켜져 있습니다 · 방 소리가 늘 메모리에 담깁니다 · 상태 띠에 ‘마이크 포함’이 보입니다")
+                               : tr(L"처음에는 꺼져 있습니다 · 녹화 탭의 마이크와 따로 정합니다"),
+               60, [&](Rect c) {
+                   changed |= ui_.Toggle(HashId("set.rpMic"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.rpMic);
+               });
+    SettingRow(area, tr(L"마우스 커서"), tr(L"커서를 함께 담습니다"), 60, [&](Rect c) {
+        changed |= ui_.Toggle(HashId("set.rpCursor"), Rect::Centered(c.r - 22, c.CY(), 44, 24), settings_.rpCursor);
+    });
+    HotkeyRow(area, kHotkeyReplay, tr(L"저장 단축키"),
+              settings_.rpOn && !replayHotkeyOk_
+                  ? tr(L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요")
+              : settings_.rpHkHook ? tr(L"다른 프로그램보다 먼저 받습니다 · 그 프로그램에서는 이 조합이 듣지 않습니다")
+                                   : tr(L"리플레이가 켜져 있을 때만 씁니다 · 방금 지나간 장면을 MP4로 저장합니다"));
+    SettingRow(area, tr(L"저장 폴더"),
+               tr(L"저장 폴더 › 리플레이 › 프로그램 이름 폴더에 MP4로 저장합니다 · 리플레이 탭의 목록은 이 폴더를 읽습니다"), 110,
+               [&](Rect c) {
+                   if (ui_.Button(HashId("set.rpDir"), c, tr(L"열기"), BtnStyle::Secondary, icon::Folder, true, 13.f)) {
+                       util::EnsureDir(ReplayDir());
+                       util::ShellOpen(ReplayDir());
+                   }
+               });
+    SettingRow(area, tr(L"화질"), tr(L"코덱 · 비트레이트 · 키프레임 간격은 설정 › 동영상을 따릅니다 (리플레이는 H.264)"), 150,
+               [&](Rect c) {
+                   if (ui_.Button(HashId("set.rpVideo"), c, tr(L"동영상 설정 ›"), BtnStyle::Secondary, 0, true, 13.f))
+                       OpenSettings(kTabVideo);
+               });
 }
 
 // ---------------------------------------------------------------- editor
@@ -2571,19 +3423,25 @@ void App::DrawSettings(Rect r) {
                           {L"녹화", icon::Record},
                           {L"동영상", icon::Video},
                           {L"소리", icon::Volume},
-                          {L"정보", icon::Info}};
+                          {L"정보", icon::Info},
+                          {L"리플레이", icon::Replay}};
+    // The order they are shown in; the numbers stay as they were saved.
+    static constexpr int kOrder[kTabCount] = {kTabGeneral, kTabRecord, kTabReplay, kTabVideo, kTabAudio, kTabAbout};
     int tab = settings_.settingsTab;
     Rect list = in.CutLeft(150);
     ui_.Declare(HashId("set.tabs"), list, Role::Group, tr(L"설정 탭"));
     ui_.Line(list.r + 12.5f, list.t, list.r + 12.5f, list.b, Border);
     in.CutLeft(28);
-    for (int i = 0; i < kTabCount; ++i) {
+    int shownAt = 0;
+    for (int k = 0; k < kTabCount; ++k) {
+        const int i = kOrder[k];
+        if (i == tab) shownAt = k;
         Rect item = list.CutTop(40);
         list.CutTop(4);
         bool on = i == tab;
         if (ui_.Click(HashId("set.tab", i), item)) tab = i;
         if (UiNode* n = ui_.Describe(HashId("set.tab", i), tr(kTabs[i].name), Role::Tab))
-            n->on = on, n->pos = i, n->count = kTabCount, n->group = HashId("set.tabs");
+            n->on = on, n->pos = k, n->count = kTabCount, n->group = HashId("set.tabs");
         float hl = ui_.Anim(HashId("set.tabHl", i), on ? 1.f : ui_.Hover(item) ? 0.5f : 0.f);
         const bool onHighlight = on && Contrast();
         if (onHighlight)
@@ -2596,7 +3454,7 @@ void App::DrawSettings(Rect r) {
         ui_.Text(Rect(item.l + 42, item.t, item.r - 8, item.b), tr(kTabs[i].name), 14.f,
                  onHighlight ? OnFill : on ? TextColor : TextDim, on ? Bold() : TextStyle{});
     }
-    if (ui_.In().ctrl && ui_.In().Key(VK_TAB)) tab = (tab + (ui_.In().shift ? kTabCount - 1 : 1)) % kTabCount;
+    if (ui_.In().ctrl && ui_.In().Key(VK_TAB)) tab = kOrder[(shownAt + (ui_.In().shift ? kTabCount - 1 : 1)) % kTabCount];
     if (tab != settings_.settingsTab) {
         settings_.settingsTab = tab;
         settingsScroll_ = 0;
@@ -2622,6 +3480,7 @@ void App::DrawSettings(Rect r) {
         case kTabVideo: SettingsVideo(area, changed); break;
         case kTabAudio: SettingsAudio(area, changed); break;
         case kTabAbout: SettingsAbout(area); break;
+        case kTabReplay: SettingsReplay(area, changed); break;
     }
     settingsContentH_ = area.t - top + 8;
     ui_.PopClip();
@@ -2816,8 +3675,8 @@ void App::AskReset() {
     Ask(std::move(q));
 }
 
-void App::SettingsRecord(Rect& area, bool& changed) {
-    // A hotkey row, and under it, when the combination pressed is another program's, the offer to take it over (#50).
+// A hotkey row, and under it, when the combination pressed is another program's, the offer to take it over (#50).
+void App::HotkeyRow(Rect& area, int which, std::wstring_view title, std::wstring_view desc) {
     const std::wstring caveat = tr(L"OzMaker가 쓰면 그 프로그램에서는 이 조합이 듣지 않습니다. 관리자 권한으로 실행한 게임 안에서는 OzMaker도 받지 못할 수 있습니다.");
     TextStyle wrap;
     wrap.wrap = true;
@@ -2827,73 +3686,73 @@ void App::SettingsRecord(Rect& area, bool& changed) {
     if (auto lay = Fonts::Layout(caveat, 12.f, wrap, area.W() - 32 - 28, 200); lay && SUCCEEDED(lay->GetMetrics(&m)))
         caveatH = std::ceil(m.height);
     const float panelH = 14 + 22 + 10 + 32 + 10 + caveatH + 14;
-    auto hotkeyRow = [&](int which, const wchar_t* title, std::wstring_view desc, UINT mods, UINT vk, bool taken) {
-        const float top = area.t;
-        const bool conflict = hkConflict_.which == which;
-        Rect more = SettingRow(
-            area, title, desc, 230,
-            [&](Rect c) {
-                bool on = capturingHotkey_ == which;
-                std::wstring label = on ? tr(L"키 조합을 누르세요…") : util::HotkeyToString(mods, vk);
-                if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
-                               icon::Keyboard, true, 13.f))
-                    SetCapturingHotkey(on ? 0 : which);
-            },
-            conflict ? panelH + 14 : 0);
-        if (taken) {  // 가져옴: received ahead of the program that has it
-            const std::wstring tag = tr(L"가져옴");
-            const float x = area.l + ui_.Measure(title, 14.f, kSemibold) + 10, tw = ui_.Measure(tag, 11.f, kSemibold) + 14;
-            Rect chip = Rect::XYWH(x, top + 14, tw, 18);
-            ui_.Fill(chip, WithAlpha(Accent, Contrast() ? 0.f : 0.18f), 9);
-            if (Contrast()) ui_.Stroke(chip.Inset(0.5f), AccentHi, 9);
-            ui_.Text(chip, tag, 11.f, AccentHi, Bold(AlignCenter));
-        }
-        if (!conflict) return;
-        Rect box = more.CutTop(panelH);
-        ui_.Fill(box, WithAlpha(Warning, Contrast() ? 0.f : 0.08f), 10);
-        ui_.Stroke(box.Inset(0.5f), WithAlpha(Warning, 0.5f), 10);
-        const std::wstring combo = util::HotkeyToString(hkConflict_.mods, hkConflict_.vk);
-        const std::wstring head = tr(L"다른 프로그램이 이미 쓰고 있는 조합입니다:");
-        ui_.Declare(HashId("set.hkConflict"), box, Role::Group, head + L" " + combo);
-        Rect c = box.Inset(16, 14);
-        ui_.Icon(Rect::XYWH(c.l, c.t, 18, 22), icon::Warning, 14.f, Warning);
-        c.CutLeft(28);
-        Rect line = c.CutTop(22);
-        const float hw = ui_.Measure(head, 13.f, kSemibold) + 4;
-        ui_.Text(line.CutLeft(hw), head, 13.f, TextColor, Bold());
-        line.CutLeft(8);
-        Rect key = line.CutLeft(ui_.Measure(combo, 12.f, kSemibold) + 16);
-        ui_.Fill(key.Inset(0, 1), Surface3, 6);
-        ui_.Stroke(key.Inset(0.5f, 1.5f), BorderStrong, 6);
-        ui_.Text(key, combo, 12.f, TextColor, Bold(AlignCenter));
-        c.CutTop(10);
-        Rect btns = c.CutTop(32);
-        const std::wstring take = tr(L"그래도 OzMaker가 쓰기"), again = tr(L"다른 조합 누르기"), cancel = tr(L"취소");
-        if (ui_.Button(HashId("set.hkTake"), btns.CutLeft(ui_.Measure(take, 13.f, kSemibold) + 32), take, BtnStyle::Primary,
-                       0, true, 13.f))
-            TakeHotkey();
-        btns.CutLeft(8);
-        if (ui_.Button(HashId("set.hkAgain"), btns.CutLeft(ui_.Measure(again, 13.f, kSemibold) + 32), again,
-                       BtnStyle::Secondary, 0, true, 13.f))
-            SetCapturingHotkey(which);
-        btns.CutLeft(8);
-        if (ui_.Button(HashId("set.hkCancel"), btns.CutLeft(ui_.Measure(cancel, 13.f, kSemibold) + 32), cancel,
-                       BtnStyle::Ghost, 0, true, 13.f))
-            hkConflict_ = {};
-        c.CutTop(10);
-        ui_.Text(c.CutTop(caveatH), caveat, 12.f, TextFaint, wrap);
-    };
+    auto [mods, vk, taken] = Hotkey(which);
+    const float top = area.t;
+    const bool conflict = hkConflict_.which == which;
+    Rect more = SettingRow(
+        area, title, desc, 230,
+        [&](Rect c) {
+            bool on = capturingHotkey_ == which;
+            std::wstring label = on ? tr(L"키 조합을 누르세요…") : util::HotkeyToString(mods, vk);
+            if (ui_.Button(HashId("set.hotkey", which), c, label, on ? BtnStyle::Primary : BtnStyle::Secondary,
+                           icon::Keyboard, true, 13.f))
+                SetCapturingHotkey(on ? 0 : which);
+        },
+        conflict ? panelH + 14 : 0);
+    if (taken) {  // 가져옴: received ahead of the program that has it
+        const std::wstring tag = tr(L"가져옴");
+        const float x = area.l + ui_.Measure(title, 14.f, kSemibold) + 10, tw = ui_.Measure(tag, 11.f, kSemibold) + 14;
+        Rect chip = Rect::XYWH(x, top + 14, tw, 18);
+        ui_.Fill(chip, WithAlpha(Accent, Contrast() ? 0.f : 0.18f), 9);
+        if (Contrast()) ui_.Stroke(chip.Inset(0.5f), AccentHi, 9);
+        ui_.Text(chip, tag, 11.f, AccentHi, Bold(AlignCenter));
+    }
+    if (!conflict) return;
+    Rect box = more.CutTop(panelH);
+    ui_.Fill(box, WithAlpha(Warning, Contrast() ? 0.f : 0.08f), 10);
+    ui_.Stroke(box.Inset(0.5f), WithAlpha(Warning, 0.5f), 10);
+    const std::wstring combo = util::HotkeyToString(hkConflict_.mods, hkConflict_.vk);
+    const std::wstring head = tr(L"다른 프로그램이 이미 쓰고 있는 조합입니다:");
+    ui_.Declare(HashId("set.hkConflict"), box, Role::Group, head + L" " + combo);
+    Rect c = box.Inset(16, 14);
+    ui_.Icon(Rect::XYWH(c.l, c.t, 18, 22), icon::Warning, 14.f, Warning);
+    c.CutLeft(28);
+    Rect line = c.CutTop(22);
+    const float hw = ui_.Measure(head, 13.f, kSemibold) + 4;
+    ui_.Text(line.CutLeft(hw), head, 13.f, TextColor, Bold());
+    line.CutLeft(8);
+    Rect key = line.CutLeft(ui_.Measure(combo, 12.f, kSemibold) + 16);
+    ui_.Fill(key.Inset(0, 1), Surface3, 6);
+    ui_.Stroke(key.Inset(0.5f, 1.5f), BorderStrong, 6);
+    ui_.Text(key, combo, 12.f, TextColor, Bold(AlignCenter));
+    c.CutTop(10);
+    Rect btns = c.CutTop(32);
+    const std::wstring take = tr(L"그래도 OzMaker가 쓰기"), again = tr(L"다른 조합 누르기"), cancel = tr(L"취소");
+    if (ui_.Button(HashId("set.hkTake"), btns.CutLeft(ui_.Measure(take, 13.f, kSemibold) + 32), take, BtnStyle::Primary,
+                   0, true, 13.f))
+        TakeHotkey();
+    btns.CutLeft(8);
+    if (ui_.Button(HashId("set.hkAgain"), btns.CutLeft(ui_.Measure(again, 13.f, kSemibold) + 32), again,
+                   BtnStyle::Secondary, 0, true, 13.f))
+        SetCapturingHotkey(which);
+    btns.CutLeft(8);
+    if (ui_.Button(HashId("set.hkCancel"), btns.CutLeft(ui_.Measure(cancel, 13.f, kSemibold) + 32), cancel,
+                   BtnStyle::Ghost, 0, true, 13.f))
+        hkConflict_ = {};
+    c.CutTop(10);
+    ui_.Text(c.CutTop(caveatH), caveat, 12.f, TextFaint, wrap);
+}
+
+void App::SettingsRecord(Rect& area, bool& changed) {
     const wchar_t* takenDesc = tr(L"다른 프로그램보다 먼저 받습니다 · 그 프로그램에서는 이 조합이 듣지 않습니다");
-    hotkeyRow(kHotkeyRecord, tr(L"녹화 단축키"),
+    HotkeyRow(area, kHotkeyRecord, tr(L"녹화 단축키"),
               !hotkeyOk_          ? tr(L"⚠ 다른 프로그램이 사용 중이라 등록하지 못했습니다. 다른 조합을 지정하세요")
               : settings_.hkHook ? takenDesc
-                                 : tr(L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"),
-              settings_.hkMods, settings_.hkVk, settings_.hkHook);
-    hotkeyRow(kHotkeyPause, tr(L"일시정지 단축키"),
+                                 : tr(L"게임 중에도 이 키로 녹화를 시작/중지합니다 (창 탭: 지금 보고 있는 창)"));
+    HotkeyRow(area, kHotkeyPause, tr(L"일시정지 단축키"),
               !pauseHotkeyOk_         ? tr(L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요")
               : settings_.hkPauseHook ? takenDesc
-                                      : tr(L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"),
-              settings_.hkPauseMods, settings_.hkPauseVk, settings_.hkPauseHook);
+                                      : tr(L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"));
 
     // 녹화 타이머 (#47): the same one as the 녹화 tab's button.
     const bool custom = settings_.timerIdx == kTimerCustom;

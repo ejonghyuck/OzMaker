@@ -475,6 +475,196 @@ LRESULT RecOverlay::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// ---------------------------------------------------------------- ReplayNotice
+
+namespace {
+constexpr UINT_PTR kNoticeTimer = 1;
+constexpr float kNoticeBtnW[3] = {0, 66, 62}, kNoticeBtnH = 30;
+
+float TextWidth(std::wstring_view s, float size, DWRITE_FONT_WEIGHT w) {
+    TextStyle st;
+    st.weight = w;
+    DWRITE_TEXT_METRICS m{};
+    auto lay = Fonts::Layout(s, size, st, 2000, 100);
+    return lay && SUCCEEDED(lay->GetMetrics(&m)) ? std::ceil(m.widthIncludingTrailingWhitespace) : 0.f;
+}
+}  // namespace
+
+void ReplayNotice::Init(HINSTANCE inst, ID2D1Factory1* factory) {
+    inst_ = inst;
+    factory_ = factory;
+}
+
+float ReplayNotice::Width(const Content& c) {
+    float text = std::max(TextWidth(c.title, 13.f, kBold), TextWidth(c.sub, 12.f, DWRITE_FONT_WEIGHT_NORMAL));
+    float w = 16 + 28 + 12 + text + 18;
+    if (c.buttons) w += kNoticeBtnW[kEdit] + 6 + kNoticeBtnW[kFolder] + 12 - 6;
+    return std::ceil(std::min(w, 640.f));
+}
+
+Rect ReplayNotice::ButtonRect(int b) const {
+    if (!c_.buttons) return {};
+    const float folderL = width_ - 12 - kNoticeBtnW[kFolder];
+    const float y = (kHeight - kNoticeBtnH) / 2;
+    return b == kFolder ? Rect::XYWH(folderL, y, kNoticeBtnW[kFolder], kNoticeBtnH)
+                        : Rect::XYWH(folderL - 6 - kNoticeBtnW[kEdit], y, kNoticeBtnW[kEdit], kNoticeBtnH);
+}
+
+int ReplayNotice::ButtonAt(float x, float y) const {
+    for (int b : {kEdit, kFolder})
+        if (ButtonRect(b).Inset(-2).Contains(x, y)) return b;
+    return 0;
+}
+
+void ReplayNotice::Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton) {
+    if (!win_.Hwnd()) {
+        win_.Create(inst_, factory_, L"OzMakerNotice", WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, Proc, this);
+        SetWindowDisplayAffinity(win_.Hwnd(), WDA_EXCLUDEFROMCAPTURE);  // never shows up in recordings
+    }
+    c_ = std::move(c);
+    onButton_ = std::move(onButton);
+    hover_ = 0;
+    ms_ = ms;
+    // Without buttons the clicks go through to what is under it (the game).
+    LONG_PTR ex = GetWindowLongPtrW(win_.Hwnd(), GWL_EXSTYLE);
+    ex = c_.buttons ? ex & ~WS_EX_TRANSPARENT : ex | WS_EX_TRANSPARENT;
+    SetWindowLongPtrW(win_.Hwnd(), GWL_EXSTYLE, ex);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT vis;
+    if (!IntersectRect(&vis, &target, full ? &mi.rcMonitor : &mi.rcWork)) vis = mi.rcWork;
+    scale_ = ScaleForRect(vis);
+    width_ = Width(c_);
+    const int w = (int)std::lround(width_ * scale_), h = (int)std::lround(kHeight * scale_);
+    // Below a window's title bar; near the top of a full screen game.
+    const int x = (vis.left + vis.right - w) / 2, y = vis.top + (int)std::lround((full ? 24 : 52) * scale_);
+    rect_ = {x, y, x + w, y + h};
+    shown_ = true;
+    Redraw();
+    SetWindowPos(win_.Hwnd(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetTimer(win_.Hwnd(), kNoticeTimer, ms_, nullptr);
+}
+
+void ReplayNotice::Hide() {
+    shown_ = false;
+    onButton_ = nullptr;
+    if (win_.Hwnd()) {
+        KillTimer(win_.Hwnd(), kNoticeTimer);
+        ShowWindow(win_.Hwnd(), SW_HIDE);
+    }
+}
+
+void ReplayNotice::Redraw() {
+    if (shown_) win_.Render(rect_, scale_, true, [&](Painter& p) { Paint(p); });
+}
+
+void ReplayNotice::PaintTest(Painter& p, const Content& c, int hover) {
+    c_ = c;
+    width_ = Width(c);
+    hover_ = hover;
+    Paint(p);
+    hover_ = 0;
+}
+
+void ReplayNotice::Paint(Painter& p) {
+    theme::Use colors(theme::OverlayPalette());
+    Rect r(0.5f, 0.5f, width_ - 0.5f, kHeight - 0.5f);
+    p.Fill(r, Panel(0.94f), 14);
+    p.Stroke(r, Edge(0.10f), 14);
+    const float cy = kHeight / 2;
+    if (c_.ok) {
+        p.Circle(16 + 14, cy, 14, WithAlpha(Success, Contrast() ? 1.f : 0.16f));
+        p.Icon(Rect::XYWH(16, cy - 14, 28, 28), 0xE73E /*CheckMark*/, 13.f, Contrast() ? OnFill : Success);
+    } else {
+        p.Circle(16 + 14, cy, 14, WithAlpha(Warning, Contrast() ? 1.f : 0.16f));
+        p.Icon(Rect::XYWH(16, cy - 14, 28, 28), 0xE7BA /*Warning*/, 13.f, Contrast() ? OnFill : Warning);
+    }
+    const float tx = 16 + 28 + 12;
+    const float right = c_.buttons ? ButtonRect(kEdit).l - 10 : width_ - 16;
+    TextStyle bold;
+    bold.weight = kBold;
+    p.Text(Rect(tx, 8, right, 28), c_.title, 13.f, Ink(), bold);
+    p.Text(Rect(tx, 28, right, 48), c_.sub, 12.f, TextDim);
+    if (!c_.buttons) return;
+    for (int b : {kEdit, kFolder}) {
+        Rect br = ButtonRect(b);
+        const bool hot = hover_ == b, primary = b == kEdit;
+        if (Contrast()) {
+            p.Fill(br, primary ? Accent : Bg, 8);
+            p.Stroke(br.Inset(0.5f), Border, 8, hot ? 2.f : 1.f);
+        } else {
+            p.Fill(br, primary ? (hot ? AccentHi : Accent) : WithAlpha(White, hot ? 0.20f : 0.10f), 8);
+        }
+        const D2D1_COLOR_F ink = Contrast() ? (primary ? OnFill : TextColor) : White;
+        const wchar_t glyph = primary ? 0xE8C6 /*Cut*/ : 0xE8B7 /*Folder*/;
+        const wchar_t* label = primary ? tr(L"편집") : tr(L"폴더");
+        const float lw = TextWidth(label, 12.5f, kSemibold), x = std::round(br.CX() - (14 + 5 + lw) / 2);
+        p.Icon(Rect::XYWH(x, br.t, 14, br.H()), glyph, 12.f, ink);
+        TextStyle st;
+        st.weight = kSemibold;
+        p.Text(Rect(x + 19, br.t, br.r, br.b), label, 12.5f, ink, st);
+    }
+}
+
+LRESULT CALLBACK ReplayNotice::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)l)->lpCreateParams);
+    auto* self = (ReplayNotice*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    return self ? self->Handle(h, m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT ReplayNotice::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
+    auto toDip = [&](LPARAM lp) {
+        return std::pair<float, float>{GET_X_LPARAM(lp) / scale_, GET_Y_LPARAM(lp) / scale_};
+    };
+    switch (m) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_TIMER:
+            if (w == kNoticeTimer) {
+                // Not while the pointer is on a button: it goes once the pointer leaves.
+                if (hover_) return 0;
+                Hide();
+            }
+            return 0;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, hover_ ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        case WM_MOUSEMOVE: {
+            auto [x, y] = toDip(l);
+            int hov = ButtonAt(x, y);
+            if (!tracking_) {
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+                TrackMouseEvent(&tme);
+                tracking_ = true;
+            }
+            if (hov != hover_) {
+                hover_ = hov;
+                Redraw();
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            tracking_ = false;
+            if (hover_) {
+                hover_ = 0;
+                Redraw();
+                SetTimer(h, kNoticeTimer, 1500, nullptr);
+            }
+            return 0;
+        case WM_LBUTTONUP: {
+            auto [x, y] = toDip(l);
+            const int b = ButtonAt(x, y);
+            auto cb = onButton_;
+            if (b) {
+                Hide();
+                if (cb) cb(b);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 // ---------------------------------------------------------------- PickerOverlay
 
 void PickerOverlay::Init(HINSTANCE inst, ID2D1Factory1* factory) {

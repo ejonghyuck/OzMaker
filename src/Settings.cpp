@@ -138,6 +138,16 @@ void Settings::Load() {
     hkPauseVk = (UINT)ReadInt(ini, L"PauseHotkeyKey", (int)hkPauseVk, 1, 0xFE);
     hkHook = ReadInt(ini, L"HotkeyHook", hkHook, 0, 1) != 0;
     hkPauseHook = ReadInt(ini, L"PauseHotkeyHook", hkPauseHook, 0, 1) != 0;
+    rpOn = ReadInt(ini, L"Replay", rpOn, 0, 1) != 0;
+    rpLenIdx = ReadInt(ini, L"ReplayLength", rpLenIdx, 0, _countof(kReplayLenOptions) - 1);
+    rpFpsIdx = ReadInt(ini, L"ReplayFps", rpFpsIdx, 0, _countof(kVideoFpsOptions) - 1);
+    rpResIdx = ReadInt(ini, L"ReplayRes", rpResIdx, 0, _countof(kVideoResOptions) - 1);
+    rpAudio = ReadInt(ini, L"ReplayAudio", rpAudio, 0, 1) != 0;
+    rpMic = ReadInt(ini, L"ReplayMic", rpMic, 0, 1) != 0;
+    rpCursor = ReadInt(ini, L"ReplayCursor", rpCursor, 0, 1) != 0;
+    rpHkMods = (UINT)ReadInt(ini, L"ReplayHotkeyMods", (int)rpHkMods, 0, 0xF);
+    rpHkVk = (UINT)ReadInt(ini, L"ReplayHotkeyKey", (int)rpHkVk, 1, 0xFE);
+    rpHkHook = ReadInt(ini, L"ReplayHotkeyHook", rpHkHook, 0, 1) != 0;
     startHide = ReadInt(ini, L"StartHide", startHide, 0, 1);
     // The timer took the place of 최대 녹화 길이 (끔, 10분, 30분, 1시간) in 0.6.5: a length set there still stops.
     if ((int)GetPrivateProfileIntW(L"OzMaker", L"Timer", (UINT)-1, ini.c_str()) < 0) {
@@ -197,6 +207,20 @@ void Settings::Load() {
     for (size_t i = 0; i < kMaxRecent; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Recent%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
         if (*buf) recent.push_back(buf);
+    }
+    // ReplayN=<p|m><1|0>|<path>|<name>: a program or a monitor, switched on or not, then what it is.
+    rpTargets.clear();
+    for (size_t i = 0; i < kMaxReplayTargets; ++i) {
+        GetPrivateProfileStringW(L"OzMaker", util::Format(L"Replay%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
+        std::wstring v = buf;
+        size_t a = v.find(L'|'), b = a == std::wstring::npos ? a : v.find(L'|', a + 1);
+        if (a != 2 || b == std::wstring::npos) break;
+        ReplayTarget t;
+        t.monitor = v[0] == L'm';
+        t.on = v[1] != L'0';
+        t.path = v.substr(a + 1, b - a - 1);
+        t.name = v.substr(b + 1);
+        if (!t.path.empty()) rpTargets.push_back(std::move(t));
     }
     if (outDir.empty()) outDir = util::KnownFolder(FOLDERID_Pictures) + L"\\OzMaker";
     GetPrivateProfileStringW(L"OzMaker", L"FileName", kNameTemplates[0], buf, _countof(buf), ini.c_str());
@@ -261,6 +285,21 @@ void Settings::Save() const {
     num(L"PauseHotkeyKey", (long)hkPauseVk);
     num(L"HotkeyHook", hkHook);
     num(L"PauseHotkeyHook", hkPauseHook);
+    num(L"Replay", rpOn);
+    num(L"ReplayLength", rpLenIdx);
+    num(L"ReplayFps", rpFpsIdx);
+    num(L"ReplayRes", rpResIdx);
+    num(L"ReplayAudio", rpAudio);
+    num(L"ReplayMic", rpMic);
+    num(L"ReplayCursor", rpCursor);
+    num(L"ReplayHotkeyMods", (long)rpHkMods);
+    num(L"ReplayHotkeyKey", (long)rpHkVk);
+    num(L"ReplayHotkeyHook", rpHkHook);
+    for (size_t i = 0; i < rpTargets.size() && i < kMaxReplayTargets; ++i) {
+        const ReplayTarget& t = rpTargets[i];
+        put(util::Format(L"Replay%zu", i).c_str(),
+            std::wstring(t.monitor ? L"m" : L"p") + (t.on ? L"1" : L"0") + L"|" + t.path + L"|" + t.name);
+    }
     num(L"StartHide", startHide);
     num(L"Timer", timerIdx);
     num(L"TimerMinutes", timerMinutes);
@@ -303,6 +342,7 @@ void Settings::Reset() {
     d.monitor = std::move(monitor);
     d.region = region;
     d.recent = std::move(recent);
+    d.rpTargets = std::move(rpTargets);  // what the 리플레이 tab has picked
     d.crashSeen = std::move(crashSeen);
     d.trayHintShown = trayHintShown;
     d.settingsTab = settingsTab;

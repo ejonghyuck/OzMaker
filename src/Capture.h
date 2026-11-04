@@ -16,6 +16,7 @@ struct VideoOptions {
     bool mic = false;           // the microphone mixed in (#21)
     std::wstring micDevice;     // endpoint ID, empty = Windows' default input
     float micGain = 1;
+    ReplayRing* ring = nullptr;  // 순간 리플레이 (#20): into memory instead of path; it outlives the capture
 };
 
 struct CaptureOptions {
@@ -32,6 +33,9 @@ struct CaptureOptions {
     int maxEdge = 0;             // 0 = original size, else longest edge limit in pixels
     int boxLong = 0, boxShort = 0;  // fit inside this box in either orientation (video presets); 0 = no limit
     std::optional<VideoOptions> video;
+    // How a monitor (Monitor, Region, monitorMode) is taken: 0 = desktop duplication where Windows.Graphics.Capture
+    // can't drop its yellow border (Windows 10), 1 = duplication wherever it works, 2 = Windows.Graphics.Capture.
+    int screenVia = 0;
 };
 
 struct CaptureResult {
@@ -54,6 +58,12 @@ public:
     ~Capture();
 
     static bool IsSupported();
+    // Windows 11 leaves the yellow border off only for an app that asked first; turning it off alone is ignored.
+    // RequestBorderless asks once, on a thread of its own (the answer is awaited, which the window's thread must not
+    // do). BorderlessAccess waits up to waitMs for the answer: an AppCapabilityAccessStatus (4 = allowed), -1 without
+    // one, -2 where the border can't be turned off at all (Windows 10).
+    static void RequestBorderless();
+    static int BorderlessAccess(int waitMs);
     // closedMsg is posted when the source goes away (wParam 0) or the video encoder fails (wParam 1).
     bool Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err);
     CaptureResult Stop();
@@ -71,9 +81,34 @@ public:
     size_t ClickFrames() const { return clickFrames_; }  // clip frames added for highlights (tests)
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
+    bool Duplicating() const { return dupThread_.joinable(); }  // the monitor comes through desktop duplication
+    // Tests: the cursor drawn the way duplication draws it, over grey; detail says what was found.
+    static bool CursorDrawCheck(std::wstring& detail);
 
 private:
     void OnFrame(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& pool);
+    // Under mtx_: whether a picture captured at qpc is taken (accept), or only kept under a click highlight (base);
+    // ts is its time on the recording's clock. Take hands a picture of the source (cw × ch) on to Process.
+    void Admit(int64_t qpc, int64_t& ts, bool& accept, bool& base);
+    void Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept);
+
+    // Desktop duplication (#20): Windows 10 draws a yellow border around what Windows.Graphics.Capture takes, and
+    // has no way to turn it off (nor has Windows 11 when the request wasn't allowed). Duplication has none. dupThread_ copies the screen into desk_ whenever it changes
+    // and hands it on at the frame rate, with the cursor drawn on by GDI (duplication leaves it out).
+    bool Duplicate();  // (re)opens dup_ on the monitor; false while it can't be duplicated
+    void DupLoop();
+    bool PushDesktop(int64_t& retryIn);  // false: too soon, again in retryIn (100 ns)
+    ID3D11Texture2D* WithCursor();       // under the device lock: desk_, or deskCur_ with the cursor drawn on it
+    HMONITOR dupMonitor_ = nullptr;
+    ComPtr<IDXGIOutputDuplication> dup_;
+    ComPtr<ID3D11Texture2D> desk_, deskCur_;
+    int deskW_ = 0, deskH_ = 0;
+    bool haveDesk_ = false;
+    HCURSOR cursor_ = nullptr;  // the last cursor drawn, its hotspot and size
+    POINT hotspot_{};
+    SIZE cursorSize_{};
+    std::thread dupThread_;
+    HANDLE dupStop_ = nullptr;
     bool SourceRect(int contentW, int contentH, RECT& r) const;
     void CoveredRects(const RECT& sr, std::vector<RECT>& out) const;
     bool Setup(int srcW, int srcH);
@@ -161,6 +196,10 @@ private:
         std::vector<D3D11_RECT> mask;
     } finish_;
     bool finishDue_ = false;
+    // monitorMode: the last picture with nothing over the window. What covers it while it isn't in front is filled
+    // from here instead of black (black only until there was such a picture).
+    ComPtr<ID3D11Texture2D> clean_;
+    bool haveClean_ = false;
     uint64_t shots_ = 0;  // video mode: frames Process took (under the device lock)
     // Variable frame rate (#55). Windows hands over frames of a window that hasn't changed too, so the ticker takes
     // the picture (Snapshot, into cand_) and compares it on the GPU with the last frame written (prev_): blocks with

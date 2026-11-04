@@ -2,6 +2,7 @@
 #include "Mp4Writer.h"
 #include "FrameStore.h"
 #include "Mp4Unfragment.h"
+#include "Replay.h"
 #include "Util.h"
 
 #include <codecapi.h>
@@ -93,14 +94,16 @@ UINT32 Mp4Writer::AutoBitrate(int w, int h, int fps, bool hevc) {
 }
 
 bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const AudioConfig& a, ID3D11Device* dev,
-                     std::wstring& err) {
+                     std::wstring& err, ReplayRing* ring) {
     v_ = v;
     a_ = a;
-    path_ = path;
+    ring_ = ring;
+    path_ = ring ? std::wstring() : path;
     tried_.clear();
     // Windows' fragmented MP4 sink takes H.264 only: it refuses HEVC, even with the encoder's sequence header in
     // the type (--encoder-test). HEVC is written as a plain MP4, which a crash leaves without its index.
     if (v_.hevc) v_.fragmented = false;
+    if (ring_) v_.hevc = false, v_.fragmented = true;  // the ring takes fragments
     dev_ = dev;
     dev_->GetImmediateContext(&ctx_);
     ctx_.As(&mt_);
@@ -172,7 +175,7 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
     // Hardware first; codec tuning parameters are optional on some drivers; software as the last resort.
     if (TryOpen(path, v_.hardware, true, err) || TryOpen(path, v_.hardware, false, err) ||
         (v_.hardware && TryOpen(path, false, true, err))) {
-        if (v_.fragmented) Mark();
+        if (v_.fragmented && !ring_) Mark();
         return true;
     }
     Close();
@@ -246,7 +249,12 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
         wa->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, devManager_.Get());
         wa->SetGUID(MF_TRANSCODE_CONTAINERTYPE,
                     v_.fragmented ? MFTranscodeContainerType_FMPEG4 : MFTranscodeContainerType_MPEG4);
-        hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, wa.Get(), &writer_);
+        if (ring_) {
+            ComPtr<IMFByteStream> bs = ring_->NewStream();
+            hr = bs ? MFCreateSinkWriterFromURL(nullptr, bs.Get(), wa.Get(), &writer_) : E_OUTOFMEMORY;
+        } else {
+            hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, wa.Get(), &writer_);
+        }
     }
     if (FAILED(hr)) {
         err = tr(L"파일을 만들 수 없습니다. (") + Hr(hr) + L")";
@@ -348,7 +356,7 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
                                                  : util::Format(tr(L"%s를 시작할 수 없습니다. ("), stage) + Hr(hr) + L")";
         writer_.Reset();
         codecApi_.Reset();
-        DeleteFileW(path.c_str());
+        if (!ring_) DeleteFileW(path.c_str());
         videoStream_ = audioStream_ = MAXDWORD;
         return false;
     }
@@ -501,6 +509,10 @@ bool Mp4Writer::Finish(std::wstring& err) {
     if (held_) EndVideo(heldTime_ + 10'000'000 / std::max(1, v_.fps));
     if (!failed_) WriteAudioQueue();
     HRESULT hr = videoFrames_ > 0 ? writer_->Finalize() : E_FAIL;
+    if (ring_) {  // the last fragments went into the ring: there is no file to finish
+        Close();
+        return SUCCEEDED(hr);
+    }
     if (FAILED(hr)) {
         err = videoFrames_ == 0 ? tr(L"녹화된 화면이 없습니다.")
                                 : tr(L"동영상 파일을 마무리하지 못했습니다. (") + Hr(hr) + L")";
@@ -526,7 +538,7 @@ bool Mp4Writer::Finish(std::wstring& err) {
 void Mp4Writer::Abort() {
     bool had = writer_ != nullptr;
     Close();
-    if (had) DeleteFileW(path_.c_str());
+    if (had && !path_.empty()) DeleteFileW(path_.c_str());
     Unmark();
 }
 

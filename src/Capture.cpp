@@ -7,6 +7,9 @@
 #include "ScalePS.h"
 #include "ScaleVS.h"
 
+#include <future>
+#include <winrt/Windows.Security.Authorization.AppCapabilityAccess.h>
+
 namespace wgc = winrt::Windows::Graphics::Capture;
 namespace wgdx = winrt::Windows::Graphics::DirectX;
 using winrt::Windows::Foundation::Metadata::ApiInformation;
@@ -32,7 +35,47 @@ bool OwnWindowAt(POINT pt) {
     if (h) GetWindowThreadProcessId(h, &pid);
     return pid == GetCurrentProcessId();
 }
+
+bool BorderToggle() {
+    try {
+        return ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
+                                                 L"IsBorderRequired");
+    } catch (...) {
+        return false;
+    }
+}
+
+std::once_flag g_borderOnce;
+std::shared_future<int> g_border;
 }  // namespace
+
+void Capture::RequestBorderless() {
+    std::call_once(g_borderOnce, [] {
+        std::promise<int> answer;
+        g_border = answer.get_future().share();
+        if (!BorderToggle()) {
+            answer.set_value(-2);
+            return;
+        }
+        std::thread([answer = std::move(answer)]() mutable {
+            int status = -1;
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                status = (int)wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless)
+                             .get();
+                winrt::uninit_apartment();
+            } catch (...) {
+            }
+            answer.set_value(status);
+        }).detach();
+    });
+}
+
+int Capture::BorderlessAccess(int waitMs) {
+    RequestBorderless();
+    if (g_border.wait_for(std::chrono::milliseconds(waitMs)) != std::future_status::ready) return -1;
+    return g_border.get();
+}
 
 Capture::~Capture() {
     if (running_) Stop();
@@ -93,29 +136,39 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             mon = opt.monitor;
         else if (opt.source == CaptureSource::Region)
             mon = opt.monitor ? opt.monitor : MonitorFromRect(&opt.region, MONITOR_DEFAULTTONEAREST);
+        // Windows 11 turns the border off only once the request was allowed; until then monitors go through
+        // duplication, as on Windows 10. The answer is usually in by now (asked at startup).
+        const bool toggle = BorderToggle();
+        const bool borderless = toggle && BorderlessAccess(500) == 4;  // AppCapabilityAccessStatus::Allowed
+        bool duplicate = false;
         if (mon) {
             MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(mon, &mi);
             monitorRect_ = mi.rcMonitor;
-            winrt::check_hresult(
-                interop->CreateForMonitor(mon, winrt::guid_of<wgc::GraphicsCaptureItem>(), winrt::put_abi(item_)));
+            dupMonitor_ = mon;
+            cursor_ = nullptr;
+            duplicate = opt.screenVia != 2 && (opt.screenVia == 1 || !borderless) && Duplicate();
+            if (!duplicate)  // another GPU drives the monitor, a rotated screen, or no duplication left
+                winrt::check_hresult(
+                    interop->CreateForMonitor(mon, winrt::guid_of<wgc::GraphicsCaptureItem>(), winrt::put_abi(item_)));
         } else {
             winrt::check_hresult(interop->CreateForWindow(opt.target, winrt::guid_of<wgc::GraphicsCaptureItem>(),
                                                           winrt::put_abi(item_)));
         }
 
-        poolSize_ = item_.Size();
-        pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            rtDevice_, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, poolSize_);
-        session_ = pool_.CreateCaptureSession(item_);
-        if (ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
-                                              L"IsCursorCaptureEnabled"))
-            session_.IsCursorCaptureEnabled(opt.cursor);
-        if (ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
-                                              L"IsBorderRequired")) {
-            try {
-                session_.IsBorderRequired(false);
-            } catch (...) {
+        if (!duplicate) {
+            poolSize_ = item_.Size();
+            pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                rtDevice_, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, poolSize_);
+            session_ = pool_.CreateCaptureSession(item_);
+            if (ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",
+                                                  L"IsCursorCaptureEnabled"))
+                session_.IsCursorCaptureEnabled(opt.cursor);
+            if (toggle) {
+                try {
+                    session_.IsBorderRequired(false);
+                } catch (...) {
+                }
             }
         }
 
@@ -132,10 +185,12 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         pausedAt_ = 0;
         pausedTotal_ = 0;
         running_ = true;
-        frameToken_ = pool_.FrameArrived([this](auto const& sender, auto const&) { OnFrame(sender); });
-        closedToken_ = item_.Closed([this](auto const&, auto const&) {
-            if (notify_) PostMessageW(notify_, closedMsg_, 0, 0);
-        });
+        if (!duplicate) {
+            frameToken_ = pool_.FrameArrived([this](auto const& sender, auto const&) { OnFrame(sender); });
+            closedToken_ = item_.Closed([this](auto const&, auto const&) {
+                if (notify_) PostMessageW(notify_, closedMsg_, 0, 0);
+            });
+        }
         startQpc_ = util::Qpc100ns();
         if (video) {
             writer_ = std::make_unique<Mp4Writer>();
@@ -184,7 +239,12 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
             clickStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             clickThread_ = std::thread([this] { ClickLoop(); });
         }
-        session_.StartCapture();
+        if (duplicate) {
+            dupStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            dupThread_ = std::thread([this] { DupLoop(); });
+        } else {
+            session_.StartCapture();
+        }
     } catch (winrt::hresult_error const& e) {
         running_ = false;
         err = tr(L"캡처를 시작할 수 없습니다. (") + std::wstring(e.message()) + L")";
@@ -334,6 +394,9 @@ bool Capture::Setup(int sw, int sh) {
     if (FAILED(dev_->CreateTexture2D(&td, nullptr, &out_)) ||
         FAILED(dev_->CreateRenderTargetView(out_.Get(), nullptr, &outRtv_)))
         return false;
+    haveClean_ = false;
+    clean_.Reset();
+    if (opt_.monitorMode && FAILED(dev_->CreateTexture2D(&td, nullptr, &clean_))) clean_.Reset();  // black then
     diffReady_ = diffPending_ = false;
     if (opt_.video && opt_.video->video.vfr) {
         // What the comparison needs. Without it every picture that may have changed counts as changed.
@@ -394,6 +457,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     const bool video = opt_.video.has_value();
     const bool same = sw - outW_ >= 0 && sw - outW_ <= 1 && sh - outH_ >= 0 && sh - outH_ <= 1;
     const bool mask = !covered.empty() && ctx1_;
+    const bool keep = clean_ != nullptr;  // out_ is also kept in clean_, so the picture always goes through it
     DeviceLock lock(mt_.Get());
 
     // Clip mode copies into the next staging texture (through out_ when it is scaled or masked). Video mode keeps
@@ -406,7 +470,8 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
     if (same) {
         // Same size (an odd edge is trimmed by one pixel): plain copy, no resampling.
         D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)(sr.left + outW_), (UINT)(sr.top + outH_), 1};
-        ctx_->CopySubresourceRegion(video || mask || opt_.clickFx ? out_.Get() : staging, 0, 0, 0, 0, tex, 0, &box);
+        ctx_->CopySubresourceRegion(video || mask || keep || opt_.clickFx ? out_.Get() : staging, 0, 0, 0, 0, tex, 0,
+                                    &box);
     } else {
         float f = std::min((float)outW_ / sw, (float)outH_ / sh);
         int dw = std::clamp((int)std::lround(sw * f), 1, outW_);
@@ -477,7 +542,7 @@ void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const st
         fxShown_ = DrawClicks(qpc);
         if (fxShown_) from = fx_.Get();
     }
-    if (!same || mask || opt_.clickFx) ctx_->CopyResource(staging, from);
+    if (!same || mask || keep || opt_.clickFx) ctx_->CopyResource(staging, from);
     pending_.push_back({ring_, ts});
     ring_ = (ring_ + 1) % kRing;
     // Read back with one frame of latency so Map() doesn't stall on the copy just issued.
@@ -514,9 +579,19 @@ void Capture::FinishFrame() {
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
         ++scaled_;
     }
-    if (!f.mask.empty()) {
+    if (!f.mask.empty() && haveClean_) {
+        // Another window over the game while it isn't in front (Alt+Tab): never in the recording, and not black
+        // either: the game as it was last seen with nothing over it.
+        for (const D3D11_RECT& r : f.mask) {
+            D3D11_BOX box{(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1};
+            ctx_->CopySubresourceRegion(out_.Get(), 0, r.left, r.top, 0, clean_.Get(), 0, &box);
+        }
+    } else if (!f.mask.empty()) {
         const float black[4] = {0, 0, 0, 1};
         ctx1_->ClearView(outRtv_.Get(), black, f.mask.data(), (UINT)f.mask.size());
+    } else if (clean_) {
+        ctx_->CopyResource(clean_.Get(), out_.Get());
+        haveClean_ = true;
     }
 }
 
@@ -751,7 +826,7 @@ void Capture::TickLoop() {
         vc.fps = opt_.fps;
         vc.fragmented = true;  // a crash leaves a file that plays; Finish makes it a plain MP4 (#24)
         std::wstring err;
-        open = writer_->Open(opt_.video->path, vc, opt_.video->audio, dev_.Get(), err);
+        open = writer_->Open(opt_.video->path, vc, opt_.video->audio, dev_.Get(), err, opt_.video->ring);
         if (!open) Fail(err);
     }
     if (open) {
@@ -854,8 +929,30 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
 
     auto cs = frame.ContentSize();
     const int64_t qpc = frame.SystemRelativeTime().count();
-    int64_t ts = qpc - pausedTotal_;  // the recording's own clock
-    bool accept = false;
+    int64_t ts = 0;
+    bool accept = false, base = false;
+    Admit(qpc, ts, accept, base);
+    if (accept || base) {
+        try {
+            auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            ComPtr<ID3D11Texture2D> tex;
+            if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) Take(tex.Get(), cs.Width, cs.Height, ts, qpc, accept);
+        } catch (...) {
+        }
+    }
+    frame.Close();
+    if ((cs.Width != poolSize_.Width || cs.Height != poolSize_.Height) && cs.Width > 0 && cs.Height > 0) {
+        poolSize_ = cs;
+        try {
+            pool.Recreate(rtDevice_, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, cs);
+        } catch (...) {
+        }
+    }
+}
+
+void Capture::Admit(int64_t qpc, int64_t& ts, bool& accept, bool& base) {
+    ts = qpc - pausedTotal_;  // the recording's own clock
+    accept = false;
     if (pausedAt_) {
         // nothing while paused
     } else if (firstTs_ < 0) {
@@ -868,39 +965,256 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
         nextDue_ = (nextDue_ + interval_ > ts) ? nextDue_ + interval_ : ts + interval_;
     }
     // A clip frame that comes too soon still becomes the picture the click highlight frames are drawn on.
-    const bool base = !accept && !opt_.video && opt_.clickFx && !pausedAt_ && firstTs_ >= 0 && ClicksShow(qpc);
-    if (accept || base) {
-        RECT sr;
-        if (SourceRect(cs.Width, cs.Height, sr)) {
-            if (opt_.monitorMode)
-                CoveredRects(sr, covered_);
-            else
-                covered_.clear();
-            if (opt_.clickFx) texOrigin_ = TextureOrigin(cs.Width, cs.Height);
-            try {
-                auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-                ComPtr<ID3D11Texture2D> tex;
-                if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) {
-                    int64_t rel = ts - firstTs_;
-                    if (rel > 0 && rel <= lastTs_) rel = lastTs_ + 1;  // after a click highlight frame of ours
-                    Process(tex.Get(), sr, rel, covered_, qpc, accept);
-                    if (accept) {
-                        lastTs_ = rel;
-                        lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
-                    }
+    base = !accept && !opt_.video && opt_.clickFx && !pausedAt_ && firstTs_ >= 0 && ClicksShow(qpc);
+}
+
+void Capture::Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept) {
+    RECT sr;
+    if (!SourceRect(cw, ch, sr)) return;
+    if (opt_.monitorMode)
+        CoveredRects(sr, covered_);
+    else
+        covered_.clear();
+    if (opt_.clickFx) texOrigin_ = TextureOrigin(cw, ch);
+    int64_t rel = ts - firstTs_;
+    if (rel > 0 && rel <= lastTs_) rel = lastTs_ + 1;  // after a click highlight frame of ours
+    Process(tex, sr, rel, covered_, qpc, accept);
+    if (accept) {
+        lastTs_ = rel;
+        lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
+    }
+}
+
+// ---------------------------------------------------------------- desktop duplication
+
+bool Capture::Duplicate() {
+    dup_.Reset();
+    MONITORINFO mi{sizeof(mi)};
+    if (!dupMonitor_ || !GetMonitorInfoW(dupMonitor_, &mi)) return false;
+    // The monitor's output on the device's adapter: one another GPU drives can't be duplicated with this device.
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIOutput> output;
+    if (FAILED(dev_.As(&dxgi)) || FAILED(dxgi->GetAdapter(&adapter))) return false;
+    for (UINT i = 0;; ++i) {
+        ComPtr<IDXGIOutput> o;
+        if (FAILED(adapter->EnumOutputs(i, &o))) break;
+        DXGI_OUTPUT_DESC od{};
+        if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == dupMonitor_) {
+            output = o;
+            break;
+        }
+    }
+    if (!output) return false;
+    ComPtr<IDXGIOutput5> o5;
+    ComPtr<IDXGIOutput1> o1;
+    HRESULT hr = E_NOINTERFACE;
+    if (SUCCEEDED(output.As(&o5))) {
+        const DXGI_FORMAT formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};  // an HDR screen comes as SDR, like the pool's
+        hr = o5->DuplicateOutput1(dev_.Get(), 0, _countof(formats), formats, &dup_);
+    }
+    if (FAILED(hr) && SUCCEEDED(output.As(&o1))) hr = o1->DuplicateOutput(dev_.Get(), &dup_);
+    if (FAILED(hr)) {
+        dup_.Reset();
+        return false;
+    }
+    DXGI_OUTDUPL_DESC dd{};
+    dup_->GetDesc(&dd);
+    const bool upright = dd.Rotation == DXGI_MODE_ROTATION_IDENTITY || dd.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED;
+    if (!upright || dd.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || dd.ModeDesc.Width < 2 || dd.ModeDesc.Height < 2) {
+        dup_.Reset();
+        return false;
+    }
+    monitorRect_ = mi.rcMonitor;
+    if (!desk_ || deskW_ != (int)dd.ModeDesc.Width || deskH_ != (int)dd.ModeDesc.Height) {
+        desk_.Reset();
+        deskCur_.Reset();
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = dd.ModeDesc.Width;
+        td.Height = dd.ModeDesc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev_->CreateTexture2D(&td, nullptr, &desk_))) {
+            dup_.Reset();
+            return false;
+        }
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+        if (opt_.cursor && FAILED(dev_->CreateTexture2D(&td, nullptr, &deskCur_))) deskCur_.Reset();  // no cursor then
+        deskW_ = td.Width;
+        deskH_ = td.Height;
+    }
+    haveDesk_ = false;
+    return true;
+}
+
+void Capture::DupLoop() {
+    bool dirty = false;    // desk_ (or the cursor over it) changed since it was last handed on
+    int64_t retryIn = -1;  // too soon: when it is due
+    bool gone = false;
+    while (WaitForSingleObject(dupStop_, 0) == WAIT_TIMEOUT) {
+        if (!dup_) {
+            // Lost: a mode change, the secure desktop (UAC, the lock screen), a fullscreen switch. The last
+            // picture stays until the screen can be duplicated again.
+            if (!Duplicate()) {
+                MONITORINFO mi{sizeof(mi)};
+                if (!gone && !GetMonitorInfoW(dupMonitor_, &mi)) {
+                    gone = true;  // unplugged: like Windows.Graphics.Capture's Closed
+                    if (notify_) PostMessageW(notify_, closedMsg_, 0, 0);
                 }
-            } catch (...) {
+                WaitForSingleObject(dupStop_, 250);
+                continue;
             }
         }
-    }
-    frame.Close();
-    if ((cs.Width != poolSize_.Width || cs.Height != poolSize_.Height) && cs.Width > 0 && cs.Height > 0) {
-        poolSize_ = cs;
-        try {
-            pool.Recreate(rtDevice_, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, cs);
-        } catch (...) {
+        UINT wait = 50;
+        if (dirty && retryIn >= 0) wait = (UINT)std::clamp<int64_t>(retryIn / 10'000, 0, 50);
+        DXGI_OUTDUPL_FRAME_INFO fi{};
+        ComPtr<IDXGIResource> res;
+        HRESULT hr = dup_->AcquireNextFrame(wait, &fi, &res);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            // nothing new
+        } else if (FAILED(hr)) {
+            dup_.Reset();
+            continue;
+        } else {
+            ComPtr<ID3D11Texture2D> tex;
+            if ((fi.LastPresentTime.QuadPart != 0 || !haveDesk_) && running_ && !pausedAt_ &&
+                SUCCEEDED(res.As(&tex))) {
+                D3D11_TEXTURE2D_DESC td{};
+                tex->GetDesc(&td);
+                if ((int)td.Width == deskW_ && (int)td.Height == deskH_ && td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                    DeviceLock lock(mt_.Get());
+                    ctx_->CopyResource(desk_.Get(), tex.Get());
+                    haveDesk_ = dirty = true;
+                }
+            }
+            if (fi.LastMouseUpdateTime.QuadPart != 0 && deskCur_ && haveDesk_) dirty = true;  // the cursor moved
+            dup_->ReleaseFrame();
         }
+        if (dirty) dirty = !PushDesktop(retryIn);
     }
+}
+
+bool Capture::PushDesktop(int64_t& retryIn) {
+    std::lock_guard lk(mtx_);
+    retryIn = -1;
+    if (!running_ || pausedAt_) return true;  // nothing while paused: the next change after it comes through
+    const int64_t qpc = util::Qpc100ns();
+    int64_t ts = 0;
+    bool accept = false, base = false;
+    Admit(qpc, ts, accept, base);
+    if (accept || base) {
+        DeviceLock lock(mt_.Get());
+        Take(WithCursor(), deskW_, deskH_, ts, qpc, accept);
+    }
+    if (accept) return true;
+    retryIn = std::max<int64_t>(0, nextDue_ - interval_ / 4 - ts);
+    return false;
+}
+
+namespace {
+// The cursor as Windows shows it, through GDI (also the inverting kinds, like the text cursor) onto a GDI-compatible
+// texture. Under the device lock.
+bool DrawCursorOn(ID3D11Texture2D* tex, HCURSOR cursor, int x, int y) {
+    ComPtr<IDXGISurface1> s;
+    HDC dc = nullptr;
+    if (FAILED(tex->QueryInterface(IID_PPV_ARGS(&s))) || FAILED(s->GetDC(FALSE, &dc))) return false;
+    const bool ok = DrawIconEx(dc, x, y, cursor, 0, 0, 0, nullptr, DI_NORMAL) != 0;
+    s->ReleaseDC(nullptr);
+    return ok;
+}
+
+bool CursorShape(HCURSOR cursor, POINT& hotspot, SIZE& size) {
+    ICONINFO ii{};
+    if (!GetIconInfo(cursor, &ii)) return false;
+    hotspot = {(LONG)ii.xHotspot, (LONG)ii.yHotspot};
+    BITMAP bm{};
+    GetObjectW(ii.hbmMask, sizeof(bm), &bm);
+    size = {bm.bmWidth, ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2};  // a black-and-white one: AND over XOR
+    DeleteObject(ii.hbmMask);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    return true;
+}
+}  // namespace
+
+ID3D11Texture2D* Capture::WithCursor() {
+    if (!deskCur_) return desk_.Get();
+    CURSORINFO ci{sizeof(ci)};
+    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return desk_.Get();  // a game hides it
+    if (ci.hCursor != cursor_) {
+        if (!CursorShape(ci.hCursor, hotspot_, cursorSize_)) return desk_.Get();
+        cursor_ = ci.hCursor;
+    }
+    const int x = ci.ptScreenPos.x - monitorRect_.left - hotspot_.x, y = ci.ptScreenPos.y - monitorRect_.top - hotspot_.y;
+    if (x >= deskW_ || y >= deskH_ || x + cursorSize_.cx <= 0 || y + cursorSize_.cy <= 0) return desk_.Get();
+    ctx_->CopyResource(deskCur_.Get(), desk_.Get());
+    return DrawCursorOn(deskCur_.Get(), ci.hCursor, x, y) ? deskCur_.Get() : desk_.Get();
+}
+
+bool Capture::CursorDrawCheck(std::wstring& detail) {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr,
+                                 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
+        detail = L"no device";
+        return false;
+    }
+    constexpr int kW = 64, kH = 64;
+    std::vector<uint32_t> grey(kW * kH, 0xFF505A64u);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = kW;
+    td.Height = kH;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+    D3D11_SUBRESOURCE_DATA init{grey.data(), kW * 4, 0};
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (FAILED(dev->CreateTexture2D(&td, &init, &tex))) {
+        detail = L"no GDI-compatible texture";
+        return false;
+    }
+    // The arrow and the text cursor (drawn by inverting what is under it), side by side.
+    HCURSOR arrow = LoadCursorW(nullptr, IDC_ARROW), beam = LoadCursorW(nullptr, IDC_IBEAM);
+    POINT hs{};
+    SIZE sz{};
+    const bool drawn = CursorShape(arrow, hs, sz) && DrawCursorOn(tex.Get(), arrow, 2, 2) && DrawCursorOn(tex.Get(), beam, 34, 2);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.MiscFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (!drawn || FAILED(dev->CreateTexture2D(&td, nullptr, &staging))) {
+        detail = L"not drawn";
+        return false;
+    }
+    ctx->CopyResource(staging.Get(), tex.Get());
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+        detail = L"no readback";
+        return false;
+    }
+    int dark[2] = {}, light[2] = {}, changed[2] = {};
+    for (int y = 0; y < kH; ++y)
+        for (int x = 0; x < kW; ++x) {
+            const uint32_t p = static_cast<const uint32_t*>(m.pData)[(size_t)y * m.RowPitch / 4 + x] & 0xFFFFFFu;
+            const int side = x < 32 ? 0 : 1, lum = ((p >> 16 & 255) + (p >> 8 & 255) + (p & 255)) / 3;
+            if (p == 0x505A64u) continue;
+            ++changed[side];
+            dark[side] += lum < 40;
+            light[side] += lum > 150;
+        }
+    ctx->Unmap(staging.Get(), 0);
+    detail = util::Format(L"arrow %ld×%ld hotspot %ld,%ld: %d px (%d dark, %d light), text cursor %d px", sz.cx, sz.cy,
+                          hs.x, hs.y, changed[0], dark[0], light[0], changed[1]);
+    // The arrow is white with a black outline; the text cursor turns the grey under it into its inverse.
+    return dark[0] > 10 && light[0] > 10 && changed[1] > 10;
 }
 
 CaptureResult Capture::Stop() {
@@ -915,6 +1229,12 @@ CaptureResult Capture::Stop() {
         if (session_) session_.Close();
         if (pool_) pool_.Close();
     } catch (...) {
+    }
+    if (dupThread_.joinable()) {
+        SetEvent(dupStop_);
+        dupThread_.join();
+        CloseHandle(dupStop_);
+        dupStop_ = nullptr;
     }
     if (opt_.video) {
         stopAt_ = stopQpc - startQpc_ - pausedTotal_;
@@ -974,10 +1294,18 @@ void Capture::ReleaseGpu() {
     pool_ = nullptr;
     item_ = nullptr;
     rtDevice_ = nullptr;
+    dup_.Reset();
+    desk_.Reset();
+    deskCur_.Reset();
+    deskW_ = deskH_ = 0;
+    haveDesk_ = false;
+    cursor_ = nullptr;
     for (auto& s : staging_) s.Reset();
     pending_.clear();
     out_.Reset();
     outRtv_.Reset();
+    clean_.Reset();
+    haveClean_ = false;
     mip_.Reset();
     mipSrv_.Reset();
     mipW_ = mipH_ = mipLevels_ = 0;
