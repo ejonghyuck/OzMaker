@@ -118,6 +118,7 @@ struct Settings {
     bool hkHook = false, hkPauseHook = false;
     int startHide = kHideToTray;  // where the window goes when a recording starts from it
     int deleteMode = kDeleteToBin;  // what 삭제 does to a video or a saved replay
+    int imageFormat = 0;            // image::Format: frame images and screenshots
     // The record timer (#47): kTimerOptions, the length 직접 입력 holds, and what happens when the time is up.
     int timerIdx = 0;
     int timerMinutes = 90;   // 1 – kTimerMaxMinutes

@@ -30,7 +30,8 @@ void OpenFolderAndSelect(const std::wstring& path);
 // OzMaker: recordings leave out OzMaker's process tree (AudioCapture::Source::Others), and a player or browser
 // started from here must still be heard in them. False when Explorer couldn't, and OzMaker started it itself.
 bool ShellOpen(const std::wstring& path, const std::wstring& args = {});
-bool CopyFileToClipboard(HWND owner, const std::wstring& path);
+// With a CF_DIB too, for an image: what takes files pastes the file, what takes pictures the picture.
+bool CopyFileToClipboard(HWND owner, const std::wstring& path, const std::vector<uint8_t>* dib = nullptr);
 bool MoveToRecycleBin(HWND owner, const std::wstring& path);  // false if the file is still there
 bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name,

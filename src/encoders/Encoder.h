@@ -37,3 +37,5 @@ std::unique_ptr<IEncoder> CreateWebpEncoder();
 std::unique_ptr<IEncoder> CreateAvifEncoder();
 
 bool WriteWholeFile(const std::wstring& path, const void* data, size_t size);
+// One still WebP (ImageFile.h): BGRA, straight alpha if alpha. False without libwebp in the build.
+bool WriteWebpImage(const std::wstring& path, const uint8_t* bgra, int w, int h, bool alpha, int quality);
