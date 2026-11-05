@@ -32,6 +32,16 @@ struct RecTarget {
     RECT rect{};  // screen pixels: window frame / monitor / region
 };
 
+// One thing being recorded: a window, a monitor or a region. 여러 창 녹화 (#48) has one per checked window, each
+// with its own capture, encoder, sound and file.
+struct RecSession {
+    RecTarget target;
+    std::wstring name;                 // in words (window title, "화면 1", "영역"): its file, held clip and card row
+    std::unique_ptr<Capture> capture;
+    CaptureResult result;  // once it stopped
+    bool ended = false;    // stopped before the others: its window closed, or its encoder failed
+};
+
 class App {
 public:
     int Run(HINSTANCE inst, int show, const std::wstring& cmdLine);
@@ -83,10 +93,14 @@ private:
     void Alert(std::wstring text, int settingsTab = -1);
     void SyncIme();
     // The live window preview (DWM thumbnails, which DWM draws above everything in this window).
+    struct LivePreview;
     void ApplyThumbnail();
-    bool AddThumbnail();
-    void ReleaseThumbnails();
+    void ApplyPreview(LivePreview& p, HWND src, const Rect& area);  // src null: none
+    bool AddThumbnail(LivePreview& p, HWND src);
+    void ReleasePreview(LivePreview& p);
+    void ReleaseThumbnails();  // all of them
     void PreviewLayout(RECT& dest, RECT& source);  // where it goes (client pixels), what of the window it shows
+    void PreviewLayout(const LivePreview& p, HWND src, const Rect& area, RECT& dest, RECT& source);
     std::vector<RECT> PreviewParts(const RECT& dest);  // dest less whatever floats above it this frame
 
     // ---- views (AppViews.cpp)
@@ -104,8 +118,10 @@ private:
     void DrawTimerPopover(Rect client);
     bool TimerFields(Rect r);    // 직접 입력's hours and minutes; true when they changed
     void DrawCapturePreview(Rect r);
+    void DrawPreviewGrid(Rect view);
     void DrawMonitorLayout(Rect r, const RECT* region, bool pickable);
     void DrawVideoResult(Rect r);
+    void DrawVideoResults(Rect preview);  // the card for several windows' files
     void DrawEditor(Rect r);
     void DrawEditHome(Rect r);  // the 편집 tab with no file open: where to drop one, what to open
     void DrawFileBar(Rect r);   // over the editor: the open file and 닫기
@@ -140,6 +156,12 @@ private:
     void WatchWindows(bool on);
     static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND h, LONG obj, LONG child, DWORD, DWORD);
     void SelectTarget(HWND h);
+    // 여러 창 녹화 (#48): windows are checked instead of picked, up to kMaxRecWindows, in the order checked; the
+    // first is target_ (the preview, the size line).
+    bool MultiPicking() const { return settings_.source == kSourceWindow && settings_.multiWindow; }
+    void SetMultiWindow(bool on);
+    void TogglePick(HWND h);
+    std::vector<RecTarget> PickedTargets() const;
     const WinInfo* FindWindowInfo(HWND h) const;
     void SetSource(int source);
     void StartRegionPick();
@@ -153,11 +175,22 @@ private:
 
     // ---- recording
     void StartRecording(const RecTarget& target, bool fromHotkey);
+    void StartRecording(const std::vector<RecTarget>& targets, bool fromHotkey);
     void BeginCapture();
     void StopRecording();
+    // One window of several stopped by itself (it closed, its encoder failed): its file is done, the rest go on.
+    void EndRecSession(size_t i);
+    RecSession* RecLead();  // the first recording still going: the pill sits on it, its clock is the recording's
+    void StopSeveral(std::vector<RecSession>& done);  // what StopRecording does with several windows' results
+    void OpenClipWarn(const std::shared_ptr<FrameStore>& clip, size_t held);
+    // The file name for one of several windows: the pattern, and the window's name after it when the pattern has
+    // no {창 이름} of its own.
+    std::wstring RecFileStem(const std::wstring& name, bool several) const;
     void OnVideoSaved(const CaptureResult& r);
+    void OnVideosSaved();  // several windows: lastVideos_
     void ShowVideo(const CaptureResult& r);
     void EditLastVideo();  // the video card's 편집
+    void EditVideoAt(size_t i);  // the 편집 of a row of the card for several windows
     void OnHotkey();
     void TogglePause();
     // Every recording tick: the record timer (#47) and the free space (#17). Stops with a reason when one says so.
@@ -196,7 +229,7 @@ private:
     void BrowseForVideo();
     void AddRecent(const std::wstring& path);
     void RefreshRecent();
-    void HoldRecording(std::shared_ptr<Clip> clip);
+    void HoldRecording(std::shared_ptr<Clip> clip, const std::wstring& name);
     void DropHeld(const Clip* clip);
     void OpenHeld(size_t i);
     void ConfirmDropHeld(size_t i);  // asks, then lets held_[i] go
@@ -207,6 +240,7 @@ private:
     bool CanDiscard() const;  // the editor's 버리기 / 삭제: a recording from this run, nothing exporting
     void ConfirmDiscard();
     void DiscardRecording();
+    bool RemoveFile(const std::wstring& path);  // as 설정 › 일반 "삭제할 때" says; false if the file is still there
 
     // A question inside the window instead of a MessageBox: a card over the dimmed window, Enter for yes, Esc (or a
     // click outside) for no. The window comes to the front for it.
@@ -334,7 +368,8 @@ private:
     void BrowseReplayProgram();
     void RefreshReplayFiles();
     void RenameReplay(size_t i, std::wstring name);
-    void TrashReplay(size_t i);
+    void TrashReplay(size_t i);  // asks first when nothing can bring the file back
+    void RemoveReplay(const std::wstring& path);
     void EditReplay(const std::wstring& path);
     void OpenReplayTab();
     std::wstring ReplayDir() const;  // 저장 폴더 › 리플레이
@@ -392,6 +427,7 @@ private:
     int RunVideoTest(const std::wstring& dir, int w, int h);
     int RunEncoderTest(const std::wstring& dir);
     int RunReplayTest(const std::wstring& dir);
+    int RunMultiTest(const std::wstring& dir);  // 여러 창 녹화 (#48)
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
@@ -419,6 +455,7 @@ private:
 
     std::vector<WinInfo> windows_;
     HWND target_ = nullptr;
+    std::vector<HWND> picks_;  // 여러 창 녹화: the checked windows, in the order checked
     float listScroll_ = 0;
     std::vector<MonitorDesc> monitors_;
     RegionPicker regionPicker_;
@@ -426,17 +463,27 @@ private:
     RECT snapRect_{};
     std::unordered_map<HWND, ComPtr<ID2D1Bitmap1>> icons_;
     uint32_t iconGen_ = 0;
-    // One thumbnail of target_; while something floats over the preview, several, each showing the part of the
-    // window around it (source rects set: thumbSplit_).
-    std::vector<HTHUMBNAIL> thumb_;
-    HWND thumbSrc_ = nullptr;
-    bool thumbSplit_ = false;
+    // A window shown live: one thumbnail; while something floats over it, several, each showing the part of the
+    // window around it (source rects set: split).
+    struct LivePreview {
+        std::vector<HTHUMBNAIL> thumb;
+        HWND src = nullptr;
+        bool split = false;
+    };
+    LivePreview thumb_;  // target_
     bool thumbWanted_ = false;
     Rect thumbArea_;
+    // 여러 창 녹화's grid: the checked windows after the first, each in its cell (set while drawing, like thumbArea_).
+    struct PreviewCell {
+        HWND hwnd = nullptr;
+        Rect area;
+    };
+    std::vector<PreviewCell> thumbCells_;
+    std::vector<LivePreview> thumbMore_;
 
-    Capture capture_;
+    std::vector<RecSession> recs_;  // what is being recorded: one, or one per checked window (#48)
     RecState rec_ = RecState::Idle;
-    RecTarget recTarget_;
+    RecTarget recTarget_;  // the lead's: where the countdown and the pill go
     bool recFromHotkey_ = false, recFullscreen_ = false, recVideo_ = false;
     bool recScreen_ = false;  // the recording takes the screen (a monitor, a region, a fullscreen game through it)
     std::wstring recNotice_;
@@ -447,6 +494,12 @@ private:
     std::wstring clipName_;  // the same for the clip in the editor (export file names)
     CaptureResult lastVideo_;
     bool showVideo_ = false;
+    // A recording of several windows: each file, for the card (lastVideo_ is the first).
+    struct SavedVideo {
+        CaptureResult r;
+        bool early = false;  // its window closed before the recording stopped
+    };
+    std::vector<SavedVideo> lastVideos_;
     mutable bool encProbed_ = false;
     mutable std::wstring encName_[2][2];  // [hevc][hardware]
     mutable int hevcPlayable_ = -1;       // probed once; -1 = not yet
@@ -565,7 +618,7 @@ private:
         double when = 0;
         std::wstring name;
     };
-    static constexpr size_t kMaxHeld = 5;
+    static constexpr size_t kMaxHeld = 2 * kMaxRecWindows;  // two recordings of as many windows as there can be
     std::vector<HeldClip> held_;  // newest first
     struct RecentFile {
         std::wstring path;
@@ -612,7 +665,7 @@ private:
     double recElapsedForTest_ = -1;  // README pictures: the time a made-up recording shows (-1: the real one)
     int hevcForTest_ = -1;  // screenshots: 0 no HEVC, 1 HEVC that plays, 2 an encoder without the extension
     SIZE sourceForTest_{};  // screenshots: the size the target has (a 5K screen), zero: its own
-    double RecElapsed() const { return recElapsedForTest_ >= 0 ? recElapsedForTest_ : capture_.Elapsed(); }
+    double RecElapsed() const;
 
     Updater updater_;
     bool updateOpen_ = false;  // the popover under the update button

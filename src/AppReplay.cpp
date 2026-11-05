@@ -674,12 +674,25 @@ void App::RenameReplay(size_t i, std::wstring name) {
 void App::TrashReplay(size_t i) {
     if (i >= rpFiles_.size()) return;
     const std::wstring path = rpFiles_[i].path;
-    if (clip_ && SamePath(clip_->SourcePath(), path)) CloseClip();  // the editor lets go of it first
-    if (!util::MoveToRecycleBin(hwnd_, path)) {
-        Toast(tr(L"휴지통으로 옮기지 못했습니다."), true);
+    if (settings_.deleteMode != kDeleteNow) {
+        RemoveReplay(path);
         return;
     }
-    Toast(tr(L"휴지통으로 옮겼습니다 · ") + util::FileNameOf(path));
+    // By path: the list can change under the question.
+    Ask({tr(L"이 리플레이를 삭제할까요?"), util::FileNameOf(path) + tr(L"\n휴지통을 거치지 않고 지워서 되돌릴 수 없습니다."),
+         tr(L"삭제"), true, [this, path] { RemoveReplay(path); }});
+}
+
+void App::RemoveReplay(const std::wstring& path) {
+    const bool now = settings_.deleteMode == kDeleteNow;
+    if (clip_ && SamePath(clip_->SourcePath(), path)) CloseClip();  // the editor lets go of it first
+    if (!RemoveFile(path)) {
+        Toast(now ? tr(L"파일을 삭제하지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.")
+                  : tr(L"휴지통으로 옮기지 못했습니다."),
+              true);
+        return;
+    }
+    Toast((now ? tr(L"삭제했습니다 · ") : tr(L"휴지통으로 옮겼습니다 · ")) + util::FileNameOf(path));
     RefreshReplayFiles();
 }
 

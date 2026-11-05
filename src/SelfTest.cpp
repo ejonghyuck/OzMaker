@@ -13,6 +13,8 @@
 //   --test-window <sec> cover <x> <y> <w> <h>  a plain white window over others there, never in front (--replay-test)
 //   --test-window <sec> [capture]         a pattern window in a process of its own (for --preview-test); capture:
 //                                         grey, one Windows lets --record-test take, a white square blinking every 1.5 s
+//   --multi-test <dir>                    여러 창 녹화 (#48) in the app: two test windows recorded at once, as 움짤 and
+//                                         as MP4 while one of them closes partway
 //   --update-test <dir> [url|github]      the updater on a fake release folder (also part of --selftest); url: the
 //                                         same served over HTTP; github: one check against the real releases
 #include "pch.h"
@@ -1444,6 +1446,7 @@ int App::RunSelfTest(const std::wstring& dir) {
                 gfx_.RenderToPng((dir + L"\\selftest_layers.png").c_str(), 1120, 780, 96, [&](ID2D1DeviceContext* dc) {
                     ui_.Begin(dc, in, clock);
                     thumbWanted_ = false;
+                    thumbCells_.clear();
                     DrawFrame(Rect(0, 0, 1120, 780));
                     if (after) after();
                     ui_.End();
@@ -1830,11 +1833,60 @@ int App::RunSelfTest(const std::wstring& dir) {
                              ok ? L"ok  " : L"FAIL", parent == 0 ? L"unknown" : parent == GetCurrentProcessId() ? L"OzMaker" : L"another process"));
         }
     }
+    // 여러 창 녹화 (#48): check boxes up to kMaxRecWindows in the order checked, the first one the window picked; the
+    // switch hands the selection over both ways; each file is named after its window when the pattern doesn't say.
+    {
+        std::vector<HWND> ws;
+        for (size_t i = 0; i <= kMaxRecWindows; ++i)
+            ws.push_back(CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr));
+        const int source = settings_.source;
+        const bool multi = settings_.multiWindow;
+        const HWND was = target_;
+        settings_.source = kSourceWindow;
+        settings_.multiWindow = false;
+        target_ = ws[2];
+        SetMultiWindow(true);
+        const bool handed = MultiPicking() && picks_.size() == 1 && picks_[0] == ws[2];
+        TogglePick(ws[2]);
+        const bool none = picks_.empty() && !target_;
+        toast_.clear();
+        for (HWND h : ws) TogglePick(h);  // the last one is one too many
+        const bool capped = picks_.size() == kMaxRecWindows && picks_[0] == ws[0] && picks_.back() == ws[kMaxRecWindows - 1] &&
+                            target_ == ws[0] && !toast_.empty() && toastError_;
+        TogglePick(ws[0]);
+        const bool next = picks_.size() == kMaxRecWindows - 1 && target_ == ws[1] && PickedTargets().size() == kMaxRecWindows - 1;
+        SetMultiWindow(false);
+        const bool back = !MultiPicking() && target_ == ws[1];
+        bool ok = handed && none && capped && next && back;
+        if (!ok) ++failures;
+        log(util::Format(L"multi-window: %s checked in order, %zu at most, the first one picked (handed %d, none %d, capped %d, "
+                         L"next %d, back %d)",
+                         ok ? L"ok  " : L"FAIL", kMaxRecWindows, handed, none, capped, next, back));
+        const std::wstring pattern = settings_.nameTemplate;
+        settings_.nameTemplate = L"OzMaker_{날짜}";
+        const std::wstring a = RecFileStem(L"데모 게임", true), one = RecFileStem(L"데모 게임", false);
+        settings_.nameTemplate = L"{창 이름}_{날짜}";
+        const std::wstring b = RecFileStem(L"데모 게임", true);
+        settings_.nameTemplate = L"{window}_{number}";
+        const std::wstring c = RecFileStem(L"데모 게임", true);
+        settings_.nameTemplate = pattern;
+        ok = a.starts_with(L"OzMaker_") && a.ends_with(L"_데모 게임") && !one.ends_with(L"_데모 게임") &&
+             b.starts_with(L"데모 게임_") && !b.ends_with(L"_데모 게임") && c.starts_with(L"데모 게임_0");
+        if (!ok) ++failures;
+        log(util::Format(L"multi-window names: %s %s · %s · %s", ok ? L"ok  " : L"FAIL", a.c_str(), b.c_str(), c.c_str()));
+        for (HWND h : ws) DestroyWindow(h);
+        picks_.clear();
+        toast_.clear();
+        toastUntil_ = 0;
+        settings_.source = source;
+        settings_.multiWindow = multi;
+        target_ = was;
+    }
     // 버리기 in the editor (#37): an unsaved 움짤 recording goes, and the 편집 tab is left with nothing open.
     {
         auto clip = MakeSyntheticClip(320, 180, 10, 30);
         size_t before = held_.size();
-        HoldRecording(clip);
+        HoldRecording(clip, L"OzMaker Test Window");
         OpenEditor(clip);
         bool can = CanDiscard();
         DiscardRecording();
@@ -1848,7 +1900,7 @@ int App::RunSelfTest(const std::wstring& dir) {
     {
         auto clip = MakeSyntheticClip(320, 180, 10, 30);
         size_t before = held_.size();
-        HoldRecording(clip);
+        HoldRecording(clip, L"OzMaker Test Window");
         OpenEditor(clip);
         CloseEditor();
         const bool away = screen_ == Screen::Home && clip_ == clip;
@@ -2527,8 +2579,12 @@ int App::RunSelfTest(const std::wstring& dir) {
         check(hour.timerIdx == 2 && hour.TimerMinutes() == 60 && hour.timerStop && hour.vCodec == kCodecAuto,
               L"최대 녹화 길이 1시간: the 1시간 timer that stops; H.264 becomes 자동");
         check(fresh.TimerMinutes() == 0 && !fresh.timerStop && fresh.vCodec == kCodecAuto &&
-                  fresh.startHide == kHideToTray && !fresh.hkHook && !fresh.hkPauseHook,
-              L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over");
+                  fresh.startHide == kHideToTray && !fresh.hkHook && !fresh.hkPauseHook &&
+                  fresh.deleteMode == kDeleteToBin,
+              L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over, 삭제 to the bin");
+        check(load(L"delete_now.ini", "[OzMaker]\r\nDeleteMode=1\r\n").deleteMode == kDeleteNow &&
+                  load(L"delete_odd.ini", "[OzMaker]\r\nDeleteMode=7\r\n").deleteMode == kDeleteToBin,
+              L"삭제할 때: 바로 삭제 is read back; a value it doesn't know stays with the Recycle Bin");
         Settings kept = load(L"timer_kept.ini", "[OzMaker]\r\nTimer=4\r\nTimerMinutes=200\r\nTimerStop=0\r\nMaxLength=2\r\n"
                                                 "Codec=1\r\nVideoCodec=1\r\nHotkeyHook=1\r\nStartHide=1\r\n");
         check(kept.timerIdx == kTimerCustom && kept.TimerMinutes() == 200 && !kept.timerStop &&
@@ -2563,6 +2619,7 @@ int App::RunSelfTest(const std::wstring& dir) {
         r.vCodec = kCodecHevc;
         r.vFrameMode = 1;
         r.startHide = kHideMinimize;
+        r.deleteMode = kDeleteNow;
         r.nameTemplate = L"{날짜}";
         r.output = kOutputVideo;
         r.fpsIdx = 0;
@@ -2577,9 +2634,10 @@ int App::RunSelfTest(const std::wstring& dir) {
               L"설정 초기화 keeps the save folder, the window's place, the 녹화 tab's pick and the files lists");
         check(r.hkMods == d.hkMods && r.hkVk == d.hkVk && !r.hkHook && !r.hkPauseHook && r.TimerMinutes() == 0 &&
                   !r.timerStop && r.theme == d.theme && r.language == d.language && r.vCodec == kCodecAuto &&
-                  r.vFrameMode == 0 && r.startHide == kHideToTray && r.nameTemplate == d.nameTemplate && r.output == d.output &&
-                  r.fpsIdx == d.fpsIdx,
-              L"and puts back the rest: hotkeys (taken over or not), timer, theme, language, codec, frame rate mode, start");
+                  r.vFrameMode == 0 && r.startHide == kHideToTray && r.deleteMode == kDeleteToBin &&
+                  r.nameTemplate == d.nameTemplate && r.output == d.output && r.fpsIdx == d.fpsIdx,
+              L"and puts back the rest: hotkeys (taken over or not), timer, theme, language, codec, frame rate mode, start, "
+              L"삭제");
         const bool mp4First = r.exportVideo && r.exportPreset == 0 && r.scaleIdx == 0 && r.outFpsIdx == 0;
         r.UseExportKind(false);
         check(mp4First && r.exportPreset == 1 && r.scaleIdx == 4 && r.outFpsIdx == 3,
@@ -3068,18 +3126,27 @@ int App::RunCrashTest(const std::vector<std::wstring>& args) {
 // What DWM puts over the window preview, for screenshots (drawn offscreen, without it): the parts it would show,
 // drawn last as DWM does, in a flat colour that hides whatever was wrongly left under them.
 void App::DrawPreviewStandIn(ID2D1DeviceContext* dc) {
-    if (!thumbWanted_ || !target_ || !IsWindow(target_)) return;
-    RECT dest, src;
-    PreviewLayout(dest, src);
     ComPtr<ID2D1SolidColorBrush> fill, edge;
     dc->CreateSolidColorBrush(D2D1::ColorF(0x2F4A73), &fill);
     dc->CreateSolidColorBrush(D2D1::ColorF(0x6F94CC), &edge);
     const float s = Scale();
-    for (const RECT& p : PreviewParts(dest)) {
-        D2D1_RECT_F r{p.left / s, p.top / s, p.right / s, p.bottom / s};
-        dc->FillRectangle(r, fill.Get());
-        dc->DrawRectangle({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, edge.Get(), 1.f);
+    auto draw = [&](const RECT& dest) {
+        for (const RECT& p : PreviewParts(dest)) {
+            D2D1_RECT_F r{p.left / s, p.top / s, p.right / s, p.bottom / s};
+            dc->FillRectangle(r, fill.Get());
+            dc->DrawRectangle({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, edge.Get(), 1.f);
+        }
+    };
+    RECT dest, src;
+    if (thumbWanted_ && target_ && IsWindow(target_)) {
+        PreviewLayout(dest, src);
+        draw(dest);
     }
+    for (const PreviewCell& c : thumbCells_)  // 여러 창 녹화's grid
+        if (IsWindow(c.hwnd)) {
+            PreviewLayout(LivePreview{}, c.hwnd, c.area, dest, src);
+            draw(dest);
+        }
 }
 
 int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
@@ -3107,6 +3174,7 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             gfx_.RenderToPng((dir + L"\\" + name).c_str(), pw, ph, dpi, [&](ID2D1DeviceContext* dc) {
                 ui_.Begin(dc, mouse, clock);
                 thumbWanted_ = false;
+                thumbCells_.clear();
                 DrawFrame(Rect(0, 0, W, H));
                 ui_.End();
                 if (pass == 9 && ui_.LayerErrors()) {
@@ -3186,6 +3254,64 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     showVideo_ = true;
     shot(L"home_video_saved.png", 96);
     showVideo_ = false;
+    // 여러 창 녹화 (#48): the switch on with nothing checked; two windows side by side; four checked (the fifth row
+    // dimmed) in a 2 × 2 grid; the card for three files, one closed early and one encoded on the CPU.
+    {
+        const std::vector<WinInfo> realWins = windows_;
+        const HWND realTarget = target_;
+        const bool en = look == L"en";
+        const wchar_t* titles[] = {en ? L"Demo Game - 1P" : L"데모 게임 - 1P", en ? L"Demo Game - 2P" : L"데모 게임 - 2P",
+                                   en ? L"Chat" : L"채팅", en ? L"Map" : L"지도", en ? L"Notes" : L"메모"};
+        std::vector<WinInfo> fake;
+        for (int i = 0; i < 5; ++i) {
+            WinInfo w;
+            w.hwnd = MakeStandInWindow(inst_);
+            w.title = titles[i];
+            w.exeName = i < 2 ? L"DemoGame.exe" : i == 2 ? L"Chat.exe" : i == 3 ? L"Map.exe" : L"Memo.exe";
+            w.frame = {0, 0, 1280, 720};
+            SetWindowPos(w.hwnd, nullptr, 0, 0, 1280, 720, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            icons_[w.hwnd] = nullptr;
+            fake.push_back(w);
+        }
+        windows_ = fake;
+        settings_.multiWindow = true;
+        picks_.clear();
+        target_ = nullptr;
+        shot(L"home_multi_empty.png", 96);
+        picks_ = {fake[0].hwnd, fake[1].hwnd};
+        target_ = picks_[0];
+        shot(L"home_multi_two.png", 96);
+        picks_ = {fake[0].hwnd, fake[1].hwnd, fake[2].hwnd, fake[3].hwnd};
+        target_ = picks_[0];
+        shot(L"home_multi_full.png", 96);
+        shot(L"home_multi_full_150.png", 144);
+        picks_ = {fake[0].hwnd, fake[1].hwnd, fake[2].hwnd};
+        target_ = picks_[0];
+        shot(L"home_multi_three.png", 96);
+        lastVideos_.clear();
+        for (int i = 0; i < 3; ++i) {
+            CaptureResult r = lastVideo_;
+            r.path = settings_.outDir + L"\\OzMaker_20261105_201500_" + util::SafeFileName(titles[i], 60) + L".mp4";
+            r.seconds = i == 1 ? 41.7 : 74.2;
+            r.bytes = i == 1 ? 21'004'512 : i == 2 ? 30'118'230 : 48'213'004;
+            r.hardware = i != 2;
+            if (i == 2) r.encoder = L"H264 Encoder MFT";
+            lastVideos_.push_back({r, i == 1});
+        }
+        lastVideo_ = lastVideos_[0].r;
+        showVideo_ = true;
+        shot(L"home_multi_saved.png", 96);
+        showVideo_ = false;
+        lastVideos_.clear();
+        settings_.multiWindow = false;
+        picks_.clear();
+        for (const WinInfo& w : fake) {
+            icons_.erase(w.hwnd);
+            DestroyWindow(w.hwnd);
+        }
+        windows_ = realWins;
+        target_ = realTarget;
+    }
     settings_.source = kSourceDisplay;
     shot(L"home_display.png", 96);
     settings_.source = kSourceRegion;
@@ -3219,11 +3345,11 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             regionPicker_.PaintTest(p, mr, a, c);
         });
         // The recording pill: recording (stop hovered) and paused (resume hovered), then with the record timer
-        // (#47) and with its time up, at 150 %.
-        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 510, 276, 144, [&](ID2D1DeviceContext* dc) {
+        // (#47) and with its time up, and recording three windows (#48), at 150 %.
+        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 510, 342, 144, [&](ID2D1DeviceContext* dc) {
             Painter p;
             p.Bind(dc);
-            p.Fill(Rect(0, 0, 340, 184), theme::Hex(0x2B4C7E));
+            p.Fill(Rect(0, 0, 340, 228), theme::Hex(0x2B4C7E));
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 6));
             overlay_.PaintTest(p, 73.4, false, 2);
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 50));
@@ -3232,6 +3358,8 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             overlay_.PaintTest(p, 4271.2, false, 0, 200 * 60);
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 138));
             overlay_.PaintTest(p, 12034.5, false, 0, 200 * 60, true);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 182));
+            overlay_.PaintTest(p, 73.4, false, 0, 0, false, 3);  // 여러 창 녹화 (#48): three windows
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
         });
         // 순간 리플레이's save notice (#20): with 편집 · 폴더 (편집 under the pointer), over a game that holds the mouse
@@ -3326,6 +3454,9 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         shot(L"settings_filename_warn.png", 96);
         nameCustom_ = false;
         settings_.nameTemplate = nameWas;
+        settings_.deleteMode = kDeleteNow;
+        shot(L"settings_delete.png", 96);
+        settings_.deleteMode = kDeleteToBin;
     }
     {
         // 동영상 › 코덱 on HEVC: its line says a crash leaves no recording. On made-up encoders, so it shows the same
@@ -3421,6 +3552,7 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
                 gfx_.RenderToPng((dir + L"\\" + name).c_str(), (UINT)W, (UINT)H, 96, [&](ID2D1DeviceContext* dc) {
                     ui_.Begin(dc, in, clock);
                     thumbWanted_ = false;
+                    thumbCells_.clear();
                     DrawFrame(Rect(0, 0, W, H));
                     ui_.End();
                 });
@@ -3527,6 +3659,11 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     Ask({L"이 동영상을 휴지통으로 옮길까요?", L"OzMaker_20261102_142311.mp4\n이 녹화에서 따로 저장한 파일은 그대로 남습니다.",
          L"휴지통으로", true, nullptr});
     shot(L"editor_ask_video.png", 96);
+    Ask({tr(L"이 동영상을 삭제할까요?"),
+         L"OzMaker_20261102_142311.mp4" + std::wstring(tr(L"\n휴지통을 거치지 않고 지워서 되돌릴 수 없습니다.")) +
+             tr(L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."),
+         tr(L"삭제"), true, nullptr});
+    shot(L"editor_ask_delete.png", 96);
     question_.reset();
     CloseEditor();
 
@@ -3709,7 +3846,13 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         rpRunning_.clear();
         rpFileMenu_ = 1;
         shot(L"replay_menu.png", 96);
+        settings_.deleteMode = kDeleteNow;
+        shot(L"replay_menu_delete.png", 96);
         rpFileMenu_ = -1;
+        TrashReplay(1);
+        shot(L"replay_ask_delete.png", 96);
+        question_.reset();
+        settings_.deleteMode = kDeleteToBin;
         rpRenaming_ = 1;
         rpRenameFocused_ = false;
         rpRenameText_ = L"Starfall Arena_20261104_151208";
@@ -3813,6 +3956,7 @@ int App::RunReadmeMedia(const std::wstring& dir) {
             windows_ = wins;  // nothing here lists the real ones
             ui_.Begin(dc, mouse, clock);
             thumbWanted_ = false;
+            thumbCells_.clear();
             DrawFrame(Rect(0, 0, W, H));
             ui_.End();
             if (ui_.LayerErrors() && !layerFailed) {
@@ -4407,6 +4551,7 @@ int App::RunRecordTest(const std::wstring& cmdLine) {
     // dda | wgc (anywhere after the mode): how a monitor is taken, desktop duplication or Windows.Graphics.Capture.
     if (std::find(a.begin() + std::min<size_t>(a.size(), 7), a.end(), L"dda") != a.end()) o.screenVia = 1;
     if (std::find(a.begin() + std::min<size_t>(a.size(), 7), a.end(), L"wgc") != a.end()) o.screenVia = 2;
+    Capture capture_;  // its own: the app's recordings are App::recs_
     std::wstring err;
     double t0 = util::NowSeconds();
     if (!capture_.Start(o, nullptr, 0, err)) {
@@ -5921,6 +6066,25 @@ int App::RunReplayTest(const std::wstring& dir) {
               L"replay app: the saved list shows it first and new, its length read from the file");
         check(rpNotice_.Visible(), L"replay app: the save notice shows over the program");
         rpNotice_.Hide();
+        // 삭제할 때 › 바로 삭제: on a copy, so what follows keeps its file. The menu asks; the list follows.
+        const std::wstring spare = first.substr(0, first.size() - 4) + L"_spare.mp4";
+        check(CopyFileW(first.c_str(), spare.c_str(), FALSE) != 0, L"replay app: a copy to delete");
+        RefreshReplayFiles();
+        const auto row = [&] {
+            return std::find_if(rpFiles_.begin(), rpFiles_.end(), [&](const auto& f) { return f.path == spare; });
+        };
+        settings_.deleteMode = kDeleteNow;
+        const size_t listed = rpFiles_.size();
+        TrashReplay((size_t)(row() - rpFiles_.begin()));
+        const bool asked = question_.has_value() && question_->danger &&
+                           GetFileAttributesW(spare.c_str()) != INVALID_FILE_ATTRIBUTES;
+        auto yes = asked ? std::move(question_->onYes) : nullptr;
+        question_.reset();
+        if (yes) yes();
+        check(asked && GetFileAttributesW(spare.c_str()) == INVALID_FILE_ATTRIBUTES && row() == rpFiles_.end() &&
+                  rpFiles_.size() == listed - 1,
+              L"replay app: 바로 삭제 asks first, then the file and its row are gone");
+        settings_.deleteMode = kDeleteToBin;
         // The program closes: what was held stays to be saved, and goes once it is.
         WaitForSingleObject(pi.hProcess, 15000);
         CloseHandle(pi.hProcess);
@@ -6327,6 +6491,33 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
               L"Enter on the question: 삭제 removes the video and its card; the 편집 tab has nothing open");
         check(OpenVideo(path) && !CanDiscard(), L"a video opened by hand has no 삭제");
         CloseEditor();
+        // 삭제할 때 › 바로 삭제: it says so; a file another program holds stays, open as it was, and goes once let go.
+        testDeleteFiles_ = false;
+        settings_.deleteMode = kDeleteNow;
+        check(CopyFileW(path.c_str(), copy.c_str(), FALSE) != 0, L"copy for the 바로 삭제 check");
+        r.path = copy;
+        r.bytes = util::FileSize(copy);
+        OnVideoSaved(r);
+        EditLastVideo();
+        pump(0.5);
+        key(VK_DELETE);
+        pump(0.3);
+        const bool says = question_.has_value() && question_->danger && question_->yes == tr(L"삭제") &&
+                          question_->title == tr(L"이 동영상을 삭제할까요?");
+        HANDLE other = CreateFileW(copy.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        key(VK_RETURN);
+        pump(0.5);
+        const bool stayed = other != INVALID_HANDLE_VALUE && clip_ && toastError_ && CanDiscard() &&
+                            GetFileAttributesW(copy.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (other != INVALID_HANDLE_VALUE) CloseHandle(other);
+        check(says && stayed, util::Format(L"바로 삭제 asks and says it can't be undone (%d); a held file stays (%d)", says, stayed));
+        key(VK_DELETE);
+        pump(0.3);
+        key(VK_RETURN);
+        pump(0.5);
+        check(!clip_ && !showVideo_ && !question_ && GetFileAttributesW(copy.c_str()) == INVALID_FILE_ATTRIBUTES,
+              L"바로 삭제 removes the file itself");
+        settings_.deleteMode = kDeleteToBin;
     } else {
         check(false, L"copy for the 삭제 check");
     }
@@ -6334,6 +6525,142 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     quitting_ = true;
     DestroyWindow(hwnd_);
     pump(2.0);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+// 여러 창 녹화 (#48) in the app, through two test windows in processes of their own (no other window is listed):
+// both as 움짤, held with the first one open; then as MP4 while the first window's process ends partway, which ends
+// only its file, the pill going on to the other; the card lists both and each row's 편집 opens its own.
+int App::RunMultiTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\multi-test.log");
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    settings_.outDir = dir;
+    settings_.sounds = false;
+    settings_.mic = false;  // never the real microphone: it records the room
+    settings_.audio = true;
+    settings_.rpOn = false;
+    settings_.source = kSourceWindow;
+    settings_.multiWindow = true;
+    settings_.nameTemplate = kNameTemplates[0];
+    if (!CreateMainWindow(SW_HIDE)) return 1;
+    auto pump = [&](double seconds, const std::function<bool()>& until) {
+        const double end = util::NowSeconds() + seconds;
+        MSG msg;
+        while (util::NowSeconds() < end && !(until && until())) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    };
+    // The first window's process ends while the MP4s are recorded.
+    const int lives[2] = {9, 30};
+    PROCESS_INFORMATION pis[2]{};
+    for (int i = 0; i < 2; ++i) {
+        std::wstring cmd = L"\"" + util::ExePath() + util::Format(L"\" --test-window %d capture", lives[i]);
+        STARTUPINFOW si{sizeof(si)};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pis[i])) {
+            log(L"FAIL can't start --test-window");
+            return 1;
+        }
+    }
+    auto cleanup = [&] {
+        for (PROCESS_INFORMATION& pi : pis) {
+            if (!pi.hProcess) continue;
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            pi = {};
+        }
+    };
+    HWND wins[2] = {};
+    double nextList = 0;
+    pump(8, [&] {
+        if (util::NowSeconds() < nextList) return false;
+        nextList = util::NowSeconds() + 0.2;
+        RefreshWindows();
+        for (const WinInfo& w : windows_) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w.hwnd, &pid);
+            for (int i = 0; i < 2; ++i)
+                if (pid == pis[i].dwProcessId) wins[i] = w.hwnd;
+        }
+        return wins[0] && wins[1];
+    });
+    check(wins[0] && wins[1], L"multi: both test windows are listed");
+    if (!wins[0] || !wins[1]) {
+        cleanup();
+        return 1;
+    }
+    TogglePick(wins[0]);
+    TogglePick(wins[1]);
+    check(MultiPicking() && picks_.size() == 2 && target_ == wins[0], L"multi: both checked, the first one picked");
+
+    // 움짤: a clip of each, held; the first window's opens.
+    settings_.output = kOutputClip;
+    const size_t heldBefore = held_.size();
+    StartRecording(PickedTargets(), true);
+    check(rec_ == RecState::Recording && recs_.size() == 2 && !recScreen_,
+          L"multi clip: two windows recording, each through its window");
+    pump(2.0, nullptr);
+    StopRecording();
+    const bool two = held_.size() == heldBefore + 2;
+    const size_t f0 = two ? held_[0].clip->Count() : 0, f1 = two ? held_[1].clip->Count() : 0;
+    check(two && f0 > 10 && f1 > 10 && clip_ && clip_ == held_[0].clip && screen_ == Screen::Editor,
+          util::Format(L"multi clip: both held (%zu and %zu frames), the first one open in the editor", f0, f1));
+    CloseClip();
+    held_.clear();
+    CloseEditor();
+
+    // MP4: a file each; the first window closes partway.
+    settings_.output = kOutputVideo;
+    StartRecording(PickedTargets(), true);
+    check(rec_ == RecState::Recording && recs_.size() == 2, L"multi mp4: two windows recording");
+    pump(15, [&] { return rec_ != RecState::Recording || recs_[0].ended; });
+    const bool ended = rec_ == RecState::Recording && recs_.size() == 2 && recs_[0].ended && !recs_[1].ended &&
+                       RecLead() == &recs_[1] && recTarget_.hwnd == wins[1];
+    check(ended, L"multi mp4: the first window closed: only its file ended, the pill went on to the other");
+    pump(2.5, nullptr);
+    StopRecording();
+    check(lastVideos_.size() == 2 && showVideo_ && lastVideos_[0].early && !lastVideos_[1].early,
+          util::Format(L"multi mp4: the card lists %zu files, the first one closed early", lastVideos_.size()));
+    if (lastVideos_.size() == 2) {
+        double secs[2] = {};
+        bool sound[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            std::wstring err;
+            if (auto v = VideoClip::Open(lastVideos_[i].r.path, err)) {
+                secs[i] = v->Seconds();
+                sound[i] = v->HasAudio();
+            }
+        }
+        const std::wstring n0 = util::FileNameOf(lastVideos_[0].r.path), n1 = util::FileNameOf(lastVideos_[1].r.path);
+        check(secs[0] > 1.5 && secs[1] > secs[0] + 1.5,
+              util::Format(L"multi mp4: %.2f s and %.2f s (sound %d %d)", secs[0], secs[1], sound[0], sound[1]));
+        check(n0 != n1 && n0.find(L"_OzMaker Test Window") != std::wstring::npos &&
+                  n1.find(L"_OzMaker Test Window") != std::wstring::npos,
+              L"multi mp4: each named after its window: " + n0 + L", " + n1);
+        EditVideoAt(1);
+        check(screen_ == Screen::Editor && clip_ && clip_->SourcePath() == lastVideos_[1].r.path &&
+                  lastVideo_.path == lastVideos_[1].r.path,
+              L"multi mp4: the second row's 편집 opens the second file");
+        CloseEditor();
+    }
+    cleanup();
+    lastVideos_.clear();
+    lastVideo_ = {};
+    picks_.clear();
+    quitting_ = true;
+    DestroyWindow(hwnd_);
+    pump(1.0, nullptr);
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -6492,7 +6819,7 @@ int App::RunPreviewTest(const std::wstring& dir) {
         const LONG dw = dest.right - dest.left, dh = dest.bottom - dest.top;
         {
             SIZE whole{};
-            if (!thumb_.empty()) DwmQueryThumbnailSourceSize(thumb_[0], &whole);
+            if (!thumb_.thumb.empty()) DwmQueryThumbnailSourceSize(thumb_.thumb[0], &whole);
             RECT pw, pf{}, pc;
             GetWindowRect(pattern, &pw);
             DwmGetWindowAttribute(pattern, DWMWA_EXTENDED_FRAME_BOUNDS, &pf, sizeof(pf));
@@ -6552,7 +6879,7 @@ int App::RunPreviewTest(const std::wstring& dir) {
         // (Text on the list has ClearType's coloured fringes; the preview showing through would be most of it.)
         check(underN > 100 && under <= underN / 50,
               util::Format(L"%s: the files list shows above the preview (%d of %d points under it show the window, %zu "
-                           L"thumbnails)", mode.c_str(), under, underN, thumb_.size()));
+                           L"thumbnails)", mode.c_str(), under, underN, thumb_.thumb.size()));
         check(keptN > 100 && kept >= keptN * 99 / 100,
               util::Format(L"%s: the rest of the preview is as before (%d of %d points)", mode.c_str(), kept, keptN));
         save(base, clientOnly ? L"preview_client.png" : L"preview_window.png");
@@ -6575,7 +6902,7 @@ int App::RunPreviewTest(const std::wstring& dir) {
                 ++backN;
                 back += same(at(after, x, y), at(base, x, y));
             }
-        check(back >= backN * 99 / 100 && thumb_.size() == 1 && !thumbSplit_,
+        check(back >= backN * 99 / 100 && thumb_.thumb.size() == 1 && !thumb_.split,
               util::Format(L"%s: closing the list brings the whole preview back (%d of %d points)", mode.c_str(), back,
                            backN));
     }

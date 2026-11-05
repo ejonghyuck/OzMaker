@@ -9,6 +9,7 @@
 | 부분 | 구현 |
 |---|---|
 | 캡처 | Windows.Graphics.Capture. 창 캡처(가려져도 녹화), 모니터 캡처, 모니터 캡처 후 영역 크롭. ‘자동’이면 전체화면 게임 창은 모니터 캡처 후 창 영역 크롭. Windows 11은 시작할 때 따로 된 스레드에서 `GraphicsCaptureAccess.RequestAccessAsync(Borderless)`로 한 번 허락을 받고 `IsBorderRequired(false)`로 노란 테두리를 끔(허락 없이 끄면 무시됨). Windows 10은 끌 수 없어(`IsBorderRequired`가 없음), Windows 11도 허락되지 않았으면 모니터 캡처를 DXGI 데스크톱 복제(`DuplicateOutput1`, BGRA)로 함: 바뀔 때마다 `desk_`에 복사하고 프레임 레이트에 맞춰 넘김, 커서는 빠져 있어 GDI 호환 텍스처에 `DrawIconEx`로 그림(반전 커서 포함), 접근을 잃으면(모드 변경 · UAC · 잠금) 다시 엶. 모니터를 다른 GPU가 맡거나 회전된 화면이면 WGC로. 모니터를 담아 창으로 자를 때 그 창이 앞에 없으면 위에 올라온 다른 프로세스의 창 자리는 그 창이 가려지지 않았던 마지막 그림(`clean_`)으로 채움(그런 그림이 없을 때만 검게) |
+| 여러 창 녹화 | `App::recs_`: 녹화하는 것마다 `RecSession`(대상 · 이름 · 자기 `Capture` · 결과) 하나. 여러 창이면 창마다 `Capture`를 따로 열어(늘 창 캡처, 창마다 프로세스 루프백, 마이크는 각자 공유 모드로 엶) 파일 이름을 미리 정해 겹치지 않게 함. 각 `Capture`는 `WM_APP_CAPTURE_CLOSED`의 lParam에 자기 번호(1부터)를 실어 보내고, 하나가 끝나면 `EndRecSession`이 그것만 멈춰 결과를 받아 둠(마지막 하나면 `StopRecording`). 멈출 때는 모두 일시정지한 뒤 하나씩 닫아 길이를 맞춤. 미리 보기 격자는 칸마다 DWM 썸네일(`thumbCells_` · `thumbMore_`), 칸마다 `NativeLayer` |
 | 축소 | GPU에서 밉맵 + 4탭 박스 필터(녹화와 MP4 내보내기. 움짤 · WebM 내보내기는 CPU의 면적 리샘플) |
 | 움짤 임시 저장 | 이전 프레임과 XOR 후 Windows 내장 XPRESS 압축, `%TEMP%\OzMaker`의 임시 파일(키프레임 30장마다)과 디스크에 쓴 프레임을 하나씩 적는 작은 기록(`.idx`). 버리거나 저장하면 둘 다 지우고, 프로세스가 죽어 남은 것은 다음 실행 때 되살림. 1프레임 지연 읽기로 GPU가 멈추지 않음 |
 | 동영상 | 화면이 바뀔 때만 오는 프레임을 1/fps마다 샘플링해 고정 프레임 레이트로 만들고(가변은 아래), GPU 비디오 프로세서로 NV12(BT.709) 변환 → Media Foundation 싱크 라이터(H.264/HEVC 하드웨어 인코더 + AAC) → MP4. 영상이 GPU 메모리를 벗어나지 않음. 녹화하는 동안은 조각(fragmented) MP4로 써서 비정상 종료돼도 다 쓴 조각까지 남고(H.264만. Windows의 조각 MP4 싱크는 HEVC를 받지 않아 HEVC는 일반 MP4로 쓰며, 비정상 종료되면 남지 않음), 멈추면 그 자리에서 일반 MP4로 바꿈(모든 조각의 샘플 테이블을 담은 moov를 끝에 붙이고 조각 상자는 `free`로, 데이터는 옮기지 않음). 쓰는 중인 파일은 `%TEMP%\OzMaker`의 표시 파일이 가리키고, 남은 표시 파일은 다음 실행 때 같은 방법으로 바꿈 |
@@ -85,6 +86,8 @@ OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·�
 OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지, 다른 프로그램 창이 목록에 바로 반영되는지
 OzMaker.exe --replay-test <dir>       # 순간 리플레이: 합성 영상으로 링 버퍼의 자르기(길이 · 첫 키프레임 · 소리 맞춤, 하드웨어와 소프트웨어),
                                       # 그리고 --test-window를 대상으로 켜기 → 담기 → 저장 → 창이 닫힌 뒤 남은 것 저장 → 끄기(테스트 창만 담음)
+OzMaker.exe --multi-test <dir>        # 여러 창 녹화: --test-window 두 개를 체크해 움짤로(둘 다 남고 첫 창이 열림), 그리고 MP4로
+                                      # 녹화하며 첫 창이 도중에 닫힘(그 파일만 먼저 끝남, REC 표시가 다음 창으로, 카드에 두 파일)
 OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업데이트 확인 → 받기 → 검증 → 교체(--selftest에도 포함)
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```

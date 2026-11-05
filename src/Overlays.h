@@ -43,11 +43,17 @@ public:
     // The record timer (#47): the pill shows "/ 3:20:00" after the time (0: none), and once it is up, a bell and
     // an amber edge.
     void SetTimer(int seconds, bool up);
+    // 여러 창 녹화 (#48): how many windows are recorded, shown after REC as "창 2개" (0 or 1: nothing).
+    void SetCount(int windows);
+    // The window the pill sits on closed while the others go on: onto the next one.
+    void MoveTo(const RECT& target);
     void ShowFrame(const RECT& area);
     void Update(double elapsed, size_t frames);
     // Screenshot tests: the pill drawn at the origin without a window.
-    void PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer = 0, bool timerUp = false);
-    static float PillWidth(int timer);  // DIPs
+    void PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer = 0, bool timerUp = false,
+                   int windows = 0);
+    static float PillWidth(int timer);  // DIPs, without the window count
+    float Width() const;  // the pill's, DIPs
     void Hide();
     bool Visible() const { return mode_ != Mode::None; }
     void SetMotion(bool on) { motion_ = on; }  // Windows' animations: off, the REC dot stays still
@@ -59,6 +65,7 @@ private:
     void Ensure();
     void Place(const RECT& target, int wDip, int hDip, bool center, bool outside);
     void Redraw(bool move);
+    void Resize();  // after the width changed: about its middle
     void Paint(Painter& p);
     Rect StopRect() const;
     Rect PauseRect() const;
@@ -75,6 +82,8 @@ private:
     int countdown_ = 0;
     int timer_ = 0;  // seconds, 0 = none
     bool timerUp_ = false;
+    int count_ = 0;       // windows recorded (SetCount)
+    float countW_ = 0;    // the room its label takes, DIPs
     int hover_ = 0;  // ButtonAt under the mouse
     bool tracking_ = false, paused_ = false, motion_ = true;
     std::function<void()> onStop_, onPause_;

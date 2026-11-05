@@ -220,6 +220,12 @@ constexpr float kPillW = 228, kPillH = 40, kTimerW = 92;
 
 float RecOverlay::PillWidth(int timer) { return kPillW + (timer > 0 ? kTimerW : 0); }
 
+float RecOverlay::Width() const { return PillWidth(timer_) + countW_; }
+
+namespace {
+std::wstring CountLabel(int windows) { return util::Format(tr(L"창 %d개"), windows); }
+}  // namespace
+
 void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop,
                           std::function<void()> onPause) {
     Ensure();
@@ -232,6 +238,8 @@ void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()
     paused_ = false;
     timer_ = 0;
     timerUp_ = false;
+    count_ = 0;
+    countW_ = 0;
     Place(target, (int)kPillW, (int)kPillH, false, outside);
     Redraw(true);
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
@@ -290,12 +298,34 @@ void RecOverlay::SetTimer(int seconds, bool up) {
         Redraw(false);
         return;
     }
+    Resize();
+}
+
+void RecOverlay::Resize() {
     // Wider or narrower about its middle, where the user may have dragged it.
     RECT r{};
     GetWindowRect(win_.Hwnd(), &r);
-    const int w = (int)std::lround(PillWidth(timer_) * scale_);
+    const int w = (int)std::lround(Width() * scale_);
     rect_ = {(r.left + r.right - w) / 2, r.top, (r.left + r.right + w) / 2, r.bottom};
     win_.Render(rect_, scale_, true, [&](Painter& p) { Paint(p); });
+}
+
+void RecOverlay::SetCount(int windows) {
+    if (count_ == windows) return;
+    const float was = countW_;
+    count_ = windows;
+    countW_ = windows > 1 ? Painter().Measure(CountLabel(windows), 11.5f, kSemibold) + 22 : 0;
+    if (mode_ != Mode::Pill) return;
+    if (countW_ == was)
+        Redraw(false);
+    else
+        Resize();
+}
+
+void RecOverlay::MoveTo(const RECT& target) {
+    if (mode_ != Mode::Pill) return;
+    Place(target, (int)std::lround(Width()), (int)kPillH, false, false);
+    Redraw(true);
 }
 
 void RecOverlay::Hide() {
@@ -309,8 +339,8 @@ void RecOverlay::Hide() {
     }
 }
 
-Rect RecOverlay::StopRect() const { return Rect::Centered(PillWidth(timer_) - 21, kPillH / 2, 28, 28); }
-Rect RecOverlay::PauseRect() const { return Rect::Centered(PillWidth(timer_) - 53, kPillH / 2, 28, 28); }
+Rect RecOverlay::StopRect() const { return Rect::Centered(Width() - 21, kPillH / 2, 28, 28); }
+Rect RecOverlay::PauseRect() const { return Rect::Centered(Width() - 53, kPillH / 2, 28, 28); }
 
 int RecOverlay::ButtonAt(float x, float y) const {
     if (PauseRect().Inset(-2).Contains(x, y) && onPause_) return 1;
@@ -325,7 +355,10 @@ void RecOverlay::Redraw(bool move) {
     win_.Render(rect_, scale_, move, [&](Painter& p) { Paint(p); });
 }
 
-void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer, bool timerUp) {
+void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer, bool timerUp,
+                           int windows) {
+    count_ = windows;
+    countW_ = windows > 1 ? p.Measure(CountLabel(windows), 11.5f, kSemibold) + 22 : 0;
     mode_ = Mode::Pill;
     elapsed_ = elapsed;
     paused_ = paused;
@@ -338,6 +371,8 @@ void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover, i
     onPause_ = nullptr;
     timer_ = 0;
     timerUp_ = false;
+    count_ = 0;
+    countW_ = 0;
 }
 
 void RecOverlay::Paint(Painter& p) {
@@ -355,7 +390,7 @@ void RecOverlay::Paint(Painter& p) {
             p.Text(Rect(0, 86, 132, 112), tr(L"녹화 준비"), 12.f, TextDim, sub);
             return;
         }
-        const float pillW = PillWidth(timer_);
+        const float pillW = Width();
         Rect r(0.5f, 0.5f, pillW - 0.5f, kPillH - 0.5f);
         p.Fill(r, Panel(0.92f), 20);
         if (timerUp_)
@@ -378,7 +413,19 @@ void RecOverlay::Paint(Painter& p) {
         TextStyle tm;
         tm.weight = kSemibold;
         tm.tabular = true;
-        const float tx = paused_ ? 88.f : 66.f;
+        float tx = paused_ ? 88.f : 66.f;
+        if (countW_ > 0) {  // 여러 창 녹화: "창 2개" in a chip before the time
+            Rect chip = Rect::XYWH(tx - 2, 11, countW_ - 10, 18);
+            if (Contrast())
+                p.Stroke(chip.Inset(0.5f), Border, 9);
+            else
+                p.Fill(chip, WithAlpha(White, 0.10f), 9);
+            TextStyle cs;
+            cs.h = AlignCenter;
+            cs.weight = kSemibold;
+            p.Text(chip.Offset(0, -0.5f), CountLabel(count_), 11.5f, Contrast() ? TextColor : Hex(0xE6E8EE), cs);
+            tx += countW_;
+        }
         const std::wstring now = util::FormatClock(elapsed_, true);
         p.Text(Rect(tx, 0, pillW - 68, 40), now, 15.f, paused_ ? TextDim : Ink(), tm);
         if (timer_ > 0) {

@@ -65,7 +65,8 @@ public:
     static void RequestBorderless();
     static int BorderlessAccess(int waitMs);
     // closedMsg is posted when the source goes away (wParam 0) or the video encoder fails (wParam 1).
-    bool Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err);
+    // tag goes out as its lParam: which of several recordings (#48) it is.
+    bool Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err, LPARAM tag = 0);
     CaptureResult Stop();
 
     bool Running() const { return running_; }
@@ -160,6 +161,7 @@ private:
     CaptureOptions opt_;
     HWND notify_ = nullptr;
     UINT closedMsg_ = 0;
+    LPARAM tag_ = 0;
     RECT monitorRect_{};
 
     ComPtr<ID3D11Device> dev_;

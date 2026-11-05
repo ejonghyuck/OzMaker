@@ -62,6 +62,7 @@ inline constexpr uint64_t kLowDiskStop = 300ull << 20;      // and stop (saving 
 inline constexpr int kReplayLenOptions[] = {15, 30, 60, 120, 300};  // seconds
 inline constexpr int kReplayKeepClosed = 300;                         // seconds
 inline constexpr size_t kMaxReplayTargets = 32;
+inline constexpr size_t kMaxRecWindows = 4;  // 여러 창 녹화 (#48): checked at once
 // What 순간 리플레이 waits for (the 리플레이 tab's list): a program, by its exe, or a whole monitor. No window titles.
 struct ReplayTarget {
     bool monitor = false;
@@ -79,12 +80,14 @@ enum SettingsTab { kTabGeneral = 0, kTabRecord, kTabVideo, kTabAudio, kTabAbout,
 enum ThemeChoice { kThemeSystem = 0, kThemeDark, kThemeLight };
 enum LanguageChoice { kLangSystem = 0, kLangKorean, kLangEnglish };
 enum StartHide { kHideToTray = 0, kHideMinimize };  // 설정 › 녹화 "녹화를 시작하면" (#46)
+enum DeleteMode { kDeleteToBin = 0, kDeleteNow };   // 설정 › 일반 "삭제할 때"
 // 자동 is H.264, and HEVC only for a picture longer than H.264 encoders take (4096) on a PC that plays HEVC (#42).
 enum CodecChoice { kCodecAuto = 0, kCodecH264, kCodecHevc };
 
 struct Settings {
     // what and how
     int source = kSourceWindow;
+    bool multiWindow = false;  // 여러 창 녹화 (#48): windows are checked, up to kMaxRecWindows
     int output = kOutputClip;
     std::wstring monitor;  // device name of the chosen display (MONITORINFOEX::szDevice)
     RECT region{};         // screen pixels; empty = not chosen yet
@@ -114,6 +117,7 @@ struct Settings {
     // Taken over from another program by the user (#50): when RegisterHotKey refuses the key, a keyboard hook gets it.
     bool hkHook = false, hkPauseHook = false;
     int startHide = kHideToTray;  // where the window goes when a recording starts from it
+    int deleteMode = kDeleteToBin;  // what 삭제 does to a video or a saved replay
     // The record timer (#47): kTimerOptions, the length 직접 입력 holds, and what happens when the time is up.
     int timerIdx = 0;
     int timerMinutes = 90;   // 1 – kTimerMaxMinutes
