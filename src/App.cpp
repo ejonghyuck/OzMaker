@@ -794,6 +794,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 TogglePause();
             else if (w == kHotkeyReplay)
                 ReplaySave();
+            else if (w == kHotkeyShot)
+                TakeScreenshot();
             return 0;
         case WM_DISPLAYCHANGE:
             monitors_ = EnumerateMonitors();
@@ -1046,6 +1048,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             UnregisterHotKey(hwnd_, kHotkeyRecord);
             UnregisterHotKey(hwnd_, kHotkeyPause);
             UnregisterHotKey(hwnd_, kHotkeyReplay);
+            UnregisterHotKey(hwnd_, kHotkeyShot);
             if (dropTarget_) {
                 RevokeDragDrop(hwnd_);
                 dropTarget_.Reset();
@@ -1406,6 +1409,7 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
 }
 
 void App::StartRecording(const std::vector<RecTarget>& targets, bool fromHotkey) {
+    recShots_ = 0;
     if (rec_ != RecState::Idle || targets.empty()) return;
     StopMicTest();      // the recording opens the mic itself
     question_.reset();  // a question about this window's state (quit, discard) no longer applies
@@ -1621,6 +1625,7 @@ void App::BeginCapture() {
         TrayBalloon(tr(L"남은 공간이 적습니다"), tr(L"저장할 드라이브에 ") + util::FormatBytes(freeBytes) +
                                                 tr(L" 남았습니다. 300MB까지 줄면 녹화를 멈추고 저장합니다."));
     RegisterPauseHotkey();
+    RegisterShotHotkey();
     bool pill = settings_.overlayMode == kOverlayAlways ||
                 (settings_.overlayMode == kOverlayExceptFullscreen && !recFullscreen_);
     if (pill)
@@ -1701,6 +1706,8 @@ void App::StopRecording() {
     recPaused_ = false;
     SetRecordingLook(false);
     RegisterPauseHotkey();  // releases it
+    RegisterShotHotkey();
+    lastShots_ = std::exchange(recShots_, 0);
     overlay_.Hide();
     TrayUpdate();
     if (done.size() > 1) {
@@ -1742,12 +1749,14 @@ void App::OpenClipWarn(const std::shared_ptr<FrameStore>& clip, size_t held) {
                                                           L"‘저장하지 않은 녹화’에 있습니다"),
                                                        held)
                                        : tr(L"녹화를 편집 탭에서 열었습니다");
+    const std::wstring shots = lastShots_ ? util::Format(tr(L" · 스크린샷 %d장"), lastShots_) : L"";
+    lastShots_ = 0;  // a clip has no card to show them on
     if (NotifyQuietly()) {
         TrayBalloon(tr(L"녹화 완료 · ") + util::FormatClock(clip->Seconds(), true),
                     warn.empty() ? tr(L"클릭하면 편집 탭이 열립니다.") : warn);
     } else {
         ShowMain(true);
-        Toast(warn.empty() ? done : warn, !warn.empty());
+        Toast(warn.empty() ? done + shots : warn, !warn.empty());
     }
 }
 
@@ -2898,20 +2907,31 @@ std::wstring App::ImageDirName() const { return Language() == Lang::English ? L"
 
 std::wstring App::ImageDir() const { return settings_.outDir + L"\\" + ImageDirName(); }
 
+// A free name in the image folder, taken at once: two saves in a row are written later, one after the other.
+std::wstring App::ReserveImage(const std::wstring& stem, int format) const {
+    const std::wstring base = ImageDir() + L"\\" + stem, ext = std::wstring(L".") + image::Ext(format);
+    std::wstring path = base + ext;
+    for (int i = 2; i < 100000; ++i) {
+        const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            break;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS) break;  // writing it will say what is wrong
+        path = base + util::Format(L"_%d", i) + ext;
+    }
+    return path;
+}
+
 // The clip's name and where the frame sits in it, so that a bug report can point at the moment in the video.
-std::wstring App::FrameImageName(int format) const {
+std::wstring App::FrameImageStem() const {
     std::wstring stem = FileStem(clipName_);
     if (const std::wstring src = clip_->SourcePath(); !src.empty()) {
         stem = util::FileNameOf(src);
         if (const size_t dot = stem.rfind(L'.'); dot != std::wstring::npos) stem.resize(dot);
     }
     const int64_t ms = clip_->Ts(playhead_) / 10'000;
-    stem += util::Format(L"_%dm%02ds%03d", (int)(ms / 60'000), (int)(ms / 1000 % 60), (int)(ms % 1000));
-    const std::wstring ext = image::Ext(format), dir = ImageDir() + L"\\";
-    std::wstring name = stem + L"." + ext;
-    for (int i = 2; GetFileAttributesW((dir + name).c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
-        name = stem + util::Format(L"_%d.", i) + ext;
-    return name;
+    return stem + util::Format(L"_%dm%02ds%03d", (int)(ms / 60'000), (int)(ms / 1000 % 60), (int)(ms % 1000));
 }
 
 void App::SaveFrameImage() {
@@ -2922,7 +2942,7 @@ void App::SaveFrameImage() {
         return;
     }
     const int format = image::Available(settings_.imageFormat) ? settings_.imageFormat : (int)image::kPng;
-    const std::wstring path = dir + L"\\" + FrameImageName(format);
+    const std::wstring path = ReserveImage(FrameImageStem(), format);
     imageSaver_.Add(
         [clip = clip_, index = playhead_, crop = crop_, text = caption_, pos = captionPos_, format, path] {
             image::Saved r;
@@ -2939,6 +2959,10 @@ void App::SaveFrameImage() {
 void App::OnImageDone() {
     image::Saved r;
     while (imageSaver_.Take(r)) {
+        if (!r.clip) {
+            ShotDone(r);
+            continue;
+        }
         if (!r.ok) {
             Toast(r.error, true);
             continue;
@@ -2951,6 +2975,90 @@ void App::OnImageDone() {
         }
     }
     Invalidate();
+}
+
+// Each window being recorded gives one, or what the replay holds: at its own size, however small it is recorded.
+void App::TakeScreenshot() {
+    std::vector<std::pair<Capture*, std::wstring>> from;
+    if (rec_ == RecState::Recording) {
+        for (RecSession& s : recs_)
+            if (!s.ended && s.capture) from.emplace_back(s.capture.get(), RecFileStem(s.name, recs_.size() > 1));
+    } else if (rpCap_.Running()) {
+        from.emplace_back(&rpCap_, FileStem(rpHeld_.name.empty() ? tr(L"리플레이") : rpHeld_.name));
+    }
+    if (from.empty()) return;
+    const std::wstring dir = ImageDir();
+    if (!util::EnsureDir(dir)) {
+        ++shotsWaiting_;
+        image::Saved r;
+        r.error = tr(L"저장 폴더를 만들 수 없습니다: ") + dir;
+        ShotDone(r);
+        return;
+    }
+    const int format = image::Available(settings_.imageFormat) ? settings_.imageFormat : (int)image::kPng;
+    int taken = 0;
+    for (auto& [capture, stem] : from) {
+        image::Picture pic;
+        if (!capture->Shot(pic)) continue;
+        const std::wstring path = ReserveImage(stem, format);
+        imageSaver_.Add(
+            [pic = std::move(pic), format, path] {
+                image::Saved r;
+                r.path = path;
+                r.ok = image::Write(path, format, pic, r.error);
+                return r;
+            },
+            hwnd_, WM_APP_IMAGE_DONE);
+        ++taken;
+    }
+    if (!taken) return;  // pressed before the first frame came in
+    shotsWaiting_ += taken;
+    if (rec_ == RecState::Recording) recShots_ += taken;
+    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+}
+
+// Saved or not, once for the whole press: in the window when it is in front, else a notice over what is captured
+// (below the REC pill), unless nothing is to show over it: a screen held to itself, or 녹화 중 표시 turned down.
+void App::ShotDone(const image::Saved& r) {
+    if (r.ok) {
+        ++shotsSaved_;
+        lastShot_ = r.path;
+    } else {
+        shotError_ = r.error;
+    }
+    if (--shotsWaiting_ > 0) return;
+    const int saved = std::exchange(shotsSaved_, 0);
+    const std::wstring error = std::exchange(shotError_, {});
+    const bool ok = error.empty();
+    const std::wstring title = ok ? tr(L"스크린샷을 저장했습니다") : tr(L"스크린샷을 저장하지 못했습니다");
+    const std::wstring sub = !ok ? error
+                                 : (saved > 1 ? util::Format(tr(L"%d장 · "), saved) : L"") + ImageDirName() + L"\\" +
+                                       util::FileNameOf(lastShot_);
+    if (GetForegroundWindow() == hwnd_ && IsWindowVisible(hwnd_)) {
+        Toast(title + L" · " + sub, !ok);
+        return;
+    }
+    RECT rect{};
+    bool full = false, grabbed = false, exclusive = false;
+    NoticePlace(rect, full, grabbed, exclusive);
+    bool show = !exclusive;
+    float below = 0;
+    if (rec_ == RecState::Recording) {
+        rect = recTarget_.rect;
+        full = recFullscreen_;
+        show = settings_.overlayMode == kOverlayAlways || (settings_.overlayMode == kOverlayExceptFullscreen && !full);
+        below = 62;  // the pill's top, height and a gap
+    }
+    if (show) {
+        ReplayNotice::Content c;
+        c.title = title;
+        c.sub = sub;
+        c.ok = ok;
+        c.glyph = icon::Camera;
+        rpNotice_.Show(rect, full, c, 2000, nullptr, below);
+    } else if (!ok) {
+        TrayBalloon(title, sub);
+    }
 }
 
 ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
@@ -3222,11 +3330,22 @@ void App::RegisterPauseHotkey() {
     SyncKeyHook();
 }
 
+void App::RegisterShotHotkey() {
+    UnregisterHotKey(hwnd_, kHotkeyShot);
+    hookShot_ = false;
+    if ((rec_ == RecState::Recording || rpCap_.Running()) && !capturingHotkey_) {
+        shotHotkeyOk_ = RegisterHotKey(hwnd_, kHotkeyShot, settings_.hkShotMods | MOD_NOREPEAT, settings_.hkShotVk) != FALSE;
+        hookShot_ = !shotHotkeyOk_ && settings_.hkShotHook;
+    }
+    SyncKeyHook();
+}
+
 void App::SyncKeyHook() {
     std::vector<KeyHook::Combo> combos;
     if (hookRecord_) combos.push_back({settings_.hkMods, settings_.hkVk, kHotkeyRecord});
     if (hookPause_) combos.push_back({settings_.hkPauseMods, settings_.hkPauseVk, kHotkeyPause});
     if (hookReplay_) combos.push_back({settings_.rpHkMods, settings_.rpHkVk, kHotkeyReplay});
+    if (hookShot_) combos.push_back({settings_.hkShotMods, settings_.hkShotVk, kHotkeyShot});
     if (combos.empty() && !capturingHotkey_) {
         keyHook_.Stop();
         return;
@@ -3235,6 +3354,7 @@ void App::SyncKeyHook() {
     if (hookRecord_) hotkeyOk_ = ok;
     if (hookPause_) pauseHotkeyOk_ = ok;
     if (hookReplay_) replayHotkeyOk_ = ok;
+    if (hookShot_) shotHotkeyOk_ = ok;
 }
 
 // While a new key is being chosen the current ones are released, so pressing them again reaches the window (and
@@ -3246,12 +3366,14 @@ void App::SetCapturingHotkey(int which) {
     RegisterRecordHotkey();
     RegisterPauseHotkey();
     RegisterReplayHotkey();
+    RegisterShotHotkey();
     Invalidate();
 }
 
 App::HotkeySlot App::Hotkey(int which) {
     if (which == kHotkeyPause) return {settings_.hkPauseMods, settings_.hkPauseVk, settings_.hkPauseHook};
     if (which == kHotkeyReplay) return {settings_.rpHkMods, settings_.rpHkVk, settings_.rpHkHook};
+    if (which == kHotkeyShot) return {settings_.hkShotMods, settings_.hkShotVk, settings_.hkShotHook};
     return {settings_.hkMods, settings_.hkVk, settings_.hkHook};
 }
 
@@ -3259,11 +3381,12 @@ void App::CaptureHotkey(UINT mods, UINT vk) {
     auto [hm, hv, hook] = Hotkey(capturingHotkey_);
     // Two of OzMaker's keys can't be the same combination.
     int clash = 0;
-    for (int other : {kHotkeyRecord, kHotkeyPause, kHotkeyReplay})
+    for (int other : {kHotkeyRecord, kHotkeyPause, kHotkeyReplay, kHotkeyShot})
         if (other != capturingHotkey_ && Hotkey(other).mods == mods && Hotkey(other).vk == vk) clash = other;
     if (KeyHook::Usable(mods, vk) && clash) {
         Toast(clash == kHotkeyRecord  ? tr(L"녹화 단축키와 같습니다. 다른 조합을 눌러 주세요.")
               : clash == kHotkeyPause ? tr(L"일시정지 단축키와 같습니다. 다른 조합을 눌러 주세요.")
+              : clash == kHotkeyShot  ? tr(L"스크린샷 단축키와 같습니다. 다른 조합을 눌러 주세요.")
                                       : tr(L"리플레이 저장 단축키와 같습니다. 다른 조합을 눌러 주세요."),
               true);
     } else if (KeyHook::Usable(mods, vk)) {
@@ -3301,6 +3424,7 @@ void App::TakeHotkey() {
     RegisterRecordHotkey();
     RegisterPauseHotkey();
     RegisterReplayHotkey();
+    RegisterShotHotkey();
     settings_.Save();
     TrayUpdate();
     if ((c.which == kHotkeyRecord && !hotkeyOk_) || (c.which == kHotkeyReplay && settings_.rpOn && !replayHotkeyOk_))
@@ -3318,6 +3442,7 @@ void App::ResetSettings() {
     RegisterRecordHotkey();
     RegisterPauseHotkey();
     SetReplayOn(settings_.rpOn, false);  // off again, with its key
+    RegisterShotHotkey();
     ApplyTheme();
     ApplyLanguage();
     settings_.Save();

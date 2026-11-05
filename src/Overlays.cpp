@@ -563,7 +563,8 @@ int ReplayNotice::ButtonAt(float x, float y) const {
     return 0;
 }
 
-void ReplayNotice::Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton) {
+void ReplayNotice::Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton,
+                        float below) {
     if (!win_.Hwnd()) {
         win_.Create(inst_, factory_, L"OzMakerNotice", WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, Proc, this);
         SetWindowDisplayAffinity(win_.Hwnd(), WDA_EXCLUDEFROMCAPTURE);  // never shows up in recordings
@@ -584,7 +585,8 @@ void ReplayNotice::Show(const RECT& target, bool full, Content c, DWORD ms, std:
     width_ = Width(c_);
     const int w = (int)std::lround(width_ * scale_), h = (int)std::lround(kHeight * scale_);
     // Below a window's title bar; near the top of a full screen game.
-    const int x = (vis.left + vis.right - w) / 2, y = vis.top + (int)std::lround((full ? 24 : 52) * scale_);
+    const int x = (vis.left + vis.right - w) / 2;
+    const int y = vis.top + (int)std::lround(std::max(full ? 24.f : 52.f, below) * scale_);
     rect_ = {x, y, x + w, y + h};
     shown_ = true;
     Redraw();
@@ -621,7 +623,8 @@ void ReplayNotice::Paint(Painter& p) {
     const float cy = kHeight / 2;
     if (c_.ok) {
         p.Circle(16 + 14, cy, 14, WithAlpha(Success, Contrast() ? 1.f : 0.16f));
-        p.Icon(Rect::XYWH(16, cy - 14, 28, 28), 0xE73E /*CheckMark*/, 13.f, Contrast() ? OnFill : Success);
+        p.Icon(Rect::XYWH(16, cy - 14, 28, 28), c_.glyph ? c_.glyph : 0xE73E /*CheckMark*/, 13.f,
+               Contrast() ? OnFill : Success);
     } else {
         p.Circle(16 + 14, cy, 14, WithAlpha(Warning, Contrast() ? 1.f : 0.16f));
         p.Icon(Rect::XYWH(16, cy - 14, 28, 28), 0xE7BA /*Warning*/, 13.f, Contrast() ? OnFill : Warning);

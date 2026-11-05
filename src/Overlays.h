@@ -99,11 +99,13 @@ public:
         std::wstring title, sub;
         bool ok = true;        // a check; else a warning sign
         bool buttons = false;  // 편집 · 폴더
+        wchar_t glyph = 0;     // instead of the check
     };
     enum : int { kEdit = 1, kFolder = 2 };
     void Init(HINSTANCE inst, ID2D1Factory1* factory);
     // target: what was held, screen pixels; full: it fills its monitor. onButton gets kEdit or kFolder.
-    void Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton);
+    // below: DIPs from the top of the target to stay clear of (the REC pill).
+    void Show(const RECT& target, bool full, Content c, DWORD ms, std::function<void(int)> onButton, float below = 0);
     void Hide();
     bool Visible() const { return shown_; }
     // Screenshot tests: the notice drawn at the origin without a window; hover: the button under the pointer.

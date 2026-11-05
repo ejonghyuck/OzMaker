@@ -72,7 +72,7 @@ private:
         kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad, kTimerReplay
     };
     enum class RecState { Idle, Countdown, Recording };
-    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2, kHotkeyReplay = 3 };  // RegisterHotKey ids
+    enum : int { kHotkeyRecord = 1, kHotkeyPause = 2, kHotkeyReplay = 3, kHotkeyShot = 4 };  // RegisterHotKey ids
 
     // ---- window plumbing (App.cpp)
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -123,6 +123,7 @@ private:
     void DrawPreviewGrid(Rect view);
     void DrawMonitorLayout(Rect r, const RECT* region, bool pickable);
     void DrawVideoResult(Rect r);
+    void DrawShotCard(Rect video, float a);
     void DrawVideoResults(Rect preview);  // the card for several windows' files
     void DrawEditor(Rect r);
     void DrawEditHome(Rect r);  // the 편집 tab with no file open: where to drop one, what to open
@@ -308,9 +309,12 @@ private:
     void OnExportDone();
     std::wstring ImageDirName() const;  // 스크린샷: the folder of frame images and screenshots
     std::wstring ImageDir() const;      // 저장 폴더 › 스크린샷
-    std::wstring FrameImageName(int format) const;
+    std::wstring ReserveImage(const std::wstring& stem, int format) const;
+    std::wstring FrameImageStem() const;
     void SaveFrameImage();              // the frame in the editor, as it shows (#62)
     void OnImageDone();
+    void TakeScreenshot();              // the moment, while recording or holding a replay (#63)
+    void ShotDone(const image::Saved& r);
     void StartThumbnails();
     void StopThumbnails();
     void ResetCrop();
@@ -398,7 +402,8 @@ private:
     // ---- system
     void RegisterRecordHotkey();
     void RegisterPauseHotkey();  // only while recording, so the keys stay free for other programs otherwise
-    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay, 0 = none
+    void RegisterShotHotkey();  // only while something is being captured, like the pause key
+    void SetCapturingHotkey(int which);  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay / kHotkeyShot, 0 = none
     void CaptureHotkey(UINT mods, UINT vk);  // a combination pressed while choosing one
     struct HotkeySlot {  // a hotkey's settings
         UINT& mods;
@@ -687,6 +692,11 @@ private:
     image::Saver imageSaver_;
     image::Saved lastImage_;  // the frame image just saved: its card in the export panel
     bool hasImage_ = false;
+    int shotsWaiting_ = 0, shotsSaved_ = 0;  // of the presses being written: told about once they all are
+    std::wstring shotError_;
+    int recShots_ = 0;        // taken during the recording that is going on
+    int lastShots_ = 0;       // during the last one: its result says so
+    std::wstring lastShot_;   // the newest screenshot
     ExportResult lastResult_;
     bool hasResult_ = false;
     bool resultOriginal_ = false;  // the card shows the recording itself, not an export
@@ -702,11 +712,12 @@ private:
     bool hotkeyOk_ = true, pauseHotkeyOk_ = true;  // it works: registered, or (taken over) through the hook
     // A combination another program holds, pressed while choosing: the panel under the row offers to take it (#50).
     struct HotkeyConflict {
-        int which = 0;  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay, 0 = none
+        int which = 0;  // kHotkeyRecord / kHotkeyPause / kHotkeyReplay / kHotkeyShot, 0 = none
         UINT mods = 0, vk = 0;
     } hkConflict_;
     KeyHook keyHook_;
     bool hookRecord_ = false, hookPause_ = false;  // taken over and refused by RegisterHotKey: the hook has them
+    bool shotHotkeyOk_ = true, hookShot_ = false;
     ComPtr<ITaskbarList3> taskbar_;
     std::vector<HWINEVENTHOOK> winHooks_;
     bool windowsDirty_ = false;  // a window event came in; kTimerRefresh refreshes the list once for the burst

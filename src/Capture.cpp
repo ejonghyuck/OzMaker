@@ -109,7 +109,8 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
                                    levels, _countof(levels), D3D11_SDK_VERSION, &dev_, nullptr, &ctx_);
         winrt::check_hresult(hr);
         ctx_.As(&ctx1_);
-        if ((video || opt.clickFx) && SUCCEEDED(ctx_.As(&mt_))) mt_->SetMultithreadProtected(TRUE);
+        // The encoder and the click highlights share the device, and a screenshot reads it from the window's thread.
+        if (SUCCEEDED(ctx_.As(&mt_))) mt_->SetMultithreadProtected(TRUE);
         ComPtr<IDXGIDevice> dxgi;
         winrt::check_hresult(dev_.As(&dxgi));
         winrt::com_ptr<::IInspectable> insp;
@@ -933,11 +934,12 @@ void Capture::OnFrame(wgc::Direct3D11CaptureFramePool const& pool) {
     int64_t ts = 0;
     bool accept = false, base = false;
     Admit(qpc, ts, accept, base);
-    if (accept || base) {
+    if (accept || base || pausedAt_) {
         try {
             auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             ComPtr<ID3D11Texture2D> tex;
-            if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex)))) Take(tex.Get(), cs.Width, cs.Height, ts, qpc, accept);
+            if (SUCCEEDED(access->GetInterface(IID_PPV_ARGS(&tex))))
+                Take(tex.Get(), cs.Width, cs.Height, ts, qpc, accept, accept || base);
         } catch (...) {
         }
     }
@@ -969,13 +971,15 @@ void Capture::Admit(int64_t qpc, int64_t& ts, bool& accept, bool& base) {
     base = !accept && !opt_.video && opt_.clickFx && !pausedAt_ && firstTs_ >= 0 && ClicksShow(qpc);
 }
 
-void Capture::Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept) {
+void Capture::Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept, bool record) {
     RECT sr;
     if (!SourceRect(cw, ch, sr)) return;
     if (opt_.monitorMode)
         CoveredRects(sr, covered_);
     else
         covered_.clear();
+    KeepShot(tex, sr, covered_);
+    if (!record) return;  // paused: only for a screenshot
     if (opt_.clickFx) texOrigin_ = TextureOrigin(cw, ch);
     int64_t rel = ts - firstTs_;
     if (rel > 0 && rel <= lastTs_) rel = lastTs_ + 1;  // after a click highlight frame of ours
@@ -983,6 +987,67 @@ void Capture::Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc
     if (accept) {
         lastTs_ = rel;
         lastArrivalQpc_ = util::Qpc100ns() - pausedTotal_;  // on the recording's clock, like ts
+    }
+}
+
+// Before anything is drawn on it or scaled: the cursor is there as recorded, the click highlights are not.
+void Capture::KeepShot(ID3D11Texture2D* tex, const RECT& sr, const std::vector<RECT>& covered) {
+    const UINT w = (UINT)(sr.right - sr.left), h = (UINT)(sr.bottom - sr.top);
+    DeviceLock lock(mt_.Get());
+    D3D11_TEXTURE2D_DESC td{};
+    if (shot_) shot_->GetDesc(&td);
+    if (!shot_ || td.Width != w || td.Height != h) {
+        shot_.Reset();
+        tex->GetDesc(&td);
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        if (FAILED(dev_->CreateTexture2D(&td, nullptr, &shot_))) return;
+    }
+    const D3D11_BOX box{(UINT)sr.left, (UINT)sr.top, 0, (UINT)sr.right, (UINT)sr.bottom, 1};
+    ctx_->CopySubresourceRegion(shot_.Get(), 0, 0, 0, 0, tex, 0, &box);
+    shotMask_ = covered;
+}
+
+bool Capture::Shot(image::Picture& pic) {
+    if (!running_) return false;
+    DeviceLock lock(mt_.Get());
+    if (!shot_) return false;
+    D3D11_TEXTURE2D_DESC td{}, rd{};
+    shot_->GetDesc(&td);
+    if (shotRead_) shotRead_->GetDesc(&rd);
+    if (!shotRead_ || rd.Width != td.Width || rd.Height != td.Height) {
+        shotRead_.Reset();
+        rd = td;
+        rd.Usage = D3D11_USAGE_STAGING;
+        rd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(dev_->CreateTexture2D(&rd, nullptr, &shotRead_))) return false;
+    }
+    ctx_->CopyResource(shotRead_.Get(), shot_.Get());
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx_->Map(shotRead_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    pic.w = (int)td.Width;
+    pic.h = (int)td.Height;
+    pic.alpha = false;
+    pic.px.resize((size_t)pic.w * pic.h * 4);
+    for (int y = 0; y < pic.h; ++y)
+        memcpy(&pic.px[(size_t)y * pic.w * 4], (const uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)pic.w * 4);
+    ctx_->Unmap(shotRead_.Get(), 0);
+    BlackOut(pic, shotMask_);
+    return true;
+}
+
+void Capture::BlackOut(image::Picture& pic, const std::vector<RECT>& rects) {
+    for (const RECT& r : rects) {
+        const int l = std::clamp((int)r.left, 0, pic.w), right = std::clamp((int)r.right, l, pic.w);
+        const int t = std::clamp((int)r.top, 0, pic.h), b = std::clamp((int)r.bottom, t, pic.h);
+        for (int y = t; y < b; ++y) memset(&pic.px[((size_t)y * pic.w + l) * 4], 0, (size_t)(right - l) * 4);
     }
 }
 
@@ -1083,8 +1148,7 @@ void Capture::DupLoop() {
             continue;
         } else {
             ComPtr<ID3D11Texture2D> tex;
-            if ((fi.LastPresentTime.QuadPart != 0 || !haveDesk_) && running_ && !pausedAt_ &&
-                SUCCEEDED(res.As(&tex))) {
+            if ((fi.LastPresentTime.QuadPart != 0 || !haveDesk_) && running_ && SUCCEEDED(res.As(&tex))) {
                 D3D11_TEXTURE2D_DESC td{};
                 tex->GetDesc(&td);
                 if ((int)td.Width == deskW_ && (int)td.Height == deskH_ && td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
@@ -1103,7 +1167,12 @@ void Capture::DupLoop() {
 bool Capture::PushDesktop(int64_t& retryIn) {
     std::lock_guard lk(mtx_);
     retryIn = -1;
-    if (!running_ || pausedAt_) return true;  // nothing while paused: the next change after it comes through
+    if (!running_) return true;
+    if (pausedAt_) {  // nothing while paused but what a screenshot sees: the next change after it comes through
+        DeviceLock lock(mt_.Get());
+        Take(WithCursor(), deskW_, deskH_, 0, 0, false, false);
+        return true;
+    }
     const int64_t qpc = util::Qpc100ns();
     int64_t ts = 0;
     bool accept = false, base = false;
@@ -1314,6 +1383,8 @@ void Capture::ReleaseGpu() {
     sampler_.Reset();
     ps_.Reset();
     vs_.Reset();
+    shot_.Reset();
+    shotRead_.Reset();
     if (ctx_) ctx_->ClearState();
     mt_.Reset();
     ctx1_.Reset();

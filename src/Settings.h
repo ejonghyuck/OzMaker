@@ -116,6 +116,9 @@ struct Settings {
     UINT hkPauseVk = 'P';
     // Taken over from another program by the user (#50): when RegisterHotKey refuses the key, a keyboard hook gets it.
     bool hkHook = false, hkPauseHook = false;
+    UINT hkShotMods = MOD_CONTROL | MOD_ALT;  // 스크린샷 (#63), registered only while something is being captured
+    UINT hkShotVk = VK_F9;
+    bool hkShotHook = false;
     int startHide = kHideToTray;  // where the window goes when a recording starts from it
     int deleteMode = kDeleteToBin;  // what 삭제 does to a video or a saved replay
     int imageFormat = 0;            // image::Format: frame images and screenshots

@@ -4,8 +4,8 @@
 // app.manifest and vcpkg.json repeat it (tools\package.ps1 warns when they differ).
 #define OZ_VERSION_MAJOR 0
 #define OZ_VERSION_MINOR 7
-#define OZ_VERSION_PATCH 3
-#define OZ_VERSION_STR "0.7.3"
+#define OZ_VERSION_PATCH 4
+#define OZ_VERSION_STR "0.7.4"
 #define OZ_VERSION_WSTR L"" OZ_VERSION_STR
 #ifndef RC_INVOKED
 inline constexpr const wchar_t* kRepoUrl = L"https://github.com/ejonghyuck/OzMaker";

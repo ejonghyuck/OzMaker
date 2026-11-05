@@ -1,6 +1,7 @@
 #pragma once
 #include "AudioCapture.h"
 #include "FrameStore.h"
+#include "ImageFile.h"
 #include "Mp4Writer.h"
 
 enum class CaptureSource { Window, Monitor, Region };
@@ -80,6 +81,11 @@ public:
     // Tests: a click as if the left button went down at `at` (screen pixels) now and up `hold` (100 ns) later.
     void InjectClick(POINT at, int64_t hold);
     size_t ClickFrames() const { return clickFrames_; }  // clip frames added for highlights (tests)
+    // Screenshot (#63): the newest picture of the source at its own size, whatever size is recorded, also while paused
+    // and when the screen hasn't changed for a while. False before the first one. The window's thread.
+    bool Shot(image::Picture& pic);
+    // What covers a window in monitorMode stays black in a screenshot too. rects: pixels of the picture.
+    static void BlackOut(image::Picture& pic, const std::vector<RECT>& rects);
     int OutWidth() const { return outW_; }
     int OutHeight() const { return outH_; }
     bool Duplicating() const { return dupThread_.joinable(); }  // the monitor comes through desktop duplication
@@ -91,7 +97,8 @@ private:
     // Under mtx_: whether a picture captured at qpc is taken (accept), or only kept under a click highlight (base);
     // ts is its time on the recording's clock. Take hands a picture of the source (cw × ch) on to Process.
     void Admit(int64_t qpc, int64_t& ts, bool& accept, bool& base);
-    void Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept);
+    void Take(ID3D11Texture2D* tex, int cw, int ch, int64_t ts, int64_t qpc, bool accept, bool record = true);
+    void KeepShot(ID3D11Texture2D* tex, const RECT& sr, const std::vector<RECT>& covered);
 
     // Desktop duplication (#20): Windows 10 draws a yellow border around what Windows.Graphics.Capture takes, and
     // has no way to turn it off (nor has Windows 11 when the request wasn't allowed). Duplication has none. dupThread_ copies the screen into desk_ whenever it changes
@@ -184,6 +191,8 @@ private:
     int mipW_ = 0, mipH_ = 0, mipLevels_ = 0;
     ComPtr<ID3D11Texture2D> out_;
     ComPtr<ID3D11RenderTargetView> outRtv_;
+    ComPtr<ID3D11Texture2D> shot_, shotRead_;  // under the device lock, with shotMask_: what a screenshot takes
+    std::vector<RECT> shotMask_;
     static constexpr int kRing = 3;
     ComPtr<ID3D11Texture2D> staging_[kRing];
     int ring_ = 0;

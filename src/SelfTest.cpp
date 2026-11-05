@@ -2632,9 +2632,10 @@ int App::RunSelfTest(const std::wstring& dir) {
               L"최대 녹화 길이 1시간: the 1시간 timer that stops; H.264 becomes 자동");
         check(fresh.TimerMinutes() == 0 && !fresh.timerStop && fresh.vCodec == kCodecAuto &&
                   fresh.startHide == kHideToTray && !fresh.hkHook && !fresh.hkPauseHook &&
-                  fresh.deleteMode == kDeleteToBin && fresh.imageFormat == image::kPng,
+                  fresh.deleteMode == kDeleteToBin && fresh.imageFormat == image::kPng &&
+                  fresh.hkShotVk == VK_F9 && fresh.hkShotMods == (MOD_CONTROL | MOD_ALT) && !fresh.hkShotHook,
               L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over, 삭제 to the bin, "
-              L"images as PNG");
+              L"images as PNG, screenshots on Ctrl + Alt + F9");
         check(load(L"image_webp.ini", "[OzMaker]\r\nImageFormat=2\r\n").imageFormat == image::kWebp &&
                   load(L"image_odd.ini", "[OzMaker]\r\nImageFormat=7\r\n").imageFormat == image::kPng,
               L"이미지 형식: WebP is read back; a value it doesn't know is PNG");
@@ -3254,6 +3255,18 @@ int App::RunSelfTest(const std::wstring& dir) {
         check(clip && image::TakeFrame(AlphaClip(clip), 0, all, L"", 0, see2, err) && see2.alpha,
               L"image: a see-through clip stays see-through");
 
+        // A screenshot leaves black what covers the window, as the recording does (#63); rects can reach past the edge.
+        image::Picture covered;
+        covered.w = 40;
+        covered.h = 30;
+        covered.px.assign((size_t)40 * 30 * 4, 200);
+        Capture::BlackOut(covered, {RECT{10, 5, 20, 15}, RECT{35, 25, 90, 90}, RECT{-5, -5, 2, 2}});
+        auto dark = [&](int x, int y) { return covered.px[((size_t)y * 40 + x) * 4] == 0; };
+        check(dark(10, 5) && dark(19, 14) && dark(39, 29) && dark(0, 0) && !dark(20, 5) && !dark(10, 15) && !dark(34, 25),
+              L"shot: what covers the window is black, and nothing else");
+        image::Picture none;
+        check(!Capture().Shot(none), L"shot: nothing to take without a capture");
+
         std::atomic<int> ran{0};
         std::wstring order;
         {
@@ -3437,6 +3450,10 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     lastVideo_.hardware = true;
     showVideo_ = true;
     shot(L"home_video_saved.png", 96);
+    lastShots_ = 3;  // 스크린샷 (#63): their own card over it
+    lastShot_ = ImageDir() + L"\\OzMaker_20261102_142311.png";
+    shot(L"home_video_shots.png", 96);
+    lastShots_ = 0;
     showVideo_ = false;
     // 여러 창 녹화 (#48): the switch on with nothing checked; two windows side by side; four checked (the fifth row
     // dimmed) in a 2 × 2 grid; the card for three files, one closed early and one encoded on the CPU.
@@ -3485,6 +3502,9 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         lastVideo_ = lastVideos_[0].r;
         showVideo_ = true;
         shot(L"home_multi_saved.png", 96);
+        lastShots_ = 6;
+        shot(L"home_multi_shots.png", 96);
+        lastShots_ = 0;
         showVideo_ = false;
         lastVideos_.clear();
         settings_.multiWindow = false;
@@ -3556,8 +3576,11 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             quiet.buttons = false;
             ReplayNotice::Content failed{tr(L"리플레이를 저장하지 못했습니다"),
                                          tr(L"파일을 저장하지 못했습니다. 디스크 공간을 확인하세요."), false, false};
-            const float nw = std::max({ReplayNotice::Width(saved), ReplayNotice::Width(quiet), ReplayNotice::Width(failed)}) + 12;
-            const float nh = ReplayNotice::kHeight * 3 + 24;
+            ReplayNotice::Content taken{tr(L"스크린샷을 저장했습니다"), ImageDirName() + L"\\OzMaker_20261105_142311.png"};
+            taken.glyph = theme::icon::Camera;
+            const float nw = std::max({ReplayNotice::Width(saved), ReplayNotice::Width(quiet), ReplayNotice::Width(failed),
+                                       ReplayNotice::Width(taken)}) + 12;
+            const float nh = ReplayNotice::kHeight * 4 + 30;
             gfx_.RenderToPng((dir + L"\\replay_notice.png").c_str(), (UINT)(nw * 1.5f), (UINT)(nh * 1.5f), 144,
                              [&](ID2D1DeviceContext* dc) {
                                  Painter p;
@@ -3569,6 +3592,8 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
                                  rpNotice_.PaintTest(p, quiet, 0);
                                  dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 18 + ReplayNotice::kHeight * 2));
                                  rpNotice_.PaintTest(p, failed, 0);
+                                 dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 24 + ReplayNotice::kHeight * 3));
+                                 rpNotice_.PaintTest(p, taken, 0);
                                  dc->SetTransform(D2D1::Matrix3x2F::Identity());
                              });
         }
@@ -6249,7 +6274,25 @@ int App::RunReplayTest(const std::wstring& dir) {
         DWORD affinity = WDA_MONITOR;
         check(GetWindowDisplayAffinity(hwnd_, &affinity) && affinity == WDA_NONE,
               L"replay app: the app window isn't excluded from capture while holding");
-        pump(3.5, nullptr);
+        pump(1.0, nullptr);
+        // 스크린샷 (#63): what is held, without stopping it.
+        check(shotHotkeyOk_, L"shot: the key is registered while the replay holds a program");
+        lastShot_.clear();
+        PostMessageW(hwnd_, WM_HOTKEY, kHotkeyShot, 0);
+        pump(5, [&] { return !lastShot_.empty() && !shotsWaiting_; });
+        {
+            std::vector<uint8_t> px;
+            int iw = 0, ih = 0;
+            RECT cr{};
+            GetClientRect(rpHeld_.hwnd, &cr);
+            const bool read = ReadImageFile(lastShot_, px, iw, ih);
+            const std::vector<uint8_t> black(px.size(), 0);
+            check(read && iw == cr.right && ih == cr.bottom && WorstColour(px, black) > 30 && rpCap_.Running() &&
+                      lastShot_.rfind(ImageDir() + L"\\", 0) == 0,
+                  util::Format(L"shot: the hotkey saves what the replay holds, %dx%d, and it goes on (%s)", iw, ih,
+                               util::FileNameOf(lastShot_).c_str()));
+        }
+        pump(2.5, nullptr);
         ReplaySave();
         pump(8, [&] { return !rpSaving_; });
         const std::wstring first = rpSave_.path;
@@ -6681,6 +6724,7 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         const int64_t ms = clip_->Ts(37) / 10'000;
         stem = ImageDir() + L"\\" + stem +
                util::Format(L"_%dm%02ds%03d", (int)(ms / 60'000), (int)(ms / 1000 % 60), (int)(ms % 1000));
+        for (const wchar_t* end : {L".png", L"_2.png", L"_3.png", L".jpg"}) DeleteFileW((stem + end).c_str());  // a run before
         settings_.imageFormat = image::kPng;
         std::vector<uint8_t> px;
         int iw = 0, ih = 0;
@@ -6863,6 +6907,7 @@ int App::RunMultiTest(const std::wstring& dir) {
     settings_.source = kSourceWindow;
     settings_.multiWindow = true;
     settings_.nameTemplate = kNameTemplates[0];
+    settings_.sizeIdx = (int)std::size(kSizeOptions) - 1;  // recorded small: a screenshot isn't
     if (!CreateMainWindow(SW_HIDE)) return 1;
     auto pump = [&](double seconds, const std::function<bool()>& until) {
         const double end = util::NowSeconds() + seconds;
@@ -6914,6 +6959,7 @@ int App::RunMultiTest(const std::wstring& dir) {
         cleanup();
         return 1;
     }
+    for (HWND w : wins) SetWindowPos(w, nullptr, 0, 0, 800, 500, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     TogglePick(wins[0]);
     TogglePick(wins[1]);
     check(MultiPicking() && picks_.size() == 2 && target_ == wins[0], L"multi: both checked, the first one picked");
@@ -6924,8 +6970,45 @@ int App::RunMultiTest(const std::wstring& dir) {
     StartRecording(PickedTargets(), true);
     check(rec_ == RecState::Recording && recs_.size() == 2 && !recScreen_,
           L"multi clip: two windows recording, each through its window");
-    pump(2.0, nullptr);
+    pump(1.0, nullptr);
+    // 스크린샷 (#63): one for each window, the same name getting a number, at the size of the window and not of the
+    // recording; also while paused.
+    auto images = [&] {
+        size_t n = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((ImageDir() + L"\\*.png").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return n;
+        do {
+            ++n;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        return n;
+    };
+    auto press = [&] {
+        PostMessageW(hwnd_, WM_HOTKEY, kHotkeyShot, 0);
+        pump(0.1, nullptr);
+        pump(5, [&] { return !shotsWaiting_; });
+    };
+    const size_t before = images();  // a run before may have left some
+    press();
+    {
+        std::vector<uint8_t> px;
+        int iw = 0, ih = 0;
+        const bool read = ReadImageFile(lastShot_, px, iw, ih);
+        const int out = recs_[0].capture->OutWidth();
+        check(images() == before + 2 && recShots_ == 2 && read && iw > out && rpNotice_.Visible(),
+              util::Format(L"shot: one for each window, %d wide from a recording %d wide, with the notice", iw, out));
+        press();
+        check(images() == before + 4, L"shot: pressed again right away, nothing is overwritten");
+    }
+    TogglePause();
+    pump(0.4, nullptr);
+    press();
+    check(images() == before + 6 && recShots_ == 6, L"shot: it also takes while paused");
+    TogglePause();
+    pump(0.6, nullptr);
     StopRecording();
+    check(recShots_ == 0 && lastShots_ == 0, L"shot: a clip has no card: the message says how many");
     const bool two = held_.size() == heldBefore + 2;
     const size_t f0 = two ? held_[0].clip->Count() : 0, f1 = two ? held_[1].clip->Count() : 0;
     check(two && f0 > 10 && f1 > 10 && clip_ && clip_ == held_[0].clip && screen_ == Screen::Editor,
@@ -6938,12 +7021,20 @@ int App::RunMultiTest(const std::wstring& dir) {
     settings_.output = kOutputVideo;
     StartRecording(PickedTargets(), true);
     check(rec_ == RecState::Recording && recs_.size() == 2, L"multi mp4: two windows recording");
+    pump(1.0, nullptr);
+    press();
     pump(15, [&] { return rec_ != RecState::Recording || recs_[0].ended; });
     const bool ended = rec_ == RecState::Recording && recs_.size() == 2 && recs_[0].ended && !recs_[1].ended &&
                        RecLead() == &recs_[1] && recTarget_.hwnd == wins[1];
     check(ended, L"multi mp4: the first window closed: only its file ended, the pill went on to the other");
+    press();
+    check(recShots_ == 3, L"shot: only the window still recorded gives one");
     pump(2.5, nullptr);
     StopRecording();
+    check(lastShots_ == 3, L"shot: the video's result counts them");
+    const bool freed = RegisterHotKey(hwnd_, 99, settings_.hkShotMods, settings_.hkShotVk) != FALSE;
+    if (freed) UnregisterHotKey(hwnd_, 99);
+    check(freed, L"shot: the key is free for other programs once nothing is captured");
     check(lastVideos_.size() == 2 && showVideo_ && lastVideos_[0].early && !lastVideos_[1].early,
           util::Format(L"multi mp4: the card lists %zu files, the first one closed early", lastVideos_.size()));
     if (lastVideos_.size() == 2) {
