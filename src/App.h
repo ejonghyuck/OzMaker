@@ -4,6 +4,7 @@
 #include "Capture.h"
 #include "Exporter.h"
 #include "Gfx.h"
+#include "ImageFile.h"
 #include "KeyHook.h"
 #include "Overlays.h"
 #include "Replay.h"
@@ -60,6 +61,7 @@ private:
         WM_APP_UPDATE,
         WM_APP_ANSWER,  // a question was answered yes: what it asked for runs outside the frame that drew the button
         WM_APP_HOOKED_KEY,  // the keyboard hook took a combination while a hotkey is being chosen (#50)
+        WM_APP_IMAGE_DONE,  // a frame image or a screenshot was written
         WM_APP_ANIM_LOADED,  // a 움짤 file finished decoding (#41)
         WM_APP_REPLAY_CLOSED,  // 순간 리플레이's capture: what it held went away (wParam 0) or its encoder failed (1)
         WM_APP_REPLAY_SAVED,   // the replay being saved is written (or not)
@@ -304,6 +306,11 @@ private:
     static std::wstring FillName(std::wstring_view pattern, const std::wstring& what, const SYSTEMTIME& t, int number);
     void StartExport(bool saveAs);
     void OnExportDone();
+    std::wstring ImageDirName() const;  // 스크린샷: the folder of frame images and screenshots
+    std::wstring ImageDir() const;      // 저장 폴더 › 스크린샷
+    std::wstring FrameImageName(int format) const;
+    void SaveFrameImage();              // the frame in the editor, as it shows (#62)
+    void OnImageDone();
     void StartThumbnails();
     void StopThumbnails();
     void ResetCrop();
@@ -677,6 +684,9 @@ private:
     Rect updateBtn_;
 
     Exporter exporter_;
+    image::Saver imageSaver_;
+    image::Saved lastImage_;  // the frame image just saved: its card in the export panel
+    bool hasImage_ = false;
     ExportResult lastResult_;
     bool hasResult_ = false;
     bool resultOriginal_ = false;  // the card shows the recording itself, not an export

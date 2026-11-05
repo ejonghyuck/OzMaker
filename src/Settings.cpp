@@ -152,6 +152,7 @@ void Settings::Load() {
     startHide = ReadInt(ini, L"StartHide", startHide, 0, 1);
     // Only a plain 1 skips the Recycle Bin: a value this version doesn't know must not mean deleting for good.
     deleteMode = ReadInt(ini, L"DeleteMode", deleteMode, 0, 2) == kDeleteNow ? kDeleteNow : kDeleteToBin;
+    imageFormat = ReadInt(ini, L"ImageFormat", imageFormat, 0, 3) % 3;  // one it doesn't know is PNG
     // The timer took the place of 최대 녹화 길이 (끔, 10분, 30분, 1시간) in 0.6.5: a length set there still stops.
     if ((int)GetPrivateProfileIntW(L"OzMaker", L"Timer", (UINT)-1, ini.c_str()) < 0) {
         const int old = ReadInt(ini, L"MaxLength", 0, 0, 3);
@@ -306,6 +307,7 @@ void Settings::Save() const {
     }
     num(L"StartHide", startHide);
     num(L"DeleteMode", deleteMode);
+    num(L"ImageFormat", imageFormat);
     num(L"Timer", timerIdx);
     num(L"TimerMinutes", timerMinutes);
     num(L"TimerStop", timerStop);

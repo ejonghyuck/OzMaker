@@ -90,8 +90,30 @@ private:
 
 std::unique_ptr<IEncoder> CreateWebpEncoder() { return std::make_unique<WebpEncoder>(); }
 
+bool WriteWebpImage(const std::wstring& path, const uint8_t* bgra, int w, int h, bool alpha, int quality) {
+    WebPConfig cfg;
+    WebPPicture pic;
+    if (!WebPConfigPreset(&cfg, WEBP_PRESET_DEFAULT, (float)quality) || !WebPPictureInit(&pic)) return false;
+    cfg.method = 4;
+    cfg.use_sharp_yuv = 1;  // as above
+    pic.width = w;
+    pic.height = h;
+    pic.use_argb = 1;
+    WebPMemoryWriter out;
+    WebPMemoryWriterInit(&out);
+    pic.writer = WebPMemoryWrite;
+    pic.custom_ptr = &out;
+    bool ok = (alpha ? WebPPictureImportBGRA(&pic, bgra, w * 4) : WebPPictureImportBGRX(&pic, bgra, w * 4)) &&
+              WebPEncode(&cfg, &pic) && WriteWholeFile(path, out.mem, out.size);
+    WebPPictureFree(&pic);
+    WebPMemoryWriterClear(&out);
+    return ok;
+}
+
 #else
 
 std::unique_ptr<IEncoder> CreateWebpEncoder() { return nullptr; }
+
+bool WriteWebpImage(const std::wstring&, const uint8_t*, int, int, bool, int) { return false; }
 
 #endif

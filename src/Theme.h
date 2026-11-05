@@ -117,6 +117,7 @@ inline constexpr wchar_t Folder = 0xE8B7;
 inline constexpr wchar_t Copy = 0xE8C8;
 inline constexpr wchar_t Save = 0xE74E;
 inline constexpr wchar_t Crop = 0xE7A8;
+inline constexpr wchar_t Camera = 0xE722;
 inline constexpr wchar_t Check = 0xE73E;
 inline constexpr wchar_t Warning = 0xE7BA;
 inline constexpr wchar_t Info = 0xE946;

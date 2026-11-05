@@ -912,6 +912,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     StopRecording();
             }
             return 0;
+        case WM_APP_IMAGE_DONE:
+            OnImageDone();
+            return 0;
         case WM_APP_EXPORT_DONE:
             OnExportDone();
             return 0;
@@ -2098,7 +2101,7 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     cropAspect_ = 0;
     cropDrag_ = -1;
     ResetCrop();
-    hasResult_ = resultOriginal_ = false;
+    hasResult_ = resultOriginal_ = hasImage_ = false;
     estKey_.clear();
     fitContent_.clear();
     estValid_ = fitting_ = fitMissed_ = false;
@@ -2388,7 +2391,7 @@ void App::CloseClip() {
     clip_.reset();
     cutSource_.reset();
     frameBmp_.Reset();
-    hasResult_ = resultOriginal_ = false;
+    hasResult_ = resultOriginal_ = hasImage_ = false;
     settings_.UseRecordingKnobs();
     RefreshRecent();
     Invalidate();
@@ -2472,7 +2475,7 @@ void App::DiscardRecording() {
     DropHeld(clip_.get());
     clip_.reset();
     frameBmp_.Reset();
-    hasResult_ = resultOriginal_ = false;
+    hasResult_ = resultOriginal_ = hasImage_ = false;
     RefreshRecent();
     if (path.empty())
         Toast(tr(L"녹화를 버렸습니다."));
@@ -2858,7 +2861,7 @@ void App::StartExport(bool saveAs) {
     job.path = path;
     if (const wchar_t* why = CopyBlocker(); why && !*why) job.cut = cutSource_;
     settings_.Save();
-    hasResult_ = resultOriginal_ = false;
+    hasResult_ = resultOriginal_ = hasImage_ = false;
     exportEstimate_ = estValid_ && estKey_ == EstimateKey() ? estBytes_ : 0;
     exportStarted_ = util::NowSeconds();
     exporter_.Start(std::move(job), hwnd_, WM_APP_EXPORT_DONE);
@@ -2886,6 +2889,65 @@ void App::OnExportDone() {
             Toast(util::Format(tr(L"목표 %dMB보다 커졌습니다(%s). 더 작게 다시 맞췄으니 한 번 더 저장하세요."),
                                kTargetMB[settings_.targetIdx], util::FormatBytes(r.bytes).c_str()),
                   true);
+        }
+    }
+    Invalidate();
+}
+
+std::wstring App::ImageDirName() const { return Language() == Lang::English ? L"Screenshots" : L"스크린샷"; }
+
+std::wstring App::ImageDir() const { return settings_.outDir + L"\\" + ImageDirName(); }
+
+// The clip's name and where the frame sits in it, so that a bug report can point at the moment in the video.
+std::wstring App::FrameImageName(int format) const {
+    std::wstring stem = FileStem(clipName_);
+    if (const std::wstring src = clip_->SourcePath(); !src.empty()) {
+        stem = util::FileNameOf(src);
+        if (const size_t dot = stem.rfind(L'.'); dot != std::wstring::npos) stem.resize(dot);
+    }
+    const int64_t ms = clip_->Ts(playhead_) / 10'000;
+    stem += util::Format(L"_%dm%02ds%03d", (int)(ms / 60'000), (int)(ms / 1000 % 60), (int)(ms % 1000));
+    const std::wstring ext = image::Ext(format), dir = ImageDir() + L"\\";
+    std::wstring name = stem + L"." + ext;
+    for (int i = 2; GetFileAttributesW((dir + name).c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
+        name = stem + util::Format(L"_%d.", i) + ext;
+    return name;
+}
+
+void App::SaveFrameImage() {
+    if (!clip_ || imageSaver_.Busy()) return;
+    const std::wstring dir = ImageDir();
+    if (!util::EnsureDir(dir)) {
+        Toast(tr(L"저장 폴더를 만들 수 없습니다: ") + dir, true);
+        return;
+    }
+    const int format = image::Available(settings_.imageFormat) ? settings_.imageFormat : (int)image::kPng;
+    const std::wstring path = dir + L"\\" + FrameImageName(format);
+    imageSaver_.Add(
+        [clip = clip_, index = playhead_, crop = crop_, text = caption_, pos = captionPos_, format, path] {
+            image::Saved r;
+            r.path = path;
+            r.clip = clip.get();
+            r.ok = image::TakeFrame(*clip, index, crop, text, pos, r.pic, r.error) &&
+                   image::Write(path, format, r.pic, r.error);
+            return r;
+        },
+        hwnd_, WM_APP_IMAGE_DONE);
+    Invalidate();
+}
+
+void App::OnImageDone() {
+    image::Saved r;
+    while (imageSaver_.Take(r)) {
+        if (!r.ok) {
+            Toast(r.error, true);
+            continue;
+        }
+        if (settings_.sounds) sound::Play(sound::Cue::Saved);
+        if (r.clip && r.clip == clip_.get()) {
+            lastImage_ = std::move(r);
+            hasImage_ = true;
+            hasResult_ = resultOriginal_ = false;  // one card at a time: the panel has little room
         }
     }
     Invalidate();

@@ -112,6 +112,7 @@
     <ClCompile Include="src\Capture.cpp" />
     <ClCompile Include="src\Caption.cpp" />
     <ClCompile Include="src\Exporter.cpp" />
+    <ClCompile Include="src\ImageFile.cpp" />
     <ClCompile Include="src\FrameStore.cpp" />
     <ClCompile Include="src\Mp4Writer.cpp" />
     <ClCompile Include="src\Mp4Cut.cpp" />
@@ -151,6 +152,7 @@
     <ClInclude Include="src\Capture.h" />
     <ClInclude Include="src\Caption.h" />
     <ClInclude Include="src\Exporter.h" />
+    <ClInclude Include="src\ImageFile.h" />
     <ClInclude Include="src\FrameStore.h" />
     <ClInclude Include="src\Mp4Writer.h" />
     <ClInclude Include="src\Mp4Box.h" />

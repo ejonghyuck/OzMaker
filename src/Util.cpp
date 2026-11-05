@@ -204,7 +204,7 @@ bool MoveToRecycleBin(HWND owner, const std::wstring& path) {
     return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
 }
 
-bool CopyFileToClipboard(HWND owner, const std::wstring& path) {
+bool CopyFileToClipboard(HWND owner, const std::wstring& path, const std::vector<uint8_t>* dib) {
     // CF_HDROP: pasting into Explorer, Discord, messengers etc. pastes the file itself.
     size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);
     HGLOBAL mem = GlobalAlloc(GHND, bytes);
@@ -227,6 +227,11 @@ bool CopyFileToClipboard(HWND owner, const std::wstring& path) {
         *(DWORD*)GlobalLock(eff) = DROPEFFECT_COPY;
         GlobalUnlock(eff);
         if (!SetClipboardData(fmt, eff)) GlobalFree(eff);
+    }
+    if (HGLOBAL pic = dib ? GlobalAlloc(GHND, dib->size()) : nullptr) {
+        memcpy(GlobalLock(pic), dib->data(), dib->size());
+        GlobalUnlock(pic);
+        if (!SetClipboardData(CF_DIB, pic)) GlobalFree(pic);
     }
     CloseClipboard();
     if (!ok) GlobalFree(mem);

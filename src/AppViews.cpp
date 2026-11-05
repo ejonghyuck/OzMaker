@@ -2522,6 +2522,7 @@ void App::DrawEditor(Rect r) {
     if (plain && in.Key('J')) Shuttle(-1);
     if (plain && in.Key('K')) SetPlaying(false);
     if (plain && in.Key('R')) ResetRange();
+    if (plain && in.Key('S')) SaveFrameImage();
     if (in.Key(VK_ESCAPE)) cropMode_ = false;
     if (in.Key(VK_DELETE) && CanDiscard()) ConfirmDiscard();
 
@@ -2905,6 +2906,12 @@ void App::DrawPreview(Rect r) {
 }
 
 void App::DrawTransport(Rect r) {
+    // In a narrow window 이미지로 저장 gives up its text first, then the volume its slider.
+    const std::wstring imageLabel = tr(L"이미지로 저장");
+    const float imageW = ui_.Measure(imageLabel, 13.f, kSemibold) + 46;
+    const float fixedW = 116.f + (clip_->HasAudio() ? 34.f : 0.f) + 10 + 150 + 92 + 8 + 84 + 8;
+    const float sliderW = clip_->HasAudio() ? 78.f : 0.f;
+    const bool imageText = r.W() >= fixedW + sliderW + imageW, volSlider = r.W() >= fixedW + sliderW + 36;
     Rect playR = r.CutLeft(44);
     if (ui_.IconButton(HashId("tr.play"), Rect::Centered(playR.CX(), playR.CY(), 44, 44),
                        playing_ ? icon::Pause : icon::Play, playing_ ? tr(L"일시정지 (Space)") : tr(L"재생 (Space)"), true,
@@ -2932,7 +2939,7 @@ void App::DrawTransport(Rect r) {
                            vol == 0 || slow ? icon::Mute : icon::Volume, tip, true, 13.f))
             TogglePreviewMute();
         // The volume (#36). Crop mode pauses the preview and needs the room.
-        if (!cropMode_) {
+        if (!cropMode_ && volSlider) {
             Rect volS = r.CutLeft(78);
             Rect track(volS.l + 8, volS.t + 8, volS.r - 8, volS.b - 8);
             UiId id = HashId("tr.vol");
@@ -2979,6 +2986,22 @@ void App::DrawTransport(Rect r) {
             if (captionOpen_) ui_.Focus(HashId("cap.text"));
         }
         if (!captionOpen_ && !caption_.empty()) ui_.Tooltip(id, capBtn, tr(L"자막: ") + caption_);
+
+        r.CutRight(8);
+        const wchar_t* tip = tr(L"이 프레임을 이미지로 저장합니다 (S)");
+        const bool ready = !imageSaver_.Busy();
+        id = HashId("tr.image");
+        if (imageText) {
+            Rect btn = r.CutRight(imageW);
+            if (ui_.Button(id, Rect::Centered(btn.CX(), btn.CY(), imageW, 36), imageLabel, BtnStyle::Secondary,
+                           icon::Camera, ready, 13.f))
+                SaveFrameImage();
+            ui_.Tooltip(id, btn, tip);
+        } else {
+            Rect btn = r.CutRight(36);
+            if (ui_.IconButton(id, Rect::Centered(btn.CX(), btn.CY(), 36, 36), icon::Camera, tip, ready, 14.f))
+                SaveFrameImage();
+        }
     }
     if (cropMode_) {
         r.CutRight(8);
@@ -3168,6 +3191,18 @@ void App::DrawExportPanel(Rect r) {
     else
         summary = in.CutBottom(20);
     in.CutBottom(8);
+    // The frame just saved as an image (#62). Its name ends in what tells it from the others, so it wraps.
+    const bool showImage = hasImage_ && !busy;
+    Rect imageCard;
+    std::wstring imageName;
+    float imageNameH = 0;
+    if (showImage) {
+        imageName = ImageDirName() + L"\\" + util::FileNameOf(lastImage_.path);
+        const float lines = std::ceil(ui_.Measure(imageName, 12.5f, kSemibold) * 1.08f / (in.W() - 48));
+        imageNameH = 18 * std::clamp(lines, 1.f, 3.f);
+        imageCard = in.CutBottom(10 + imageNameH + 18 + 8 + 32 + 10);
+        in.CutBottom(8);
+    }
 
     // Options above, scrolling when the window is too short for all of them.
     Rect view = in;
@@ -3550,6 +3585,32 @@ void App::DrawExportPanel(Rect r) {
                        BtnStyle::Secondary, icon::OpenFile, true, 12.f))
             util::ShellOpen(lastResult_.path);
     }
+
+    if (showImage) {
+        ui_.Fill(imageCard, WithAlpha(Success, 0.08f), 12);
+        ui_.Stroke(imageCard.Inset(0.5f), WithAlpha(Success, 0.35f), 12);
+        Rect text = Rect(imageCard.l + 12, imageCard.t + 10, imageCard.r - 12, imageCard.b - 10);
+        ui_.Icon(Rect::XYWH(text.l, text.t, 18, 18), icon::Check, 13.f, Success);
+        text.CutLeft(24);
+        TextStyle st = Bold();
+        st.wrap = true;
+        st.v = AlignStart;
+        ui_.Text(text.CutTop(imageNameH), imageName, 12.5f, TextColor, st);
+        ui_.Text(text.CutTop(18), tr(L"이미지로 저장했습니다"), 12.f, TextDim);
+        Rect btns = Rect(imageCard.l + 10, imageCard.b - 42, imageCard.r - 10, imageCard.b - 10);
+        float bw = (btns.W() - 6) / 2;
+        if (ui_.Button(HashId("img.folder"), Rect::XYWH(btns.l, btns.t, bw, btns.H()), tr(L"폴더"), BtnStyle::Secondary,
+                       icon::Folder, true, 12.f))
+            util::OpenFolderAndSelect(lastImage_.path);
+        if (ui_.Button(HashId("img.copy"), Rect::XYWH(btns.l + bw + 6, btns.t, bw, btns.H()), tr(L"복사"),
+                       BtnStyle::Secondary, icon::Copy, true, 12.f)) {
+            const std::vector<uint8_t> dib = image::ToDib(lastImage_.pic);
+            if (util::CopyFileToClipboard(hwnd_, lastImage_.path, &dib))
+                Toast(tr(L"파일과 이미지를 클립보드에 복사했습니다 · 메신저나 탐색기에 붙여넣으세요"));
+            else
+                Toast(tr(L"클립보드에 복사할 수 없습니다."), true);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- settings
@@ -3768,6 +3829,16 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
         const auto [hint, warn] = NameHint(settings_.nameTemplate);
         ui_.Text(more.CutTop(16), hint, 12.f, warn ? Warning : TextFaint);
     }
+
+    // Frame images and screenshots alike (#62).
+    SettingRow(area, tr(L"이미지 형식"),
+               settings_.imageFormat == image::kJpg    ? tr(L"파일이 작습니다 · 글자 가장자리가 조금 뭉개질 수 있습니다")
+               : settings_.imageFormat == image::kWebp ? tr(L"파일이 작습니다 · 일부 프로그램은 열지 못합니다")
+                                                       : tr(L"손실 없이 저장합니다 · 파일이 큰 편입니다"),
+               230, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.imgfmt"), c, {L"PNG", L"JPG", L"WebP"}, settings_.imageFormat,
+                                            image::Available(image::kWebp) ? 0 : 0b100);
+               });
 
     // 편집 탭의 삭제 and the replay list's ⋯ both follow this; 저장하지 않은 움짤 has no file to move.
     SettingRow(area, tr(L"삭제할 때"),

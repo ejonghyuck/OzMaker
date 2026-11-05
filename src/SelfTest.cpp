@@ -32,6 +32,11 @@
 #include "VideoClip.h"
 #include "WebmWriter.h"
 
+#include <fstream>
+#if __has_include(<webp/decode.h>)
+#include <webp/decode.h>
+#endif
+
 #if __has_include(<mkvparser/mkvparser.h>) && __has_include(<vpx/vp8dx.h>) && __has_include(<opus/opus.h>) && \
     __has_include(<libyuv.h>)
 #include <libyuv.h>
@@ -723,6 +728,53 @@ std::vector<uint32_t> DemoIcon() {
     for (int y = 0; y < 32; ++y)
         for (int x = 0; x < 32; ++x) out[y * 32 + x] = c.px[y / 2 * 16 + x / 2];
     return out;
+}
+
+// A PNG or JPG back as straight BGRA.
+bool ReadImageFile(const std::wstring& path, std::vector<uint8_t>& px, int& w, int& h) {
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICBitmapDecoder> dec;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> conv;
+    UINT fw = 0, fh = 0;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) ||
+        FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) ||
+        FAILED(dec->GetFrame(0, &frame)) || FAILED(frame->GetSize(&fw, &fh)) ||
+        FAILED(wic->CreateFormatConverter(&conv)) ||
+        FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                WICBitmapPaletteTypeCustom)))
+        return false;
+    w = (int)fw;
+    h = (int)fh;
+    px.resize((size_t)fw * fh * 4);
+    return SUCCEEDED(conv->CopyPixels(nullptr, fw * 4, (UINT)px.size(), px.data()));
+}
+
+// A still WebP back as straight BGRA (a 움짤 file needs two frames to open as a clip).
+bool ReadWebpFile(const std::wstring& path, std::vector<uint8_t>& px, int& w, int& h, bool& alpha) {
+#if __has_include(<webp/decode.h>)
+    std::ifstream f(path, std::ios::binary);
+    const std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    WebPBitstreamFeatures ft;
+    if (data.empty() || WebPGetFeatures(data.data(), data.size(), &ft) != VP8_STATUS_OK) return false;
+    alpha = ft.has_alpha != 0;
+    uint8_t* out = WebPDecodeBGRA(data.data(), data.size(), &w, &h);
+    if (!out) return false;
+    px.assign(out, out + (size_t)w * h * 4);
+    WebPFree(out);
+    return true;
+#else
+    return false;
+#endif
+}
+
+// The largest difference of a colour byte between two BGRA pictures of the same size, the alpha left out.
+int WorstColour(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    if (a.size() != b.size()) return 256;
+    int worst = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (i % 4 != 3) worst = std::max(worst, std::abs((int)a[i] - (int)b[i]));
+    return worst;
 }
 
 bool SavePng(IWICImagingFactory* wic, const std::wstring& path, const uint8_t* bgra, int w, int h) {
@@ -2580,8 +2632,12 @@ int App::RunSelfTest(const std::wstring& dir) {
               L"최대 녹화 길이 1시간: the 1시간 timer that stops; H.264 becomes 자동");
         check(fresh.TimerMinutes() == 0 && !fresh.timerStop && fresh.vCodec == kCodecAuto &&
                   fresh.startHide == kHideToTray && !fresh.hkHook && !fresh.hkPauseHook &&
-                  fresh.deleteMode == kDeleteToBin,
-              L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over, 삭제 to the bin");
+                  fresh.deleteMode == kDeleteToBin && fresh.imageFormat == image::kPng,
+              L"a new file: no timer (notifying once set), 자동, hidden to the tray, no hotkey taken over, 삭제 to the bin, "
+              L"images as PNG");
+        check(load(L"image_webp.ini", "[OzMaker]\r\nImageFormat=2\r\n").imageFormat == image::kWebp &&
+                  load(L"image_odd.ini", "[OzMaker]\r\nImageFormat=7\r\n").imageFormat == image::kPng,
+              L"이미지 형식: WebP is read back; a value it doesn't know is PNG");
         check(load(L"delete_now.ini", "[OzMaker]\r\nDeleteMode=1\r\n").deleteMode == kDeleteNow &&
                   load(L"delete_odd.ini", "[OzMaker]\r\nDeleteMode=7\r\n").deleteMode == kDeleteToBin,
               L"삭제할 때: 바로 삭제 is read back; a value it doesn't know stays with the Recycle Bin");
@@ -3100,6 +3156,134 @@ int App::RunSelfTest(const std::wstring& dir) {
         for (const std::wstring& k : bad) log(L"  fields differ: " + k);
         if (!ok) ++failures;
     }
+    // Frame images (#62): what is written reads back, and the frame is cut as the editor shows it.
+    {
+        auto check = [&](bool ok, const std::wstring& what) {
+            log((ok ? L"ok   " : L"FAIL ") + what);
+            if (!ok) ++failures;
+        };
+        std::wstring err;
+        const int w = 64, h = 48;
+        image::Picture pic;
+        pic.w = w;
+        pic.h = h;
+        pic.px.resize((size_t)w * h * 4);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &pic.px[((size_t)y * w + x) * 4];
+                p[0] = (uint8_t)(x * 4);
+                p[1] = (uint8_t)(y * 5);
+                p[2] = 128;
+                p[3] = 0;  // opaque whatever this says
+            }
+        image::Picture see = pic;  // left half clear, right half red at half strength
+        see.alpha = true;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &see.px[((size_t)y * w + x) * 4];
+                p[0] = p[1] = 0;
+                p[2] = p[3] = x < w / 2 ? 0 : 128;
+            }
+        std::vector<uint8_t> got;
+        int gw = 0, gh = 0;
+        auto allOpaque = [&] {
+            for (size_t i = 3; i < got.size(); i += 4)
+                if (got[i] != 255) return false;
+            return true;
+        };
+        auto at = [&](int x, int y) { return &got[((size_t)y * gw + x) * 4]; };
+        const std::wstring png = dir + L"\\image.png", jpg = dir + L"\\image.jpg", webp = dir + L"\\image.webp";
+        const std::wstring seePng = dir + L"\\image_see.png", seeJpg = dir + L"\\image_see.jpg";
+
+        bool ok = image::Write(png, image::kPng, pic, err) && ReadImageFile(png, got, gw, gh);
+        check(ok && gw == w && gh == h && WorstColour(got, pic.px) == 0 && allOpaque(),
+              L"image: an opaque PNG reads back pixel for pixel");
+        ok = image::Write(jpg, image::kJpg, pic, err) && ReadImageFile(jpg, got, gw, gh);
+        int worst = ok ? WorstColour(got, pic.px) : 256;
+        check(ok && gw == w && gh == h && worst <= 10 && allOpaque(), util::Format(L"image: JPG, off by %d at most", worst));
+        ok = image::Write(seePng, image::kPng, see, err) && ReadImageFile(seePng, got, gw, gh);
+        check(ok && at(5, 5)[3] == 0 && at(w - 5, 5)[3] == 128 && at(w - 5, 5)[2] == 255 && at(w - 5, 5)[0] == 0,
+              L"image: a see-through PNG keeps its alpha, as straight colour");
+        ok = image::Write(seeJpg, image::kJpg, see, err) && ReadImageFile(seeJpg, got, gw, gh);
+        check(ok && allOpaque() && at(5, 5)[2] < 12 && std::abs(at(w - 5, 5)[2] - 128) < 12,
+              L"image: JPG shows what is see-through over black");
+        if (image::Available(image::kWebp)) {
+            bool alpha = true;
+            ok = image::Write(webp, image::kWebp, pic, err) && ReadWebpFile(webp, got, gw, gh, alpha);
+            worst = ok ? WorstColour(got, pic.px) : 256;
+            check(ok && gw == w && gh == h && !alpha && worst <= 24, util::Format(L"image: WebP, off by %d at most", worst));
+            const std::wstring seeWebp = dir + L"\\image_see.webp";
+            ok = image::Write(seeWebp, image::kWebp, see, err) && ReadWebpFile(seeWebp, got, gw, gh, alpha);
+            check(ok && alpha && at(5, 5)[3] == 0 && std::abs(at(w - 5, 5)[3] - 128) <= 2,
+                  L"image: a see-through WebP keeps its alpha");
+        } else {
+            log(L"image: WebP skipped, no libwebp in this build");
+        }
+        const std::wstring lost = dir + L"\\no such folder\\image.png";
+        check(!image::Write(lost, image::kPng, pic, err) && !err.empty(), L"image: a folder that isn't there says so");
+
+        const std::vector<uint8_t> dib = image::ToDib(see);
+        const auto* bi = (const BITMAPINFOHEADER*)dib.data();
+        const uint8_t* bits = dib.data() + sizeof(BITMAPINFOHEADER);
+        check(dib.size() == sizeof(BITMAPINFOHEADER) + (size_t)w * h * 4 && bi->biWidth == w && bi->biHeight == h &&
+                  bi->biBitCount == 32 && bits[3] == 255 && bits[((size_t)w - 1) * 4 + 2] == 128,
+              L"image: the clipboard picture is bottom-up and opaque");
+
+        auto clip = MakeSyntheticClip(320, 180, 10, 10.0);
+        auto reader = clip ? clip->NewReader() : nullptr;
+        const uint8_t* src = reader ? reader->Get(4) : nullptr;
+        std::vector<uint8_t> frame4;
+        if (src) frame4.assign(src, src + (size_t)320 * 180 * 4);
+        const RECT all{0, 0, 320, 180}, crop{40, 30, 200, 130};
+        image::Picture whole, cut, titled;
+        check(!frame4.empty() && image::TakeFrame(*clip, 4, all, L"", 0, whole, err) && whole.w == 320 && whole.h == 180 &&
+                  !whole.alpha && whole.px == frame4,
+              L"image: a frame with nothing set is the frame itself");
+        bool rows = !frame4.empty() && image::TakeFrame(*clip, 4, crop, L"", 0, cut, err) && cut.w == 160 && cut.h == 100;
+        for (int y = 0; rows && y < cut.h; ++y)
+            rows = !memcmp(&cut.px[(size_t)y * 160 * 4], &frame4[((size_t)(30 + y) * 320 + 40) * 4], (size_t)160 * 4);
+        check(rows, L"image: the crop cuts the frame at full size");
+        const bool made = !frame4.empty() && image::TakeFrame(*clip, 4, all, L"버그는 여기", caption::kBottom, titled, err);
+        const size_t half = (size_t)320 * 90 * 4;
+        check(made && !memcmp(titled.px.data(), frame4.data(), half) &&
+                  memcmp(titled.px.data() + half, frame4.data() + half, half) != 0,
+              L"image: the caption lies over the bottom of the frame");
+        check(clip && !image::TakeFrame(*clip, 4, RECT{50, 50, 50, 90}, L"", 0, cut, err) && !err.empty(),
+              L"image: an empty crop is not saved");
+        image::Picture see2;
+        check(clip && image::TakeFrame(AlphaClip(clip), 0, all, L"", 0, see2, err) && see2.alpha,
+              L"image: a see-through clip stays see-through");
+
+        std::atomic<int> ran{0};
+        std::wstring order;
+        {
+            image::Saver saver;
+            for (int i = 0; i < 3; ++i)
+                saver.Add(
+                    [i, &ran] {
+                        Sleep(15);
+                        ++ran;
+                        image::Saved r;
+                        r.ok = true;
+                        r.path = std::to_wstring(i);
+                        return r;
+                    },
+                    nullptr, 0);
+            const double until = util::NowSeconds() + 5;
+            while (saver.Busy() && util::NowSeconds() < until) Sleep(5);
+            image::Saved r;
+            while (saver.Take(r)) order += r.path;
+            saver.Add(
+                [&ran] {
+                    Sleep(15);
+                    ++ran;
+                    return image::Saved{};
+                },
+                nullptr, 0);
+        }
+        check(order == L"012" && ran == 4, L"image: saves run in order, and what waits at exit is still written");
+    }
+
     log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
     return failures ? 2 : 0;
 }
@@ -3162,7 +3346,7 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     if (!look.empty()) log(L"look: " + look);
     int layerErrors = 0;
     size_t controls = 0, shots = 0;  // named for screen readers
-    const float W = 1120, H = 780;
+    float W = 1120, H = 780;
     double clock = util::NowSeconds();
     UiInput mouse;  // where the pointer is in the next shot
     auto shot = [&](const std::wstring& name, float dpi) {
@@ -3637,6 +3821,17 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     exportScroll_ = 0;
     settings_.exportDetails = false;
     settings_.directionIdx = 0;
+    // 이미지로 저장 (#62): the card over the summary, a long name wrapping; then the bar in the narrowest window.
+    hasResult_ = false;
+    hasImage_ = true;
+    lastImage_.path = ImageDir() + L"\\Starfall Arena_20261105_151208_0m11s100.png";
+    shot(L"editor_image_saved.png", 96);
+    W = 920;
+    H = 640;
+    shot(L"editor_image_narrow.png", 96);
+    W = 1120;
+    H = 780;
+    hasImage_ = false;
     cropMode_ = true;
     crop_ = {120, 60, 840, 465};
     hasResult_ = true;
@@ -3726,6 +3921,13 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             shown_ = playhead_;
         }
         shot(L"editor_mp4_copy.png", 96);
+        W = 1000;  // the bar with sound: 이미지로 저장 is an icon, the volume keeps its slider
+        shot(L"editor_mp4_image_icon.png", 96);
+        W = 920;
+        H = 640;
+        shot(L"editor_mp4_narrow.png", 96);
+        W = 1120;
+        H = 780;
         settings_.speedIdx = 2;
         std::atomic<bool> cancel{false};
         estBytes_ = EstimateBytes(MakeJob(settings_.scaleIdx, settings_.outFpsIdx, 0), cancel);
@@ -6466,6 +6668,39 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     pump(1.0, [&] { return shown_ == 37; });
     check(playhead_ == 37 && shown_ == 37, util::Format(L"arrow keys step back: playhead %zu, shown %zu", playhead_,
                                                         shown_));
+    // 이미지로 저장 (#62): S saves the frame on screen, any frame and not only a keyframe, without asking.
+    {
+        auto saveImage = [&] {
+            hasImage_ = false;
+            key('S');
+            pump(5.0, [&] { return hasImage_; });
+            return hasImage_ ? lastImage_.path : std::wstring();
+        };
+        std::wstring stem = util::FileNameOf(path);
+        stem.resize(stem.rfind(L'.'));
+        const int64_t ms = clip_->Ts(37) / 10'000;
+        stem = ImageDir() + L"\\" + stem +
+               util::Format(L"_%dm%02ds%03d", (int)(ms / 60'000), (int)(ms / 1000 % 60), (int)(ms % 1000));
+        settings_.imageFormat = image::kPng;
+        std::vector<uint8_t> px;
+        int iw = 0, ih = 0;
+        std::wstring img = saveImage();
+        const bool read = ReadImageFile(img, px, iw, ih);
+        const int off = WorstColour(px, framePx_);
+        check(img == stem + L".png" && read && iw == clip_->Width() && ih == clip_->Height() && off <= 2 && !hasResult_,
+              util::Format(L"S saves the frame on screen: %s, %dx%d, off by %d", util::FileNameOf(img).c_str(), iw, ih, off));
+        check(saveImage() == stem + L"_2.png", L"the same frame again gets a number");
+        crop_ = {10, 20, 210, 120};
+        img = saveImage();
+        check(ReadImageFile(img, px, iw, ih) && iw == 200 && ih == 100, L"a crop that is set is in the image");
+        ResetCrop();
+        settings_.imageFormat = image::kJpg;
+        img = saveImage();
+        check(img == stem + L".jpg" && ReadImageFile(img, px, iw, ih) && iw == clip_->Width(),
+              L"이미지 형식 JPG is what S writes then");
+        settings_.imageFormat = image::kPng;
+        check(hasImage_, L"its card stays in the panel");
+    }
     key('I');
     Seek(150);
     key('O');
@@ -6477,6 +6712,7 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
     const bool copies = cutSource_ && why && !*why;
     const int frames = copies ? (int)(150 - cutSource_->KeyBefore(37) + 1) : 114;
     StartExport(false);
+    check(!hasImage_, L"saving the clip takes the image's card away");
     pump(30, [&] { return !exporter_.Busy() && hasResult_; });
     check(hasResult_ && !resultOriginal_ && lastResult_.ok && lastResult_.frames == frames && lastResult_.audio,
           util::Format(L"export%s: %s, %d frames, %.3fs, audio %d, %s", copies ? L" as it is" : L"",
