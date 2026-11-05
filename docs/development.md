@@ -85,7 +85,8 @@ OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영
 OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드), 막대(카운트다운·영역만 저장·녹화), 직전 영역
 OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지, 다른 프로그램 창이 목록에 바로 반영되는지
 OzMaker.exe --replay-test <dir>       # 순간 리플레이: 합성 영상으로 링 버퍼의 자르기(길이 · 첫 키프레임 · 소리 맞춤, 하드웨어와 소프트웨어),
-                                      # 그리고 --test-window를 대상으로 켜기 → 담기 → 저장 → 창이 닫힌 뒤 남은 것 저장 → 끄기(테스트 창만 담음)
+                                      # 그리고 --test-window를 대상으로 켜기 → 담기 → 저장 → 창이 닫힌 뒤 남은 것 저장 → 끄기(테스트 창만 담음),
+                                      # 창이 여럿일 때 잠깐 본 창은 옮기지 않고 리플레이 길이만큼 앞에 있으면 옮김, 닫힌 뒤 남은 창은 기다리고 새 창은 바로 담음
 OzMaker.exe --multi-test <dir>        # 여러 창 녹화: --test-window 두 개를 체크해 움짤로(둘 다 남고 첫 창이 열림), 그리고 MP4로
                                       # 녹화하며 첫 창이 도중에 닫힘(그 파일만 먼저 끝남, REC 표시가 다음 창으로, 카드에 두 파일)
 OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업데이트 확인 → 받기 → 검증 → 교체(--selftest에도 포함)

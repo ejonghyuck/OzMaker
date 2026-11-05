@@ -3807,6 +3807,8 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         rpClosed_ = {settings_.rpTargets[1].path, settings_.rpTargets[1].name, util::NowSeconds(), 30};
         rpHeldForTest_ = 30;
         shot(L"replay_closed.png", 96);
+        rpClosed_.left = {hwnd_};
+        shot(L"replay_closed_window.png", 96);
         rpClosed_ = {};
         FILETIME ft;
         GetSystemTimeAsFileTime(&ft);
@@ -6098,6 +6100,82 @@ int App::RunReplayTest(const std::wstring& dir) {
         check(rpSave_.ok && rpSave_.path != first && rpClosed_.path.empty() && rpRing_.Bytes() == 0,
               util::Format(L"replay app: saved what the closed program left (%.2f s), then let it go", rpSave_.seconds));
         rpNotice_.Hide();
+    }
+    // #61: windows of one program, each in a process of its own. A look at the other window keeps what is held, and
+    // replay moves once that lasted as long as the replay. What a closed window left waits for the windows open with
+    // it until it is saved; a window opened since starts over it.
+    {
+        std::vector<PROCESS_INFORMATION> procs;
+        auto spawn = [&]() -> HWND {
+            std::vector<HWND> had;
+            for (const WinInfo& w : ReplayWindows()) had.push_back(w.hwnd);
+            std::wstring line = L"\"" + util::ExePath() + L"\" --test-window 60 capture";
+            STARTUPINFOW s{sizeof(s)};
+            PROCESS_INFORMATION p{};
+            if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &s, &p)) return nullptr;
+            procs.push_back(p);
+            HWND made = nullptr;
+            pump(8, [&] {
+                for (const WinInfo& w : ReplayWindows())
+                    if (std::find(had.begin(), had.end(), w.hwnd) == had.end()) made = w.hwnd;
+                return made != nullptr;
+            });
+            return made;
+        };
+        auto close = [&](HWND win) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(win, &pid);
+            for (const PROCESS_INFORMATION& p : procs)
+                if (p.dwProcessId == pid) {
+                    TerminateProcess(p.hProcess, 0);
+                    WaitForSingleObject(p.hProcess, 3000);
+                }
+        };
+        const HWND a = spawn();
+        pump(8, [&] { return rpCap_.Running() && rpHeld_.hwnd == a; });
+        rpFrontForTest_ = a;
+        const HWND b = spawn();
+        pump(2.5, nullptr);
+        const int64_t before = rpRing_.Held();
+        rpFrontForTest_ = b;
+        pump(2.5, nullptr);
+        check(a && b && rpCap_.Running() && rpHeld_.hwnd == a && rpRing_.Held() > before,
+              util::Format(L"replay windows: a look at the program's other window keeps what is held (%.1f s, then %.1f s)",
+                           before / 1e7, rpRing_.Held() / 1e7));
+        rpOtherSince_ -= kReplayLenOptions[settings_.rpLenIdx];
+        pump(3, [&] { return rpCap_.Running() && rpHeld_.hwnd == b; });
+        check(rpCap_.Running() && rpHeld_.hwnd == b, L"replay windows: it moves once that lasted as long as the replay");
+        pump(2.5, nullptr);
+        rpFrontForTest_ = a;
+        close(b);
+        pump(4, [&] { return !rpCap_.Running(); });
+        pump(2.5, nullptr);
+        check(!rpCap_.Running() && rpClosed_.left == std::vector<HWND>{a} && ReplayState() == RpState::Waiting &&
+                  rpRing_.Held() > 10'000'000,
+              util::Format(L"replay windows: the held window closed: %.1f s kept, the window still open waits", rpClosed_.seconds));
+        ReplaySave();
+        pump(8, [&] { return !rpSaving_; });
+        rpNotice_.Hide();
+        check(rpSave_.ok && rpClosed_.path.empty(), L"replay windows: what the closed window left is saved");
+        pump(4, [&] { return rpCap_.Running(); });
+        check(rpCap_.Running() && rpHeld_.hwnd == a, L"replay windows: then the window still open is held");
+        const HWND c = spawn();
+        pump(2.5, nullptr);
+        rpFrontForTest_ = c;
+        close(a);
+        pump(4, [&] { return !rpCap_.Running(); });
+        const bool kept = !rpClosed_.path.empty() && rpClosed_.left == std::vector<HWND>{c};
+        const HWND d = spawn();
+        pump(4, [&] { return rpCap_.Running(); });
+        check(kept && rpCap_.Running() && rpHeld_.hwnd == d && rpClosed_.path.empty(),
+              L"replay windows: a window opened since starts at once, over what was kept");
+        rpFrontForTest_ = nullptr;
+        for (const PROCESS_INFORMATION& p : procs) {
+            TerminateProcess(p.hProcess, 0);
+            CloseHandle(p.hProcess);
+            CloseHandle(p.hThread);
+        }
+        pump(3, [&] { return !rpCap_.Running(); });
     }
     SetReplayOn(false, false);
     check(!rpCap_.Running() && rpRing_.Bytes() == 0, L"replay app: switched off, nothing is left in memory");
