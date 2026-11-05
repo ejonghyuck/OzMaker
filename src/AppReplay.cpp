@@ -387,12 +387,16 @@ bool App::ReplayStart(const RpHeld& t, std::wstring& err) {
     rpClosed_ = {};  // the new stream takes the ring
     if (!rpCap_.Start(o, hwnd_, WM_APP_REPLAY_CLOSED, err)) return false;
     rpConfig_ = ReplayConfigKey();
+    RegisterShotHotkey();
     return true;
 }
 
 void App::ReplayStop(bool keep) {
     const bool was = rpCap_.Running();
-    if (was) rpCap_.Stop();  // the last fragments go into the ring
+    if (was) {
+        rpCap_.Stop();  // the last fragments go into the ring
+        RegisterShotHotkey();
+    }
     keep = keep && was && !rpHeld_.path.empty() && rpRing_.Held() >= 10'000'000;  // a second at least
     if (keep) {
         rpClosed_.path = rpHeld_.path;
@@ -427,6 +431,7 @@ void App::OnReplayClosed(bool failed) {
     if (!rpCap_.Running()) return;
     if (failed) {
         rpCap_.Stop();
+        RegisterShotHotkey();
         ClearRing();
         rpPause_ = RpPause::Blocked;
         rpBlocked_ = tr(L"동영상 인코더가 멈췄습니다.");

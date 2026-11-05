@@ -36,6 +36,8 @@ Rect VideoCardRect(Rect preview, size_t files = 1) {
     const float h = files > 1 ? 16 + kCardHead + files * CardRowH(preview, files) : 64;
     return Rect(preview.l + 12, preview.b - 12 - h, preview.r - 12, preview.b - 12);
 }
+// The screenshots taken during that recording (#63), over its card.
+Rect ShotCardRect(const Rect& video) { return Rect(video.l, video.t - 8 - 56, video.r, video.t - 8); }
 
 // A file name pattern with its tokens in the UI's language: both work, the field shows these.
 std::wstring NameInLanguage(std::wstring_view p) {
@@ -936,7 +938,10 @@ void App::DrawCapturePreview(Rect preview) {
     // above the result card instead of under it.
     const bool card = showVideo_ && rec_ == RecState::Idle;
     Rect view = preview;
-    if (card) view.b = VideoCardRect(preview, lastVideos_.size()).t;
+    if (card) {
+        const Rect video = VideoCardRect(preview, lastVideos_.size());
+        view.b = lastShots_ ? ShotCardRect(video).t : video.t;
+    }
     std::wstring hk = HotkeyLabel();
     auto placeholder = [&](std::wstring_view title, std::wstring_view body, bool editHint) {
         // The line about the 편집 tab only where it fits under the rest.
@@ -946,8 +951,12 @@ void App::DrawCapturePreview(Rect preview) {
         const float hintW = wa + wl + wb + 32;
         editHint = editHint && hintW <= view.W() - 20 && view.H() >= 230;
         float cy = view.CY() - (editHint ? 26 : 0);
-        ui_.Ring(view.CX(), cy - 44, 30, WithAlpha(Accent, 0.35f), 2.f);
-        ui_.Crosshair(view.CX(), cy - 44, 30, Accent);
+        if (view.H() >= 160) {
+            ui_.Ring(view.CX(), cy - 44, 30, WithAlpha(Accent, 0.35f), 2.f);
+            ui_.Crosshair(view.CX(), cy - 44, 30, Accent);
+        } else {
+            cy -= 38;  // over the screenshots' card too: the words alone
+        }
         ui_.Text(Rect(view.l, cy - 4, view.r, cy + 22), title, 16.f, TextColor, Bold(AlignCenter));
         TextStyle st = Align(AlignCenter, AlignStart);
         st.wrap = true;
@@ -1064,6 +1073,25 @@ void App::DrawPreviewGrid(Rect view) {
         if (!r.Empty()) ui_.NativeLayer(r);  // from here on, only floats may be drawn over them
 }
 
+void App::DrawShotCard(Rect video, float a) {
+    Rect card = ShotCardRect(video);
+    ui_.Fill(card.Offset(0, 3), WithAlpha(Shadow, 0.4f * a), 12);
+    ui_.Fill(card, WithAlpha(P.SavedCard, 0.97f * a), 12);
+    ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
+    Rect in = card.Inset(14, 8);
+    Rect folder = in.CutRight(76);
+    if (ui_.Button(HashId("vres.shots"), Rect::Centered(folder.CX(), folder.CY(), 76, 32), tr(L"폴더"),
+                   BtnStyle::Secondary, icon::Folder, true, 12.f))
+        util::OpenFolderAndSelect(lastShot_);
+    in.CutRight(12);
+    Rect icon = in.CutLeft(28);
+    ui_.Circle(icon.CX(), icon.CY(), 12, WithAlpha(Success, 0.2f));
+    ui_.Icon(icon, icon::Camera, 12.f, Success);
+    in.CutLeft(8);
+    ui_.Text(Rect(in.l, in.t, in.r, in.CY() + 1), util::Format(tr(L"스크린샷 %d장"), lastShots_), 13.f, TextColor, Bold());
+    ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), ImageDirName() + L"\\", 12.f, TextDim);
+}
+
 void App::DrawVideoResult(Rect preview) {
     if (lastVideos_.size() > 1) {
         DrawVideoResults(preview);
@@ -1072,6 +1100,7 @@ void App::DrawVideoResult(Rect preview) {
     Rect card = VideoCardRect(preview);
     float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
     card = card.Offset(0, (1 - a) * 12);
+    if (lastShots_) DrawShotCard(card, a);
     ui_.Fill(card.Offset(0, 3), WithAlpha(Shadow, 0.4f * a), 12);
     ui_.Fill(card, WithAlpha(P.SavedCard, 0.97f * a), 12);
     ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
@@ -1118,6 +1147,7 @@ void App::DrawVideoResults(Rect preview) {
     Rect card = VideoCardRect(preview, n);
     float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
     card = card.Offset(0, (1 - a) * 12);
+    if (lastShots_) DrawShotCard(card, a);
     ui_.Fill(card.Offset(0, 3), WithAlpha(Shadow, 0.4f * a), 12);
     ui_.Fill(card, WithAlpha(P.SavedCard, 0.97f * a), 12);
     ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
@@ -3928,9 +3958,10 @@ void App::AskReset() {
     q.danger = true;
     q.glyph = icon::Refresh;
     std::vector<std::wstring> back{tr(L"녹화 · 동영상 · 소리 · 내보내기 설정"),
-                                   tr(L"파일 이름 · 삭제할 때 · 테마 · 언어 · 닫기 버튼 · 효과음 · 새 버전 확인"),
+                                   tr(L"파일 이름 · 이미지 형식 · 삭제할 때 · 테마 · 언어 · 닫기 버튼 · 효과음 · 새 버전 확인"),
                                    tr(L"단축키") + std::wstring(L"  → ") + util::HotkeyToString(d.hkMods, d.hkVk) + L" · " +
-                                       util::HotkeyToString(d.hkPauseMods, d.hkPauseVk)};
+                                       util::HotkeyToString(d.hkPauseMods, d.hkPauseVk) + L" · " +
+                                       util::HotkeyToString(d.hkShotMods, d.hkShotVk)};
     std::vector<std::wstring> keep{tr(L"녹화한 파일 · 최근 파일 · 저장하지 않은 녹화"),
                                    tr(L"저장 폴더") + std::wstring(L"  (") + settings_.outDir + L")"};
     if (!Settings::Portable()) keep.push_back(tr(L"Windows 시작 시 실행") + std::wstring(L"  (") + (autostart_ ? tr(L"켬") : tr(L"끔")) + L")");
@@ -4018,6 +4049,10 @@ void App::SettingsRecord(Rect& area, bool& changed) {
               !pauseHotkeyOk_         ? tr(L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요")
               : settings_.hkPauseHook ? takenDesc
                                       : tr(L"녹화 중에만 쓰입니다 · 녹화 중 표시의 ❚❚ 버튼으로도 멈추고 이어 갑니다"));
+    HotkeyRow(area, kHotkeyShot, tr(L"스크린샷 단축키"),
+              !shotHotkeyOk_         ? tr(L"⚠ 지난 녹화 때 다른 프로그램이 쓰고 있어 쓰지 못했습니다. 다른 조합을 지정하세요")
+              : settings_.hkShotHook ? takenDesc
+                                     : tr(L"녹화 · 리플레이로 담는 중에만 씁니다 · 그 순간을 이미지로 저장합니다"));
 
     // 녹화 타이머 (#47): the same one as the 녹화 tab's button.
     const bool custom = settings_.timerIdx == kTimerCustom;

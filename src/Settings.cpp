@@ -139,6 +139,9 @@ void Settings::Load() {
     hkPauseVk = (UINT)ReadInt(ini, L"PauseHotkeyKey", (int)hkPauseVk, 1, 0xFE);
     hkHook = ReadInt(ini, L"HotkeyHook", hkHook, 0, 1) != 0;
     hkPauseHook = ReadInt(ini, L"PauseHotkeyHook", hkPauseHook, 0, 1) != 0;
+    hkShotMods = (UINT)ReadInt(ini, L"ShotHotkeyMods", (int)hkShotMods, 0, 0xF);
+    hkShotVk = (UINT)ReadInt(ini, L"ShotHotkeyKey", (int)hkShotVk, 1, 0xFE);
+    hkShotHook = ReadInt(ini, L"ShotHotkeyHook", hkShotHook, 0, 1) != 0;
     rpOn = ReadInt(ini, L"Replay", rpOn, 0, 1) != 0;
     rpLenIdx = ReadInt(ini, L"ReplayLength", rpLenIdx, 0, _countof(kReplayLenOptions) - 1);
     rpFpsIdx = ReadInt(ini, L"ReplayFps", rpFpsIdx, 0, _countof(kVideoFpsOptions) - 1);
@@ -290,6 +293,9 @@ void Settings::Save() const {
     num(L"PauseHotkeyKey", (long)hkPauseVk);
     num(L"HotkeyHook", hkHook);
     num(L"PauseHotkeyHook", hkPauseHook);
+    num(L"ShotHotkeyMods", (long)hkShotMods);
+    num(L"ShotHotkeyKey", (long)hkShotVk);
+    num(L"ShotHotkeyHook", hkShotHook);
     num(L"Replay", rpOn);
     num(L"ReplayLength", rpLenIdx);
     num(L"ReplayFps", rpFpsIdx);
