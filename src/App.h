@@ -318,9 +318,10 @@ private:
         HWND hwnd = nullptr;      // the program's window
         HMONITOR mon = nullptr;
     };
-    struct RpClosed {  // a program that closed: what was held of it stays kReplayKeepClosed seconds
+    struct RpClosed {  // a window that closed: what was held of it stays kReplayKeepClosed seconds
         std::wstring path, name;
         double at = 0, seconds = 0;
+        std::vector<HWND> left;  // the program's windows still open then: they wait for it (#61)
     };
     struct RpSave {
         std::wstring path, name, err;
@@ -349,7 +350,8 @@ private:
     double ReplayHeldSeconds() const;  // of the replay length, what is held so far
     void SetReplayOn(bool on, bool save = true);
     std::wstring ReplayConfigKey() const;
-    RpHeld PickReplayTarget() const;
+    RpHeld PickReplayTarget();
+    std::vector<WinInfo> ReplayWindows() const;  // what replay looks through: tests see only their own window
     void ReplayTick();  // kTimerReplay: what to hold, whether it went away or was minimized
     bool ReplayStart(const RpHeld& t, std::wstring& err);
     void ReplayStop(bool keep);  // keep: what was held stays to be saved (the program closed)
@@ -534,6 +536,9 @@ private:
     std::wstring rpBlocked_, rpBlockedKey_;  // why the capture didn't start, and for what (not again every second)
     std::wstring rpConfig_;                  // ReplayConfigKey of the capture running
     RpClosed rpClosed_;
+    HWND rpOther_ = nullptr;  // another window of the held program, in front since rpOtherSince_ (#61)
+    double rpOtherSince_ = 0;
+    HWND rpFrontForTest_ = nullptr;  // tests: what counts as the window in front, so that none takes the focus
     bool rpLocked_ = false, rpAsleep_ = false;
     std::thread rpSaveThread_;
     bool rpSaving_ = false, rpClearAfterSave_ = false;

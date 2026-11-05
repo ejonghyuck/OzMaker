@@ -215,28 +215,52 @@ std::wstring App::ReplayConfigKey() const {
                         settings_.vPresetIdx, settings_.captureMode, settings_.clientOnly, settings_.micDevice.c_str());
 }
 
+std::vector<WinInfo> App::ReplayWindows() const {
+    std::vector<WinInfo> wins = EnumerateCaptureWindows();
+    if (testWindowsOnly_)
+        std::erase_if(wins, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
+    return wins;
+}
+
 // Of the programs switched on in the list: the one in front, else the one held already, else the one most recently
 // in front (the window list is in z-order). A monitor in the list is held while none of them runs.
-App::RpHeld App::PickReplayTarget() const {
+// Inside one program nothing held is lost to its other windows (#61): see below, and what a closed window left waits
+// for the windows open with it, while a window opened since starts over it.
+App::RpHeld App::PickReplayTarget() {
     auto findProgram = [&](const std::wstring& exe) -> const ReplayTarget* {
         for (const ReplayTarget& t : settings_.rpTargets)
             if (!t.monitor && t.on && SamePath(t.path, exe)) return &t;
         return nullptr;
     };
-    std::vector<WinInfo> wins = EnumerateCaptureWindows();
-    if (testWindowsOnly_)
-        std::erase_if(wins, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
-    const HWND fg = GetForegroundWindow();
+    std::vector<WinInfo> wins = ReplayWindows();
+    const HWND fg = rpFrontForTest_ ? rpFrontForTest_ : GetForegroundWindow();
     const WinInfo *front = nullptr, *same = nullptr, *first = nullptr, *firstMin = nullptr;
     const ReplayTarget *frontT = nullptr, *sameT = nullptr, *firstT = nullptr, *firstMinT = nullptr;
+    bool waiting = false;  // a window of a program that is still open waits for what was kept
     for (const WinInfo& w : wins) {
         if (w.exePath.empty() || w.pid == GetCurrentProcessId()) continue;
         const ReplayTarget* t = findProgram(w.exePath);
         if (!t) continue;
+        if (std::find(rpClosed_.left.begin(), rpClosed_.left.end(), w.hwnd) != rpClosed_.left.end()) {
+            waiting = true;
+            continue;
+        }
         if (w.hwnd == fg) front = &w, frontT = t;
         if (w.hwnd == rpHeld_.hwnd) same = &w, sameT = t;
         if (!w.minimized && !first) first = &w, firstT = t;
         if (!firstMin) firstMin = &w, firstMinT = t;
+    }
+    // The held window stays while another window of its program is in front: a look there loses nothing. Replay moves
+    // once that has lasted as long as the replay: by then what was held from before it has left the ring anyway.
+    if (front && same && front != same && frontT == sameT) {
+        const double now = util::NowSeconds();
+        if (rpOther_ != front->hwnd) {
+            rpOther_ = front->hwnd;
+            rpOtherSince_ = now;
+        }
+        if (now - rpOtherSince_ < kReplayLenOptions[settings_.rpLenIdx]) front = nullptr;
+    } else {
+        rpOther_ = nullptr;
     }
     const WinInfo* w = front ? front : same ? same : first ? first : firstMin;
     const ReplayTarget* t = front ? frontT : same ? sameT : first ? firstT : firstMinT;
@@ -247,7 +271,7 @@ App::RpHeld App::PickReplayTarget() const {
         out.hwnd = w->hwnd;
         return out;
     }
-    if (testWindowsOnly_) return out;  // tests hold no screen: it would show the user's windows
+    if (waiting || testWindowsOnly_) return out;  // tests hold no screen: it would show the user's windows
     const std::vector<MonitorDesc> monitors = EnumerateMonitors();
     for (const ReplayTarget& m : settings_.rpTargets) {
         if (!m.monitor || !m.on) continue;
@@ -375,6 +399,9 @@ void App::ReplayStop(bool keep) {
         rpClosed_.name = rpHeld_.name;
         rpClosed_.at = util::NowSeconds();
         rpClosed_.seconds = std::min<double>(kReplayLenOptions[settings_.rpLenIdx], rpRing_.Held() / 1e7);
+        rpClosed_.left.clear();
+        for (const WinInfo& w : ReplayWindows())
+            if (w.hwnd != rpHeld_.hwnd && SamePath(w.exePath, rpHeld_.path)) rpClosed_.left.push_back(w.hwnd);
     } else {
         rpClosed_ = {};
         ClearRing();

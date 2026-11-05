@@ -1756,8 +1756,9 @@ void App::DrawReplayStrip(Rect r) {
         case RpState::Waiting:
             title = tr(L"기다리는 중");
             if (closed)
-                sub = util::Format(tr(L"%s 닫힘 · 담아 둔 장면(%s)은 5분 동안 남겨 둡니다"), rpClosed_.name.c_str(),
-                                   util::FormatClock(ReplayHeldSeconds(), false).c_str());
+                sub = util::Format(rpClosed_.left.empty() ? tr(L"%s 닫힘 · 담아 둔 장면(%s)은 5분 동안 남겨 둡니다")
+                                                          : tr(L"%s 창 닫힘 · 담아 둔 장면(%s)을 저장하거나 5분이 지나면 다시 담습니다"),
+                                   rpClosed_.name.c_str(), util::FormatClock(ReplayHeldSeconds(), false).c_str());
             else
                 sub = names.empty() ? tr(L"켜 둔 프로그램이 없습니다 · 왼쪽 목록에서 켜세요")
                                     : tr(L"실행되면 바로 담기 시작합니다 · ") + names;
@@ -1961,7 +1962,8 @@ void App::DrawReplayPrograms(Rect r) {
             status = tr(L"담는 중");
             tint = RecHi;
         } else if (closedHere) {
-            status = util::Format(tr(L"닫힘 · 담아 둔 %s 남겨 둠"), util::FormatClock(ReplayHeldSeconds(), false).c_str());
+            status = util::Format(rpClosed_.left.empty() ? tr(L"닫힘 · 담아 둔 %s 남겨 둠") : tr(L"창 닫힘 · 담아 둔 %s 남겨 둠"),
+                                  util::FormatClock(ReplayHeldSeconds(), false).c_str());
             tint = Warning;
         } else if (!t.on) {
             status = tr(L"꺼 둠");
