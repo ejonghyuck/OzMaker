@@ -87,6 +87,7 @@ int Settings::MatchPreset(bool video, bool gif) const {
 void Settings::Load() {
     std::wstring ini = IniPath();
     source = ReadInt(ini, L"Source", source, 0, 2);
+    multiWindow = ReadInt(ini, L"MultiWindow", multiWindow, 0, 1) != 0;
     output = ReadInt(ini, L"Output", output, 0, 1);
     region.left = ReadSigned(ini, L"RegionL");
     region.top = ReadSigned(ini, L"RegionT");
@@ -149,6 +150,8 @@ void Settings::Load() {
     rpHkVk = (UINT)ReadInt(ini, L"ReplayHotkeyKey", (int)rpHkVk, 1, 0xFE);
     rpHkHook = ReadInt(ini, L"ReplayHotkeyHook", rpHkHook, 0, 1) != 0;
     startHide = ReadInt(ini, L"StartHide", startHide, 0, 1);
+    // Only a plain 1 skips the Recycle Bin: a value this version doesn't know must not mean deleting for good.
+    deleteMode = ReadInt(ini, L"DeleteMode", deleteMode, 0, 2) == kDeleteNow ? kDeleteNow : kDeleteToBin;
     // The timer took the place of 최대 녹화 길이 (끔, 10분, 30분, 1시간) in 0.6.5: a length set there still stops.
     if ((int)GetPrivateProfileIntW(L"OzMaker", L"Timer", (UINT)-1, ini.c_str()) < 0) {
         const int old = ReadInt(ini, L"MaxLength", 0, 0, 3);
@@ -237,6 +240,7 @@ void Settings::Save() const {
     };
     auto num = [&](const wchar_t* key, long v) { put(key, std::to_wstring(v)); };
     num(L"Source", source);
+    num(L"MultiWindow", multiWindow);
     num(L"Output", output);
     num(L"RegionL", region.left);
     num(L"RegionT", region.top);
@@ -301,6 +305,7 @@ void Settings::Save() const {
             std::wstring(t.monitor ? L"m" : L"p") + (t.on ? L"1" : L"0") + L"|" + t.path + L"|" + t.name);
     }
     num(L"StartHide", startHide);
+    num(L"DeleteMode", deleteMode);
     num(L"Timer", timerIdx);
     num(L"TimerMinutes", timerMinutes);
     num(L"TimerStop", timerStop);
@@ -339,6 +344,7 @@ void Settings::Reset() {
     d.window = window;
     d.windowMax = windowMax;
     d.source = source;
+    d.multiWindow = multiWindow;  // with what is picked
     d.monitor = std::move(monitor);
     d.region = region;
     d.recent = std::move(recent);

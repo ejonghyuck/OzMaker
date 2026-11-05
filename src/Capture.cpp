@@ -89,10 +89,11 @@ bool Capture::IsSupported() {
     }
 }
 
-bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err) {
+bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std::wstring& err, LPARAM tag) {
     opt_ = opt;
     notify_ = notify;
     closedMsg_ = closedMsg;
+    tag_ = tag;
     const bool video = opt.video.has_value();
     setupDone_ = setupFailed_ = false;
     failed_ = false;
@@ -188,7 +189,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         if (!duplicate) {
             frameToken_ = pool_.FrameArrived([this](auto const& sender, auto const&) { OnFrame(sender); });
             closedToken_ = item_.Closed([this](auto const&, auto const&) {
-                if (notify_) PostMessageW(notify_, closedMsg_, 0, 0);
+                if (notify_) PostMessageW(notify_, closedMsg_, 0, tag_);
             });
         }
         startQpc_ = util::Qpc100ns();
@@ -439,7 +440,7 @@ bool Capture::Setup(int sw, int sh) {
 void Capture::Fail(std::wstring msg) {
     if (failed_.exchange(true)) return;
     videoError_ = std::move(msg);
-    if (notify_) PostMessageW(notify_, closedMsg_, 1, 0);
+    if (notify_) PostMessageW(notify_, closedMsg_, 1, tag_);
 }
 
 void Capture::Process(ID3D11Texture2D* tex, const RECT& sr, int64_t ts, const std::vector<RECT>& covered,
@@ -1064,7 +1065,7 @@ void Capture::DupLoop() {
                 MONITORINFO mi{sizeof(mi)};
                 if (!gone && !GetMonitorInfoW(dupMonitor_, &mi)) {
                     gone = true;  // unplugged: like Windows.Graphics.Capture's Closed
-                    if (notify_) PostMessageW(notify_, closedMsg_, 0, 0);
+                    if (notify_) PostMessageW(notify_, closedMsg_, 0, tag_);
                 }
                 WaitForSingleObject(dupStop_, 250);
                 continue;

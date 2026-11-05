@@ -110,6 +110,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--preview-test") return RunPreviewTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--replay-test") return RunReplayTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--multi-test") return RunMultiTest(args[1]);
     if (args.size() >= 7 && args[0] == L"--test-window" && args[2] == L"cover") {
         const int x = _wtoi(args[3].c_str()), y = _wtoi(args[4].c_str());
         const RECT r{x, y, x + _wtoi(args[5].c_str()), y + _wtoi(args[6].c_str())};
@@ -388,6 +389,7 @@ void App::Render() {
     RECT rc;
     GetClientRect(hwnd_, &rc);
     thumbWanted_ = false;
+    thumbCells_.clear();
     DrawFrame(Rect(0, 0, rc.right / Scale(), rc.bottom / Scale()));
     ui_.End();
     gfx_.EndFrame();
@@ -440,28 +442,39 @@ void App::SyncIme() {
 // the preview is cut around whatever floats above the page this frame (popovers, toasts, tooltips: Ui floats), as
 // a thumbnail per part of the window left showing.
 void App::ApplyThumbnail() {
-    bool want = thumbWanted_ && target_ && IsWindow(target_) && screen_ == Screen::Home && IsWindowVisible(hwnd_);
-    if (!want || thumbSrc_ != target_) ReleaseThumbnails();
-    if (!want || (thumb_.empty() && !AddThumbnail())) return;
+    const bool shown = screen_ == Screen::Home && IsWindowVisible(hwnd_);
+    ApplyPreview(thumb_, shown && thumbWanted_ ? target_ : nullptr, thumbArea_);
+    if (thumbMore_.size() < thumbCells_.size()) thumbMore_.resize(thumbCells_.size());
+    for (size_t i = 0; i < thumbMore_.size(); ++i) {
+        const bool on = shown && i < thumbCells_.size();
+        ApplyPreview(thumbMore_[i], on ? thumbCells_[i].hwnd : nullptr, on ? thumbCells_[i].area : Rect());
+    }
+    while (!thumbMore_.empty() && thumbMore_.back().thumb.empty()) thumbMore_.pop_back();
+}
+
+void App::ApplyPreview(LivePreview& pv, HWND target, const Rect& area) {
+    const bool want = target && IsWindow(target);
+    if (!want || pv.src != target) ReleasePreview(pv);
+    if (!want || (pv.thumb.empty() && !AddThumbnail(pv, target))) return;
     // DWM reports the size of what a thumbnail shows (just the client area with 제목 표시줄 제외): that goes first.
-    DWM_THUMBNAIL_PROPERTIES area{};
-    area.dwFlags = DWM_TNP_SOURCECLIENTAREAONLY;
-    area.fSourceClientAreaOnly = settings_.clientOnly;
-    DwmUpdateThumbnailProperties(thumb_[0], &area);
+    DWM_THUMBNAIL_PROPERTIES only{};
+    only.dwFlags = DWM_TNP_SOURCECLIENTAREAONLY;
+    only.fSourceClientAreaOnly = settings_.clientOnly;
+    DwmUpdateThumbnailProperties(pv.thumb[0], &only);
     RECT dest, src;
-    PreviewLayout(dest, src);
+    PreviewLayout(pv, target, area, dest, src);
     std::vector<RECT> parts = PreviewParts(dest);
     const bool split = !(parts.size() == 1 && EqualRect(&parts[0], &dest));
-    if (!split && thumbSplit_) {  // a thumbnail given a source rect can't be told to show the whole window again
-        ReleaseThumbnails();
-        if (!AddThumbnail()) return;
+    if (!split && pv.split) {  // a thumbnail given a source rect can't be told to show the whole window again
+        ReleasePreview(pv);
+        if (!AddThumbnail(pv, target)) return;
     }
-    while (thumb_.size() < parts.size() && AddThumbnail()) {
+    while (pv.thumb.size() < parts.size() && AddThumbnail(pv, target)) {
     }
     const LONG dw = std::max(1L, dest.right - dest.left), dh = std::max(1L, dest.bottom - dest.top);
     auto sx = [&](LONG x) { return src.left + (LONG)std::lround((double)(x - dest.left) * (src.right - src.left) / dw); };
     auto sy = [&](LONG y) { return src.top + (LONG)std::lround((double)(y - dest.top) * (src.bottom - src.top) / dh); };
-    for (size_t i = 0; i < thumb_.size(); ++i) {
+    for (size_t i = 0; i < pv.thumb.size(); ++i) {
         DWM_THUMBNAIL_PROPERTIES p{};
         p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
         p.fVisible = i < parts.size();
@@ -473,59 +486,67 @@ void App::ApplyThumbnail() {
             if (split) {
                 p.dwFlags |= DWM_TNP_RECTSOURCE;
                 p.rcSource = {sx(d.left), sy(d.top), sx(d.right), sy(d.bottom)};
-                thumbSplit_ = true;
+                pv.split = true;
             }
         }
-        DwmUpdateThumbnailProperties(thumb_[i], &p);
+        DwmUpdateThumbnailProperties(pv.thumb[i], &p);
     }
 }
 
-bool App::AddThumbnail() {
+bool App::AddThumbnail(LivePreview& pv, HWND target) {
     HTHUMBNAIL t = nullptr;
-    if (FAILED(DwmRegisterThumbnail(hwnd_, target_, &t))) return false;
-    thumb_.push_back(t);
-    thumbSrc_ = target_;
+    if (FAILED(DwmRegisterThumbnail(hwnd_, target, &t))) return false;
+    pv.thumb.push_back(t);
+    pv.src = target;
     return true;
 }
 
-void App::ReleaseThumbnails() {
-    for (HTHUMBNAIL t : thumb_) DwmUnregisterThumbnail(t);
-    thumb_.clear();
-    thumbSrc_ = nullptr;
-    thumbSplit_ = false;
+void App::ReleasePreview(LivePreview& pv) {
+    for (HTHUMBNAIL t : pv.thumb) DwmUnregisterThumbnail(t);
+    pv.thumb.clear();
+    pv.src = nullptr;
+    pv.split = false;
 }
 
-void App::PreviewLayout(RECT& dest, RECT& source) {
+void App::ReleaseThumbnails() {
+    ReleasePreview(thumb_);
+    for (LivePreview& p : thumbMore_) ReleasePreview(p);
+    thumbMore_.clear();
+}
+
+void App::PreviewLayout(RECT& dest, RECT& source) { PreviewLayout(thumb_, target_, thumbArea_, dest, source); }
+
+void App::PreviewLayout(const LivePreview& pv, HWND target, const Rect& area, RECT& dest, RECT& source) {
     // Laid out by its size on screen. Source rects are in DWM's units: the size it reports for what the thumbnail
     // shows (smaller than on screen for a window Windows scales up, not being DPI aware), from the client area's
     // corner, or for the whole window from its corner including the invisible resize borders, which that size
     // leaves out. Without a thumbnail (screenshots), the size on screen.
     SIZE shown{}, dwm{};
     WINDOWINFO wi{sizeof(wi)};
-    if (settings_.clientOnly && GetWindowInfo(target_, &wi))
+    if (settings_.clientOnly && GetWindowInfo(target, &wi))
         shown = {wi.rcClient.right - wi.rcClient.left, wi.rcClient.bottom - wi.rcClient.top};
-    if (!thumb_.empty()) DwmQueryThumbnailSourceSize(thumb_[0], &dwm);
+    if (!pv.thumb.empty()) DwmQueryThumbnailSourceSize(pv.thumb[0], &dwm);
     if (shown.cx <= 0 || shown.cy <= 0) shown = dwm;
     if (shown.cx <= 0 || shown.cy <= 0) {
         RECT wr{};
-        GetWindowRect(target_, &wr);
+        GetWindowRect(target, &wr);
         shown = {wr.right - wr.left, wr.bottom - wr.top};
     }
     if (shown.cx <= 0 || shown.cy <= 0) shown = {16, 9};
     if (dwm.cx <= 0 || dwm.cy <= 0) dwm = shown;
     source = {0, 0, dwm.cx, dwm.cy};
     RECT wr, frame;
-    if (!settings_.clientOnly && GetWindowRect(target_, &wr) &&
-        SUCCEEDED(DwmGetWindowAttribute(target_, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+    if (!settings_.clientOnly && GetWindowRect(target, &wr) &&
+        SUCCEEDED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
         frame.right > frame.left) {
         double k = (double)dwm.cx / (frame.right - frame.left);
         OffsetRect(&source, (int)std::lround((frame.left - wr.left) * k), (int)std::lround((frame.top - wr.top) * k));
     }
     float s = Scale();
-    float aw = thumbArea_.W() * s, ah = thumbArea_.H() * s;
+    float aw = area.W() * s, ah = area.H() * s;
     float f = std::min({aw / shown.cx, ah / shown.cy, 1.f});
     int dw = (int)(shown.cx * f), dh = (int)(shown.cy * f);
-    int x = (int)(thumbArea_.l * s + (aw - dw) / 2), y = (int)(thumbArea_.t * s + (ah - dh) / 2);
+    int x = (int)(area.l * s + (aw - dw) / 2), y = (int)(area.t * s + (ah - dh) / 2);
     dest = {x, y, x + dw, y + dh};
 }
 
@@ -787,11 +808,15 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (w == kTimerRec) {
                 if (rec_ == RecState::Recording) {
                     // A window recorded through the monitor (fullscreen game) never closes its capture item.
-                    if ((recTarget_.source == kSourceWindow && !IsWindow(recTarget_.hwnd)) || capture_.StoreFailed()) {
-                        StopRecording();
-                        return 0;
+                    for (size_t i = 0; i < recs_.size() && rec_ == RecState::Recording; ++i) {
+                        const RecSession& s = recs_[i];
+                        if (!s.ended && s.capture &&
+                            ((s.target.source == kSourceWindow && !IsWindow(s.target.hwnd)) || s.capture->StoreFailed()))
+                            EndRecSession(i);
                     }
-                    overlay_.Update(capture_.Elapsed(), capture_.Frames());
+                    RecSession* lead = rec_ == RecState::Recording ? RecLead() : nullptr;
+                    if (!lead) return 0;
+                    overlay_.Update(lead->capture->Elapsed(), lead->capture->Frames());
                     if (IsWindowVisible(hwnd_)) Invalidate();
                     CheckLimits();
                 }
@@ -879,7 +904,13 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (capturingHotkey_) CaptureHotkey((UINT)l, (UINT)w);
             return 0;
         case WM_APP_CAPTURE_CLOSED:
-            if (rec_ == RecState::Recording) StopRecording();
+            // lParam: which of the recording's captures (1-based); its window went away or its encoder failed.
+            if (rec_ == RecState::Recording) {
+                if (l > 0 && (size_t)l <= recs_.size())
+                    EndRecSession((size_t)l - 1);
+                else
+                    StopRecording();
+            }
             return 0;
         case WM_APP_EXPORT_DONE:
             OnExportDone();
@@ -968,7 +999,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             // Logoff or shutdown ends the process without WM_DESTROY: finish the MP4 being recorded now.
             if (w && rec_ == RecState::Recording) {
                 KillTimer(hwnd_, kTimerRec);
-                capture_.Stop();
+                for (RecSession& s : recs_)
+                    if (s.capture) s.capture->Stop();
+                recs_.clear();
                 rec_ = RecState::Idle;
             }
             if (w) {
@@ -988,7 +1021,9 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_DESTROY:
             access_.Detach();
             keyHook_.Stop();
-            if (rec_ == RecState::Recording) capture_.Stop();
+            for (RecSession& s : recs_)
+                if (s.capture) s.capture->Stop();
+            recs_.clear();
             KillTimer(hwnd_, kTimerReplay);
             if (rpSaveThread_.joinable()) rpSaveThread_.join();
             rpCap_.Stop();
@@ -1028,6 +1063,8 @@ void App::RefreshWindows() {
     if (testWindowsOnly_)
         std::erase_if(windows_, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
     if (target_ && !IsWindow(target_)) target_ = nullptr;
+    std::erase_if(picks_, [](HWND h) { return !IsWindow(h); });
+    if (MultiPicking()) target_ = picks_.empty() ? nullptr : picks_[0];
     for (auto it = icons_.begin(); it != icons_.end();) {
         if (!IsWindow(it->first))
             it = icons_.erase(it);
@@ -1078,6 +1115,42 @@ void App::SelectTarget(HWND h) {
     Invalidate();
 }
 
+// The switch over the window list. On, the window picked is the first one checked; off, the first one checked is
+// the window picked.
+void App::SetMultiWindow(bool on) {
+    if (rec_ != RecState::Idle || settings_.multiWindow == on) return;
+    settings_.multiWindow = on;
+    settingsDirty_ = true;
+    if (on) {
+        picks_.clear();
+        if (target_ && IsWindow(target_)) picks_.push_back(target_);
+    } else if (!picks_.empty()) {
+        target_ = picks_[0];
+    }
+    Invalidate();
+}
+
+void App::TogglePick(HWND h) {
+    if (rec_ != RecState::Idle || !h) return;
+    if (auto it = std::ranges::find(picks_, h); it != picks_.end()) {
+        picks_.erase(it);
+    } else if (picks_.size() >= kMaxRecWindows) {
+        Toast(util::Format(tr(L"한 번에 %zu개까지 녹화합니다. 다른 창의 체크를 풀어 주세요."), kMaxRecWindows), true);
+        return;
+    } else {
+        picks_.push_back(h);
+    }
+    target_ = picks_.empty() ? nullptr : picks_[0];
+    Invalidate();
+}
+
+std::vector<RecTarget> App::PickedTargets() const {
+    std::vector<RecTarget> ts;
+    for (HWND h : picks_)
+        if (IsWindow(h)) ts.push_back(WindowTarget(h));
+    return ts;
+}
+
 const WinInfo* App::FindWindowInfo(HWND h) const {
     for (auto& w : windows_)
         if (w.hwnd == h) return &w;
@@ -1120,6 +1193,8 @@ void App::StartRegionPick() {
             RecTarget t;
             std::wstring why;
             if (CurrentTarget(t, &why)) {
+                // Hidden for the picking, not by the setting: 작업 표시줄로 최소화 holds for this start too.
+                if (settings_.startHide == kHideMinimize) ShowWindow(hwnd_, SW_SHOWMINNOACTIVE);
                 StartRecording(t, false);  // Home stays hidden; the countdown starts over the area
                 return;
             }
@@ -1319,7 +1394,16 @@ void App::SyncMicMonitor() {
 }
 
 void App::StartRecording(const RecTarget& target, bool fromHotkey) {
-    if (rec_ != RecState::Idle) return;
+    // 여러 창 녹화 (#48): what is selected is every checked window, the first of which is target_.
+    if (MultiPicking() && target.source == kSourceWindow && target.hwnd == target_ && picks_.size() > 1) {
+        StartRecording(PickedTargets(), fromHotkey);
+        return;
+    }
+    StartRecording(std::vector<RecTarget>{target}, fromHotkey);
+}
+
+void App::StartRecording(const std::vector<RecTarget>& targets, bool fromHotkey) {
+    if (rec_ != RecState::Idle || targets.empty()) return;
     StopMicTest();      // the recording opens the mic itself
     question_.reset();  // a question about this window's state (quit, discard) no longer applies
     recFromHotkey_ = fromHotkey;
@@ -1330,41 +1414,51 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
             Toast(tr(L"내보내기가 끝난 뒤에 녹화할 수 있습니다."), true);
         return;
     }
-    if (target.source == kSourceWindow && (!target.hwnd || !IsWindow(target.hwnd))) {
+    recs_.clear();
+    for (const RecTarget& target : targets) {
+        if (target.source == kSourceWindow && (!target.hwnd || !IsWindow(target.hwnd))) continue;
+        RecSession s;
+        s.target = target;
+        if (target.source == kSourceDisplay) {
+            s.name = tr(L"화면");
+            for (auto& m : monitors_)
+                if (m.handle == target.monitor) s.name = util::Format(tr(L"화면 %d"), m.number);
+        } else if (target.source == kSourceRegion) {
+            s.name = tr(L"영역");
+        } else {
+            int len = GetWindowTextLengthW(target.hwnd);
+            s.name.assign(len + 1, L'\0');
+            s.name.resize(GetWindowTextW(target.hwnd, s.name.data(), len + 1));
+            if (s.name.empty()) s.name = tr(L"창");
+        }
+        recs_.push_back(std::move(s));
+    }
+    if (recs_.empty()) {
         ShowMain(true);
         Toast(tr(L"녹화할 창을 먼저 선택하세요."), true);
         return;
     }
-    recTarget_ = target;
-    if (target.source == kSourceDisplay) {
-        recName_ = tr(L"화면");
-        for (auto& m : monitors_)
-            if (m.handle == target.monitor) recName_ = util::Format(tr(L"화면 %d"), m.number);
-    } else if (target.source == kSourceRegion) {
-        recName_ = tr(L"영역");
-    } else {
-        int len = GetWindowTextLengthW(target.hwnd);
-        recName_.assign(len + 1, L'\0');
-        recName_.resize(GetWindowTextW(target.hwnd, recName_.data(), len + 1));
-        if (recName_.empty()) recName_ = tr(L"창");
-    }
+    const RecTarget& lead = recs_[0].target;
     recVideo_ = settings_.output == kOutputVideo;
-    if (target.source == kSourceWindow) {
-        if (IsIconic(target.hwnd)) {
-            ShowWindow(target.hwnd, SW_RESTORE);
-            recTarget_ = WindowTarget(target.hwnd);
-        }
-        recFullscreen_ = IsFullscreenWindow(target.hwnd);
+    if (lead.source == kSourceWindow) {
+        for (RecSession& s : recs_)
+            if (IsIconic(s.target.hwnd)) {
+                ShowWindow(s.target.hwnd, SW_RESTORE);
+                s.target = WindowTarget(s.target.hwnd);
+            }
+        recFullscreen_ = IsFullscreenWindow(lead.hwnd);
     } else {
         HWND fg = GetForegroundWindow();
         recFullscreen_ = fg && fg != hwnd_ && IsFullscreenWindow(fg);
     }
+    recTarget_ = lead;
+    recName_ = recs_[0].name;
     if (!fromHotkey) {
         if (settings_.startHide == kHideMinimize)
             MinimizeMain();
         else
             HideMain();
-        if (target.source == kSourceWindow) SetForegroundWindow(target.hwnd);
+        if (lead.source == kSourceWindow) SetForegroundWindow(lead.hwnd);
     }
     int cd = fromHotkey ? 0 : settings_.CountdownSeconds();
     if (cd > 0) {
@@ -1379,73 +1473,105 @@ void App::StartRecording(const RecTarget& target, bool fromHotkey) {
     BeginCapture();
 }
 
+std::wstring App::RecFileStem(const std::wstring& name, bool several) const {
+    std::wstring stem = FileStem(name);
+    const std::wstring& p = settings_.nameTemplate;
+    if (several && p.find(kNameTokens[kTokWindow][0]) == std::wstring::npos &&
+        p.find(kNameTokens[kTokWindow][1]) == std::wstring::npos) {
+        std::wstring what = util::SafeFileName(name, 60);
+        stem = util::SafeFileName(stem + L"_" + (what.empty() ? std::wstring(L"OzMaker") : what), 120);
+    }
+    return stem;
+}
+
 void App::BeginCapture() {
     KillTimer(hwnd_, kTimerCountdown);
     const bool window = recTarget_.source == kSourceWindow;
-    if (window && !IsWindow(recTarget_.hwnd)) {
+    const size_t asked = recs_.size();
+    // A window closed during the countdown is left out; with none left there is nothing to record.
+    std::erase_if(recs_, [](const RecSession& s) { return s.target.source == kSourceWindow && !IsWindow(s.target.hwnd); });
+    if (recs_.empty()) {
         rec_ = RecState::Idle;
         overlay_.Hide();
         ShowMain(true);
-        Alert(tr(L"녹화할 창이 닫혔습니다."));
+        Alert(asked > 1 ? tr(L"녹화할 창이 모두 닫혔습니다.") : tr(L"녹화할 창이 닫혔습니다."));
+        TrayUpdate();
         return;
     }
-    if (window) recTarget_.rect = WindowTarget(recTarget_.hwnd).rect;
+    const bool several = recs_.size() > 1;
+    for (RecSession& s : recs_)
+        if (window) s.target.rect = WindowTarget(s.target.hwnd).rect;
+    recTarget_ = recs_[0].target;
+    recName_ = recs_[0].name;
 
-    CaptureOptions o;
-    o.source = window ? CaptureSource::Window
-                      : recTarget_.source == kSourceDisplay ? CaptureSource::Monitor : CaptureSource::Region;
-    o.target = recTarget_.hwnd;
-    o.monitorMode = window && UseMonitorCapture(recTarget_.hwnd);
-    recScreen_ = !window || o.monitorMode;
-    o.monitor = recTarget_.monitor;
-    o.region = recTarget_.rect;
-    o.clientOnly = settings_.clientOnly;
-    o.cursor = settings_.cursor;
-    o.clickFx = settings_.clickFx;
     recNotice_.clear();
-    if (recVideo_) {
-        VideoOptions v;
-        util::EnsureDir(settings_.outDir);
-        std::wstring base = settings_.outDir + L"\\" + FileStem(recName_);
-        v.path = base + L".mp4";
-        for (int i = 2; GetFileAttributesW(v.path.c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
-            v.path = base + util::Format(L"_%d.mp4", i);
-        o.fps = kVideoFpsOptions[settings_.vFpsIdx];
-        v.video = VideoSettings(o.fps);
-        int sw = 0, sh = 0, ow = 0, oh = 0;
-        SourceSize(recTarget_, sw, sh);
-        PlannedSize(sw, sh, ow, oh, &v.video.hevc);  // 자동: HEVC past 4096 (#42)
-        v.sound = settings_.audio;
-        v.mic = settings_.mic;
-        v.micDevice = settings_.micDevice;
-        v.micGain = settings_.micVolume / 100.f;
-        v.audio.sampleRate = kAudioRateOptions[settings_.aRateIdx];
-        v.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
-        // A window records only its own sound; screens and regions record what the speakers play.
-        v.processAudio = window;
-        if (window) {
-            v.audioPid = AudioCapture::AudioProcessOf(recTarget_.hwnd);
-            if (v.sound && !AudioCapture::ProcessLoopbackSupported()) {
-                v.sound = false;
-                recNotice_ = v.mic ? tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다.")
-                                   : tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.");
+    std::vector<std::wstring> paths;  // taken by the ones before, whose files don't exist yet
+    auto taken = [&](const std::wstring& path) {
+        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES ||
+               std::ranges::any_of(paths, [&](const std::wstring& q) { return _wcsicmp(q.c_str(), path.c_str()) == 0; });
+    };
+    // Each thing recorded: its own capture, and (MP4) its own file and its program's sound.
+    auto optionsFor = [&](const RecSession& s) {
+        const RecTarget& t = s.target;
+        CaptureOptions o;
+        o.source = window ? CaptureSource::Window : t.source == kSourceDisplay ? CaptureSource::Monitor : CaptureSource::Region;
+        o.target = t.hwnd;
+        // Several windows go through their windows always: the screen would take whatever covers each.
+        o.monitorMode = window && !several && UseMonitorCapture(t.hwnd);
+        o.monitor = t.monitor;
+        o.region = t.rect;
+        o.clientOnly = settings_.clientOnly;
+        o.cursor = settings_.cursor;
+        o.clickFx = settings_.clickFx;
+        if (recVideo_) {
+            VideoOptions v;
+            std::wstring base = settings_.outDir + L"\\" + RecFileStem(s.name, several);
+            v.path = base + L".mp4";
+            for (int i = 2; taken(v.path); ++i) v.path = base + util::Format(L"_%d.mp4", i);
+            paths.push_back(v.path);
+            o.fps = kVideoFpsOptions[settings_.vFpsIdx];
+            v.video = VideoSettings(o.fps);
+            int sw = 0, sh = 0, ow = 0, oh = 0;
+            SourceSize(t, sw, sh);
+            PlannedSize(sw, sh, ow, oh, &v.video.hevc);  // 자동: HEVC past 4096 (#42)
+            v.sound = settings_.audio;
+            v.mic = settings_.mic;
+            v.micDevice = settings_.micDevice;
+            v.micGain = settings_.micVolume / 100.f;
+            v.audio.sampleRate = kAudioRateOptions[settings_.aRateIdx];
+            v.audio.bitrate = kAudioBitrateOptions[settings_.aBitrateIdx] * 1000;
+            // A window records only its own sound; screens and regions record what the speakers play.
+            v.processAudio = window;
+            if (window) {
+                v.audioPid = AudioCapture::AudioProcessOf(t.hwnd);
+                if (v.sound && !AudioCapture::ProcessLoopbackSupported()) {
+                    v.sound = false;
+                    recNotice_ = v.mic ? tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 마이크 소리만 녹음했습니다.")
+                                       : tr(L"이 Windows 버전에서는 창 소리만 따로 녹음할 수 없어 소리 없이 녹화했습니다.");
+                }
             }
+            v.audio.enabled = v.sound || v.mic;
+            o.maxEdge = v.video.hevc ? 8192 : 4096;  // encoder limits
+            if (int res = kVideoResOptions[settings_.vResIdx]) {
+                o.boxShort = res;
+                o.boxLong = res * 16 / 9;
+            }
+            o.video = std::move(v);
+        } else {
+            o.fps = kFpsOptions[settings_.fpsIdx];
+            o.maxEdge = kSizeOptions[settings_.sizeIdx];
         }
-        v.audio.enabled = v.sound || v.mic;
-        o.maxEdge = v.video.hevc ? 8192 : 4096;  // encoder limits
-        if (int res = kVideoResOptions[settings_.vResIdx]) {
-            o.boxShort = res;
-            o.boxLong = res * 16 / 9;
-        }
-        o.video = std::move(v);
-    } else {
-        o.fps = kFpsOptions[settings_.fpsIdx];
-        o.maxEdge = kSizeOptions[settings_.sizeIdx];
-    }
+        return o;
+    };
+    if (recVideo_) util::EnsureDir(settings_.outDir);
+    std::vector<CaptureOptions> opts;
+    for (const RecSession& s : recs_) opts.push_back(optionsFor(s));
+    recScreen_ = !window || opts[0].monitorMode;
     // Free space (#17): too little to start, or a warning that the recording will stop itself.
     uint64_t freeBytes = util::FreeBytes(RecordingDir());
     if (freeBytes < kLowDiskStop) {
         rec_ = RecState::Idle;
+        recs_.clear();
         overlay_.Hide();
         TrayUpdate();
         ReportError(tr(L"녹화를 시작하지 못했습니다"),
@@ -1455,18 +1581,31 @@ void App::BeginCapture() {
     // 순간 리플레이 rests while recording, and starts over afterwards (ReplayTick).
     if (settings_.rpOn) ReplayStop(false);
     std::wstring err;
-    if (!capture_.Start(o, hwnd_, WM_APP_CAPTURE_CLOSED, err)) {
+    for (size_t i = 0; i < recs_.size(); ++i) {
+        auto cap = std::make_unique<Capture>();
+        // The tag tells which of several stopped by itself (WM_APP_CAPTURE_CLOSED).
+        if (cap->Start(opts[i], hwnd_, WM_APP_CAPTURE_CLOSED, err, (LPARAM)(i + 1))) {
+            recs_[i].capture = std::move(cap);
+            continue;
+        }
+        // One that won't start stops the rest: what they began goes.
+        for (size_t k = 0; k < i; ++k) {
+            CaptureResult r = recs_[k].capture->Stop();
+            if (r.video && !r.path.empty()) DeleteFileW(r.path.c_str());
+        }
+        const std::wstring which = several ? recs_[i].name + L": " : L"";
+        recs_.clear();
         rec_ = RecState::Idle;
         overlay_.Hide();
         TrayUpdate();
         // The MP4 encoder refusing to start is most often the graphics card's: the video settings hold the way out.
         if (recVideo_ && err.find(tr(L"인코더")) != std::wstring::npos)
             ReportError(tr(L"녹화를 시작하지 못했습니다"),
-                        err + tr(L" 하드웨어 인코딩을 끄거나 해상도를 낮춰 보세요. 그래픽 드라이버를 업데이트하면 "
-                                 L"해결되는 경우도 많습니다."),
+                        which + err + tr(L" 하드웨어 인코딩을 끄거나 해상도를 낮춰 보세요. 그래픽 드라이버를 업데이트하면 "
+                                         L"해결되는 경우도 많습니다."),
                         kTabVideo);
         else
-            ReportError(tr(L"녹화를 시작하지 못했습니다"), err);
+            ReportError(tr(L"녹화를 시작하지 못했습니다"), which + err);
         return;
     }
     rec_ = RecState::Recording;
@@ -1488,9 +1627,49 @@ void App::BeginCapture() {
     else
         overlay_.Hide();
     overlay_.SetTimer(settings_.TimerMinutes() * 60, false);
+    overlay_.SetCount((int)recs_.size());
     if (recTarget_.source == kSourceRegion && settings_.overlayMode != kOverlayNever) overlay_.ShowFrame(recTarget_.rect);
     if (settings_.sounds) sound::Play(sound::Cue::Start);
     SetTimer(hwnd_, kTimerRec, 100, nullptr);
+    TrayUpdate();
+    Invalidate();
+}
+
+RecSession* App::RecLead() {
+    for (RecSession& s : recs_)
+        if (!s.ended && s.capture) return &s;
+    return nullptr;
+}
+
+double App::RecElapsed() const {
+    if (recElapsedForTest_ >= 0) return recElapsedForTest_;
+    for (const RecSession& s : recs_)
+        if (!s.ended && s.capture) return s.capture->Elapsed();
+    return 0;
+}
+
+void App::EndRecSession(size_t i) {
+    if (rec_ != RecState::Recording || i >= recs_.size() || recs_[i].ended || !recs_[i].capture) return;
+    size_t live = 0;
+    for (const RecSession& s : recs_) live += !s.ended && s.capture;
+    if (live <= 1) {  // the last one: the recording is over
+        StopRecording();
+        return;
+    }
+    RecSession& s = recs_[i];
+    const bool lead = RecLead() == &s;
+    s.result = s.capture->Stop();
+    s.capture.reset();
+    s.ended = true;
+    overlay_.SetCount((int)live - 1);
+    if (lead) {
+        if (RecSession* next = RecLead()) {
+            recTarget_ = next->target;
+            if (IsWindow(recTarget_.hwnd)) recTarget_ = WindowTarget(recTarget_.hwnd);
+            recName_ = next->name;
+            overlay_.MoveTo(recTarget_.rect);
+        }
+    }
     TrayUpdate();
     Invalidate();
 }
@@ -1499,6 +1678,7 @@ void App::StopRecording() {
     if (rec_ == RecState::Countdown) {
         KillTimer(hwnd_, kTimerCountdown);
         rec_ = RecState::Idle;
+        recs_.clear();
         overlay_.Hide();
         TrayUpdate();
         ShowMain(true);
@@ -1506,29 +1686,47 @@ void App::StopRecording() {
     }
     if (rec_ != RecState::Recording) return;
     KillTimer(hwnd_, kTimerRec);
-    CaptureResult res = capture_.Stop();
+    // Several end together: each holds still while the ones before it finish their files.
+    if (recs_.size() > 1)
+        for (RecSession& s : recs_)
+            if (!s.ended && s.capture) s.capture->SetPaused(true);
+    for (RecSession& s : recs_)
+        if (!s.ended && s.capture) s.result = s.capture->Stop();
+    std::vector<RecSession> done = std::move(recs_);
+    recs_.clear();
     rec_ = RecState::Idle;
     recPaused_ = false;
     SetRecordingLook(false);
     RegisterPauseHotkey();  // releases it
     overlay_.Hide();
     TrayUpdate();
+    if (done.size() > 1) {
+        StopSeveral(done);
+        return;
+    }
+    const CaptureResult& res = done[0].result;
+    lastVideos_.clear();
     if (res.video) {
         OnVideoSaved(res);
         return;
     }
     if (settings_.sounds) sound::Play(sound::Cue::Stop);
     auto clip = res.clip;
-    if (clip) HoldRecording(clip);
-    clipName_ = recName_;
+    if (clip) HoldRecording(clip, done[0].name);
+    clipName_ = done[0].name;
     if (!clip) {
-        if (recTarget_.source == kSourceWindow)
+        if (done[0].target.source == kSourceWindow)
             ReportError(tr(L"녹화 실패"), tr(L"캡처된 화면이 없습니다. 녹화 설정에서 창 캡처 방식을 '화면'으로 바꿔 보세요."),
                         kTabRecord);
         else
             ReportError(tr(L"녹화 실패"), tr(L"캡처된 화면이 없습니다."));
         return;
     }
+    OpenClipWarn(clip, 1);
+}
+
+// The clip just recorded in the editor, and what went wrong while recording it. held: how many clips it made.
+void App::OpenClipWarn(const std::shared_ptr<FrameStore>& clip, size_t held) {
     OpenEditor(clip);
     std::wstring warn;
     if (clip->WriteFailed())
@@ -1537,13 +1735,62 @@ void App::StopRecording() {
         warn = util::Format(tr(L"디스크가 느려 프레임 %u개를 건너뛰었습니다."), clip->Dropped());
     if (!stopReason_.empty() && !clip->WriteFailed()) warn = stopReason_ + (warn.empty() ? L"" : L" " + warn);
     stopReason_.clear();
+    const std::wstring done = held > 1 ? util::Format(tr(L"창 %zu개를 녹화했습니다. 첫 창을 편집 탭에서 열었고, 나머지는 "
+                                                          L"‘저장하지 않은 녹화’에 있습니다"),
+                                                       held)
+                                       : tr(L"녹화를 편집 탭에서 열었습니다");
     if (NotifyQuietly()) {
         TrayBalloon(tr(L"녹화 완료 · ") + util::FormatClock(clip->Seconds(), true),
                     warn.empty() ? tr(L"클릭하면 편집 탭이 열립니다.") : warn);
     } else {
         ShowMain(true);
-        Toast(warn.empty() ? tr(L"녹화를 편집 탭에서 열었습니다") : warn, !warn.empty());
+        Toast(warn.empty() ? done : warn, !warn.empty());
     }
+}
+
+// 여러 창 녹화: a file (MP4) or a held clip (움짤) for each window, the first one shown.
+void App::StopSeveral(std::vector<RecSession>& done) {
+    std::wstring failed;
+    size_t failures = 0;
+    if (done[0].result.video || recVideo_) {
+        lastVideos_.clear();
+        for (RecSession& s : done) {
+            if (s.result.video && s.result.ok) {
+                lastVideos_.push_back({s.result, s.ended});
+            } else {
+                ++failures;
+                if (failed.empty())
+                    failed = s.name + L": " + (s.result.error.empty() ? tr(L"동영상을 저장하지 못했습니다.") : s.result.error);
+            }
+        }
+        if (lastVideos_.empty()) {
+            if (settings_.sounds) sound::Play(sound::Cue::Stop);
+            ReportError(tr(L"동영상 저장 실패"), failed);
+            return;
+        }
+        OnVideosSaved();
+        if (failures) Alert(util::Format(tr(L"창 %zu개는 저장하지 못했습니다. "), failures) + failed);
+        return;
+    }
+    // 움짤: each into 저장하지 않은 녹화, the first window's at the top; the first opens.
+    std::shared_ptr<FrameStore> first;
+    size_t held = 0;
+    for (size_t i = done.size(); i-- > 0;) {
+        if (!done[i].result.clip) {
+            ++failures;
+            continue;
+        }
+        HoldRecording(done[i].result.clip, done[i].name);
+        first = done[i].result.clip;
+        clipName_ = done[i].name;
+        ++held;
+    }
+    if (settings_.sounds) sound::Play(sound::Cue::Stop);
+    if (!first) {
+        ReportError(tr(L"녹화 실패"), tr(L"캡처된 화면이 없습니다."));
+        return;
+    }
+    OpenClipWarn(first, held);
 }
 
 // The file is already saved: the card on the 녹화 tab shows it. Its 편집 opens it in the 편집 tab (EditLastVideo).
@@ -1580,6 +1827,13 @@ void App::EditLastVideo() {
     hasResult_ = resultOriginal_ = true;
 }
 
+// A row of the card for several windows: that file becomes the one the card's 편집 (and the editor's 삭제) is about.
+void App::EditVideoAt(size_t i) {
+    if (i >= lastVideos_.size()) return;
+    lastVideo_ = lastVideos_[i].r;
+    EditLastVideo();
+}
+
 void App::OnVideoSaved(const CaptureResult& r) {
     if (!r.ok) {
         if (settings_.sounds) sound::Play(sound::Cue::Stop);
@@ -1603,10 +1857,37 @@ void App::OnVideoSaved(const CaptureResult& r) {
         Toast(tr(L"동영상을 저장했습니다 · ") + info);
 }
 
+void App::OnVideosSaved() {
+    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    // The first window's file at the top of 최근 파일.
+    for (size_t i = lastVideos_.size(); i-- > 1;) AddRecent(lastVideos_[i].r.path);
+    ShowVideo(lastVideos_[0].r);
+    if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
+    uint64_t bytes = 0;
+    double longest = 0;
+    for (const SavedVideo& v : lastVideos_) {
+        bytes += v.r.bytes;
+        longest = std::max(longest, v.r.seconds);
+    }
+    const std::wstring info = util::Format(tr(L"창 %zu개"), lastVideos_.size()) + L" · " + util::FormatBytes(bytes);
+    std::wstring reason = std::exchange(stopReason_, {});
+    if (NotifyQuietly())
+        TrayBalloon(tr(L"동영상 저장 완료 · ") + util::FormatClock(longest, false), reason.empty() ? info : reason);
+    else
+        ShowMain(true);
+    if (!lastVideo_.notice.empty())
+        Alert(reason.empty() ? lastVideo_.notice : reason + L" " + lastVideo_.notice);
+    else if (!reason.empty())
+        Alert(reason + L" · " + info);
+    else
+        Toast(tr(L"동영상을 저장했습니다 · ") + info);
+}
+
 void App::TogglePause() {
     if (rec_ != RecState::Recording) return;
     recPaused_ = !recPaused_;
-    capture_.SetPaused(recPaused_);
+    for (RecSession& s : recs_)
+        if (!s.ended && s.capture) s.capture->SetPaused(recPaused_);
     overlay_.SetPaused(recPaused_);
     if (settings_.sounds) sound::Play(sound::Cue::Tick);
     TrayUpdate();
@@ -1629,7 +1910,8 @@ void App::CheckLimits() {
     if (rec_ != RecState::Recording) return;
     // The record timer (#47), on the recorded time (pauses left out): once for each length it is set to.
     const int timer = settings_.TimerMinutes() * 60;
-    if (timer > 0 && timerFiredFor_ != timer && capture_.Elapsed() >= timer) {
+    const RecSession* lead = RecLead();
+    if (timer > 0 && timerFiredFor_ != timer && lead && lead->capture->Elapsed() >= timer) {
         timerFiredFor_ = timer;
         const std::wstring words = TimerWords(timer / 60);
         if (settings_.timerStop) {
@@ -1696,6 +1978,13 @@ void App::OnHotkey() {
                 TrayBalloon(tr(L"영역 녹화를 시작할 수 없습니다"), why);
             break;
         default:
+            // 여러 창 녹화: the checked windows, whatever is in front.
+            if (MultiPicking() && !picks_.empty()) {
+                if (auto ts = PickedTargets(); !ts.empty()) {
+                    StartRecording(ts, true);
+                    break;
+                }
+            }
             if (shell)
                 TrayBalloon(tr(L"녹화할 창이 없습니다"), tr(L"녹화할 창을 앞에 띄운 뒤 단축키를 누르세요."));
             else
@@ -1747,7 +2036,7 @@ std::wstring App::AudioSummary(int source) const {
     std::wstring s;
     if (settings_.audio)
         s = source != kSourceWindow                         ? tr(L"시스템 전체 소리 녹음")
-            : AudioCapture::ProcessLoopbackSupported() ? tr(L"이 창의 소리만 녹음")
+            : AudioCapture::ProcessLoopbackSupported() ? (MultiPicking() ? tr(L"창마다 그 창의 소리만 녹음") : tr(L"이 창의 소리만 녹음"))
                                                        : tr(L"창 소리 녹음 불가 (Windows 10 2004 이상)");
     if (settings_.mic) s = s.empty() ? tr(L"마이크만 녹음") : s + tr(L" + 마이크");
     return s.empty() ? tr(L"소리 끔") : s;
@@ -1938,8 +2227,8 @@ void App::RefreshRecent() {
     }
 }
 
-void App::HoldRecording(std::shared_ptr<Clip> clip) {
-    held_.insert(held_.begin(), {std::move(clip), util::NowSeconds(), recName_});
+void App::HoldRecording(std::shared_ptr<Clip> clip, const std::wstring& name) {
+    held_.insert(held_.begin(), {std::move(clip), util::NowSeconds(), name});
     // Bounded: each one keeps a temporary file of compressed frames.
     if (held_.size() > kMaxHeld) {
         held_.resize(kMaxHeld);
@@ -2132,15 +2421,24 @@ void App::ConfirmDiscard() {
     auto discard = [this, clip = std::weak_ptr<Clip>(clip_)] {
         if (clip.lock() == clip_) DiscardRecording();
     };
-    if (!clip_->SourcePath().empty())
-        Ask({tr(L"이 동영상을 휴지통으로 옮길까요?"),
-             util::FileNameOf(clip_->SourcePath()) + tr(L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."), tr(L"휴지통으로"),
-             true, discard});
-    else
+    const std::wstring name = util::FileNameOf(clip_->SourcePath());
+    if (name.empty())
         Ask({tr(L"이 녹화를 버릴까요?"),
              ClipTitle() + L" · " + util::FormatClock(clip_->Seconds(), true) +
                  (held ? tr(L"\n버리면 되돌릴 수 없습니다.") : tr(L"\n저장한 파일은 그대로 남습니다.")),
              tr(L"버리기"), true, discard});
+    else if (settings_.deleteMode == kDeleteNow)
+        Ask({tr(L"이 동영상을 삭제할까요?"),
+             name + tr(L"\n휴지통을 거치지 않고 지워서 되돌릴 수 없습니다.") + tr(L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."),
+             tr(L"삭제"), true, discard});
+    else
+        Ask({tr(L"이 동영상을 휴지통으로 옮길까요?"), name + tr(L"\n이 녹화에서 따로 저장한 파일은 그대로 남습니다."),
+             tr(L"휴지통으로"), true, discard});
+}
+
+bool App::RemoveFile(const std::wstring& path) {
+    if (settings_.deleteMode == kDeleteNow || testDeleteFiles_) return DeleteFileW(path.c_str()) != 0;
+    return util::MoveToRecycleBin(hwnd_, path);
 }
 
 void App::DiscardRecording() {
@@ -2151,15 +2449,24 @@ void App::DiscardRecording() {
     if (!path.empty()) {
         // Nothing may hold the file: the readers went with the editor; a size estimate in flight gets a moment.
         for (double until = util::NowSeconds() + 3; estimator_.Busy() && util::NowSeconds() < until;) Sleep(10);
-        bool gone = testDeleteFiles_ ? DeleteFileW(path.c_str()) != 0 : util::MoveToRecycleBin(hwnd_, path);
-        if (!gone) {
+        if (!RemoveFile(path)) {
             AttachReaders();
-            Toast(tr(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요."), true);
+            Toast(settings_.deleteMode == kDeleteNow
+                      ? tr(L"파일을 삭제하지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요.")
+                      : tr(L"동영상을 휴지통으로 옮기지 못했습니다. 다른 프로그램에서 열려 있다면 닫고 다시 해 보세요."),
+                  true);
             Invalidate();
             return;
         }
-        showVideo_ = false;
-        lastVideo_ = {};
+        // 여러 창 녹화: the card keeps the other files.
+        std::erase_if(lastVideos_, [&](const SavedVideo& v) { return _wcsicmp(v.r.path.c_str(), path.c_str()) == 0; });
+        if (!lastVideos_.empty()) {
+            lastVideo_ = lastVideos_[0].r;
+            if (lastVideos_.size() == 1) lastVideos_.clear();
+        } else {
+            showVideo_ = false;
+            lastVideo_ = {};
+        }
         RefreshRecent();
     }
     DropHeld(clip_.get());
@@ -2167,7 +2474,11 @@ void App::DiscardRecording() {
     frameBmp_.Reset();
     hasResult_ = resultOriginal_ = false;
     RefreshRecent();
-    Toast(path.empty() ? tr(L"녹화를 버렸습니다.") : tr(L"휴지통으로 옮겼습니다 · ") + util::FileNameOf(path));
+    if (path.empty())
+        Toast(tr(L"녹화를 버렸습니다."));
+    else
+        Toast((settings_.deleteMode == kDeleteNow ? tr(L"삭제했습니다 · ") : tr(L"휴지통으로 옮겼습니다 · ")) +
+              util::FileNameOf(path));
     Invalidate();
 }
 
@@ -3052,6 +3363,7 @@ void App::TrayMenu() {
     bool canRecord = CurrentTarget(current, nullptr);
     const wchar_t* what = settings_.source == kSourceDisplay  ? tr(L"선택한 화면 녹화\t")
                           : settings_.source == kSourceRegion ? tr(L"지정한 영역 녹화\t")
+                          : MultiPicking() && picks_.size() > 1 ? tr(L"체크한 창 녹화\t")
                                                               : tr(L"선택한 창 녹화\t");
     if (rec_ == RecState::Idle)
         AppendMenuW(menu, MF_STRING | (canRecord ? 0 : MF_GRAYED), 2, (what + hk).c_str());

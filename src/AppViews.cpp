@@ -25,8 +25,17 @@ TextStyle Align(uint8_t h, uint8_t v = AlignCenter) {
     return s;
 }
 
-// The saved-video card along the bottom of the capture preview.
-Rect VideoCardRect(Rect preview) { return Rect(preview.l + 12, preview.b - 12 - 64, preview.r - 12, preview.b - 12); }
+// The saved-video card along the bottom of the capture preview; for several windows' files (#48), a header and a
+// row for each, the rows narrower where the preview is short.
+constexpr float kCardHead = 40, kCardRow = 46;
+float CardRowH(Rect preview, size_t files) {
+    const float room = preview.H() - 24 - 90 - 16 - kCardHead;  // 90: the preview left above it
+    return std::clamp(room / std::max<size_t>(files, 1), 36.f, kCardRow);
+}
+Rect VideoCardRect(Rect preview, size_t files = 1) {
+    const float h = files > 1 ? 16 + kCardHead + files * CardRowH(preview, files) : 64;
+    return Rect(preview.l + 12, preview.b - 12 - h, preview.r - 12, preview.b - 12);
+}
 
 // A file name pattern with its tokens in the UI's language: both work, the field shows these.
 std::wstring NameInLanguage(std::wstring_view p) {
@@ -630,6 +639,7 @@ void App::DrawSourcePanel(Rect r) {
 }
 
 void App::DrawWindowList(Rect in) {
+    const bool multi = MultiPicking();
     Rect head = in.CutTop(36);
     ui_.Text(head, tr(L"녹화할 창"), 15.f, TextColor, Bold());
     Rect pickR = head.CutRight(124);
@@ -642,14 +652,17 @@ void App::DrawWindowList(Rect in) {
         ui_.Stroke(pickR.Inset(0.5f), Border, 9);
         ui_.Crosshair(pickR.l + 20, pickR.CY(), 14, Mix(TextDim, Accent, 0.6f + 0.4f * h));
         ui_.Text(Rect(pickR.l + 34, pickR.t, pickR.r, pickR.b), tr(L"화면에서 선택"), 13.f, TextColor, Bold());
-        ui_.Tooltip(id, pickR, tr(L"화면 위의 창을 직접 클릭해서 고릅니다"));
+        ui_.Tooltip(id, pickR, multi ? tr(L"화면 위의 창을 직접 클릭해서 체크합니다") : tr(L"화면 위의 창을 직접 클릭해서 고릅니다"));
         if (clicked) {
             HideMain();
             picker_.Start(EnumerateCaptureWindows(), [this](HWND h) {
                 ShowMain(true);
                 if (h) {
                     RefreshWindows();
-                    SelectTarget(h);
+                    if (!MultiPicking())
+                        SelectTarget(h);
+                    else if (std::ranges::find(picks_, h) == picks_.end())
+                        TogglePick(h);
                 }
             });
         }
@@ -661,8 +674,19 @@ void App::DrawWindowList(Rect in) {
         RefreshWindows();
 
     in.CutTop(10);
+    // 여러 창 녹화 (#48): the rows become check boxes.
+    {
+        Rect row = in.CutTop(46);
+        ui_.Fill(row, WithAlpha(Surface2, 0.6f), 10);
+        bool on = settings_.multiWindow;
+        if (ui_.ToggleRow(HashId("home.multi"), row, tr(L"여러 창 녹화"), on,
+                          util::Format(tr(L"%zu개까지 체크해 한 번에 녹화합니다"), kMaxRecWindows), rec_ == RecState::Idle))
+            SetMultiWindow(on);
+        in.CutTop(8);
+    }
     Rect hint = in.CutBottom(22);
-    ui_.Text(hint, tr(L"창을 더블클릭하면 바로 녹화합니다"), 12.f, TextFaint, Align(AlignCenter, AlignEnd));
+    ui_.Text(hint, multi ? tr(L"체크한 창을 모두 녹화합니다") : tr(L"창을 더블클릭하면 바로 녹화합니다"), 12.f, TextFaint,
+             Align(AlignCenter, AlignEnd));
     in.CutBottom(6);
 
     Rect list = in;
@@ -685,27 +709,59 @@ void App::DrawWindowList(Rect in) {
         const WinInfo& w = windows_[i];
         Rect item = Rect::XYWH(list.l, list.t + i * step - scroll, list.W() - (maxScroll > 0 ? 8 : 0), itemH);
         UiId id = HashId("win", (uint32_t)(uintptr_t)w.hwnd);
-        ui_.Declare(id, item, Role::Item, w.title).on = w.hwnd == target_;  // Tab reaches it scrolled out too
+        // 여러 창 녹화: its number in the order checked, 0 = not checked; with four checked the rest wait.
+        const auto pick = std::ranges::find(picks_, w.hwnd);
+        const int num = multi && pick != picks_.end() ? (int)(pick - picks_.begin()) + 1 : 0;
+        const bool full = multi && !num && picks_.size() >= kMaxRecWindows;
+        const bool sel = multi ? num > 0 : w.hwnd == target_;
+        ui_.Declare(id, item, multi ? Role::Toggle : Role::Item, w.title).on = sel;  // Tab reaches it scrolled out too
         if (item.b < list.t || item.t > list.b) continue;
         bool hov = ui_.Hover(item);
-        if (ui_.Click(id, item)) SelectTarget(w.hwnd);
-        if (hov && ui_.In().dblclick) StartRecording(WindowTarget(w.hwnd), false);
-        bool sel = w.hwnd == target_;
+        if (ui_.Click(id, item)) {
+            if (multi)
+                TogglePick(w.hwnd);
+            else
+                SelectTarget(w.hwnd);
+        }
+        // Not with check boxes: two quick clicks would check it, uncheck it and start recording.
+        if (!multi && hov && ui_.In().dblclick) StartRecording(WindowTarget(w.hwnd), false);
+        if (full)
+            ui_.Tooltip(id, item, util::Format(tr(L"한 번에 %zu개까지 녹화합니다. 다른 창의 체크를 풀어 주세요"), kMaxRecWindows));
         float h = ui_.Anim(id, hov ? 1.f : 0.f);
         ui_.Fill(item, sel ? (Contrast() ? Accent : Mix(Surface2, Accent, 0.16f)) : WithAlpha(Surface2, h), 10);
         if (sel) ui_.Stroke(item.Inset(0.75f), WithAlpha(Accent, 0.85f), 10, 1.5f);
         const bool onHighlight = sel && Contrast();
+        const float dim = full ? 0.45f : 1.f;
 
-        Rect ic = Rect::XYWH(item.l + 12, item.CY() - 16, 32, 32);
+        float x0 = item.l + 12;
+        if (multi) {
+            Rect cb = Rect::XYWH(x0, item.CY() - 9, 18, 18);
+            if (num) {
+                ui_.Fill(cb, onHighlight ? OnFill : Accent, 5);
+                ui_.Icon(cb, icon::Check, 10.f, onHighlight ? Accent : OnFill);
+            } else {
+                ui_.Stroke(cb.Inset(0.75f), WithAlpha(BorderStrong, dim), 5, 1.5f);
+            }
+            x0 += 30;
+        }
+        Rect ic = Rect::XYWH(x0, item.CY() - 16, 32, 32);
         if (ID2D1Bitmap* bmp = IconFor(w)) {
             ui_.Painted(ic);
-            dc->DrawBitmap(bmp, ic, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+            dc->DrawBitmap(bmp, ic, dim, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
         } else {
-            ui_.Icon(ic, icon::AppWindow, 20.f, onHighlight ? OnFill : TextDim);
+            ui_.Icon(ic, icon::AppWindow, 20.f, onHighlight ? OnFill : WithAlpha(TextDim, dim));
         }
+        float textR = item.r - 12;
+        if (num) {
+            const Rect nb = Rect::Centered(item.r - 12 - 11, item.CY(), 22, 22);
+            ui_.Circle(nb.CX(), nb.CY(), 11, onHighlight ? OnFill : Accent);
+            ui_.Text(nb.Offset(0, -0.5f), std::to_wstring(num), 12.f, onHighlight ? Accent : OnFill, Bold(AlignCenter));
+            textR = nb.l - 8;
+        }
+        const float tx = x0 + 44;
 
-        ui_.Text(Rect(item.l + 56, item.t + 8, item.r - 12, item.t + 30), w.title, 13.5f,
-                 onHighlight ? OnFill : TextColor, Bold());
+        ui_.Text(Rect(tx, item.t + 8, textR, item.t + 30), w.title, 13.5f,
+                 onHighlight ? OnFill : WithAlpha(TextColor, dim), Bold());
         std::wstring sub = w.exeName.empty() ? L"" : w.exeName;
         if (!w.minimized) {
             sub += util::Format(L"%s%d×%d", sub.empty() ? L"" : L" · ", w.frame.right - w.frame.left,
@@ -713,7 +769,7 @@ void App::DrawWindowList(Rect in) {
         }
         if (w.fullscreen) sub += tr(L" · 전체화면");
         if (w.minimized) sub += tr(L" · 최소화됨");
-        ui_.Text(Rect(item.l + 56, item.t + 30, item.r - 12, item.b - 8), sub, 12.f, onHighlight ? OnFill : TextFaint);
+        ui_.Text(Rect(tx, item.t + 30, textR, item.b - 8), sub, 12.f, onHighlight ? OnFill : WithAlpha(TextFaint, dim));
     }
     ui_.PopClip();
     if (maxScroll > 0) {
@@ -880,7 +936,7 @@ void App::DrawCapturePreview(Rect preview) {
     // above the result card instead of under it.
     const bool card = showVideo_ && rec_ == RecState::Idle;
     Rect view = preview;
-    if (card) view.b = VideoCardRect(preview).t;
+    if (card) view.b = VideoCardRect(preview, lastVideos_.size()).t;
     std::wstring hk = HotkeyLabel();
     auto placeholder = [&](std::wstring_view title, std::wstring_view body, bool editHint) {
         // The line about the 편집 tab only where it fits under the rest.
@@ -938,7 +994,14 @@ void App::DrawCapturePreview(Rect preview) {
             }
             break;
         default:
-            if (target_ && IsWindow(target_)) {
+            if (MultiPicking() && picks_.empty()) {
+                placeholder(tr(L"녹화할 창을 체크하세요"),
+                            util::Format(tr(L"왼쪽 목록에서 %zu개까지 체크하세요.\n체크한 순서대로 1 · 2 · 3 · 4 번호가 붙습니다."),
+                                         kMaxRecWindows),
+                            false);
+            } else if (MultiPicking() && picks_.size() > 1 && target_ == picks_[0]) {
+                DrawPreviewGrid(view);
+            } else if (target_ && IsWindow(target_)) {
                 thumbWanted_ = true;
                 thumbArea_ = view.Inset(10);
                 const WinInfo* info = FindWindowInfo(target_);
@@ -957,7 +1020,55 @@ void App::DrawCapturePreview(Rect preview) {
     if (card) DrawVideoResult(preview);
 }
 
+// 여러 창 녹화: each checked window in a cell, side by side for two and 2 × 2 for more (in one row where the
+// preview is short: the card of saved files is up), numbered as in the list.
+void App::DrawPreviewGrid(Rect view) {
+    const Rect area = view.Inset(12);
+    const size_t n = std::min(picks_.size(), kMaxRecWindows);
+    const float gap = 10, head = 32;
+    size_t cols = n > 2 ? 2 : n, rows = n > 2 ? 2 : 1;
+    if (rows == 2 && (area.H() - gap) / 2 < head + 60) cols = n, rows = 1;
+    const float cw = (area.W() - gap * (cols - 1)) / cols;
+    const float ch = rows == 2 ? (area.H() - gap) / 2 : std::min(area.H(), cw * 0.62f + head + 6);
+    const float top = area.CY() - (rows * ch + (rows - 1) * gap) / 2;
+    std::vector<Rect> shots;
+    for (size_t i = 0; i < n; ++i) {
+        Rect cell = Rect::XYWH(area.l + (i % cols) * (cw + gap), top + (i / cols) * (ch + gap), cw, ch);
+        if (rows == 2 && n == 3 && i == 2) cell = cell.Offset((cw + gap) / 2, 0);  // the third under the middle
+        ui_.Fill(cell, WithAlpha(Surface2, 0.55f), 10);
+        if (Contrast()) ui_.Stroke(cell.Inset(0.5f), Border, 10);
+        Rect c = cell;
+        Rect top = c.CutTop(std::min(head, c.H()));
+        const Rect nb = Rect::Centered(top.l + 8 + 11, top.CY(), 22, 22);
+        ui_.Circle(nb.CX(), nb.CY(), 11, Accent);
+        ui_.Text(nb.Offset(0, -0.5f), std::to_wstring(i + 1), 12.f, OnFill, Bold(AlignCenter));
+        const WinInfo* info = FindWindowInfo(picks_[i]);
+        ui_.Text(Rect(nb.r + 8, top.t, top.r - 10, top.b), info ? info->title : L"", 12.5f, TextDim, Bold());
+        const Rect shot(c.l + 8, c.t, c.r - 8, c.b - 8);
+        if (shot.H() < 16 || shot.W() < 16) {  // no room for the window itself
+            shots.push_back({});
+            continue;
+        }
+        if (info && info->minimized) {
+            TextStyle st = Align(AlignCenter);
+            st.wrap = true;
+            ui_.Text(shot.Inset(8), tr(L"최소화된 창입니다 · 녹화를 시작하면 복원됩니다"), 12.f, TextFaint, st);
+        }
+        shots.push_back(shot);
+    }
+    thumbWanted_ = !shots[0].Empty();
+    thumbArea_ = shots[0];
+    for (size_t i = 1; i < n; ++i)
+        if (!shots[i].Empty()) thumbCells_.push_back({picks_[i], shots[i]});
+    for (const Rect& r : shots)
+        if (!r.Empty()) ui_.NativeLayer(r);  // from here on, only floats may be drawn over them
+}
+
 void App::DrawVideoResult(Rect preview) {
+    if (lastVideos_.size() > 1) {
+        DrawVideoResults(preview);
+        return;
+    }
     Rect card = VideoCardRect(preview);
     float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
     card = card.Offset(0, (1 - a) * 12);
@@ -1001,6 +1112,58 @@ void App::DrawVideoResult(Rect preview) {
     ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), sub, 12.f, TextDim);
 }
 
+// 여러 창 녹화's card: a header with 폴더, then each window's file with its own 편집 (the first one's the main button).
+void App::DrawVideoResults(Rect preview) {
+    const size_t n = lastVideos_.size();
+    Rect card = VideoCardRect(preview, n);
+    float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
+    card = card.Offset(0, (1 - a) * 12);
+    ui_.Fill(card.Offset(0, 3), WithAlpha(Shadow, 0.4f * a), 12);
+    ui_.Fill(card, WithAlpha(P.SavedCard, 0.97f * a), 12);
+    ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
+    Rect in = card.Inset(14, 8);
+    Rect head = in.CutTop(kCardHead);
+    Rect close = head.CutRight(28);
+    if (ui_.IconButton(HashId("vres.close"), Rect::Centered(close.CX(), close.CY(), 28, 28), icon::Close, tr(L"닫기"),
+                       true, 11.f))
+        showVideo_ = false;
+    head.CutRight(6);
+    Rect folder = head.CutRight(76);
+    if (ui_.Button(HashId("vres.folder"), Rect::Centered(folder.CX(), folder.CY(), 76, 32), tr(L"폴더"),
+                   BtnStyle::Secondary, icon::Folder, true, 12.f))
+        util::OpenFolderAndSelect(lastVideos_[0].r.path);
+    head.CutRight(12);
+    Rect icon = head.CutLeft(28);
+    ui_.Circle(icon.CX(), icon.CY(), 12, WithAlpha(Success, 0.2f));
+    ui_.Icon(icon, icon::Check, 12.f, Success);
+    head.CutLeft(8);
+    double longest = 0;
+    for (const SavedVideo& v : lastVideos_) longest = std::max(longest, v.r.seconds);
+    ui_.Text(head, util::Format(tr(L"창 %zu개를 저장했습니다"), n) + L" · " + util::FormatClock(longest, false), 13.f,
+             TextColor, Bold());
+    const float rh = CardRowH(preview, n);
+    for (size_t i = 0; i < n; ++i) {
+        const CaptureResult& r = lastVideos_[i].r;
+        Rect row = in.CutTop(rh);
+        ui_.Fill(Rect(row.l, row.t, row.r, row.t + 1), WithAlpha(Success, 0.22f * a));
+        Rect btn = row.CutRight(76);
+        if (ui_.Button(HashId("vres.edit", (uint32_t)i), Rect::Centered(btn.CX(), btn.CY(), 76, std::min(32.f, rh - 6)),
+                       tr(L"편집"), i ? BtnStyle::Secondary : BtnStyle::Primary, icon::Cut, true, 12.f))
+            EditVideoAt(i);
+        row.CutRight(10);
+        row.CutLeft(36);
+        // The early end and the CPU's encoding in words; the CPU in amber (the graphics card had no encoder left).
+        const bool cpu = settings_.vHardware && !r.hardware && !r.encoder.empty();
+        std::wstring sub = util::FormatClock(r.seconds, false) + L" · " + util::FormatBytes(r.bytes) +
+                           (r.audio ? tr(L" · 소리 포함") : tr(L" · 소리 없음"));
+        if (lastVideos_[i].early) sub += tr(L" · 닫혀서 먼저 끝남");
+        if (cpu) sub += tr(L" · CPU로 인코딩함 (그래픽카드 인코더가 모자람)");
+        const float mid = row.CY();
+        ui_.Text(Rect(row.l, row.t + 2, row.r, mid + 1), util::FileNameOf(r.path), 13.f, TextColor, Bold());
+        ui_.Text(Rect(row.l, mid + 1, row.r, row.b - 2), sub, 12.f, cpu ? Warning : TextDim);
+    }
+}
+
 void App::DrawCapturePanel(Rect r) {
     ui_.Fill(r, Surface, 14);
     ui_.Stroke(r.Inset(0.5f), Border, 14);
@@ -1024,7 +1187,21 @@ void App::DrawCapturePanel(Rect r) {
 
     // Info row: what + resulting size.
     Rect row = controls.CutTop(24);
-    if (ready) {
+    if (src == kSourceWindow && MultiPicking()) {
+        // 여러 창 녹화: how many, each at its own size; always through their windows.
+        if (picks_.empty()) {
+            ui_.Text(row, tr(L"체크한 창 없음"), 14.f, TextFaint, Bold());
+        } else {
+            const std::wstring badge = tr(L"창 캡처"), each = tr(L"창마다 제 크기로 따로 저장");
+            float bw = ui_.Measure(badge, 11.5f) + 16, ew = ui_.Measure(each, 12.5f) + 4;
+            Rect b = Rect::XYWH(row.r - bw, row.CY() - 11, bw, 22);
+            ui_.Fill(b, WithAlpha(AccentHi, 0.15f), 11);
+            ui_.Text(b, badge, 11.5f, AccentHi, Bold(AlignCenter));
+            ui_.Text(Rect(b.l - ew - 10, row.t, b.l - 10, row.b), each, 12.5f, TextDim, Align(AlignEnd));
+            ui_.Text(Rect(row.l, row.t, b.l - ew - 20, row.b), util::Format(tr(L"창 %zu개"), picks_.size()), 14.f,
+                     TextColor, Bold());
+        }
+    } else if (ready) {
         std::wstring title;
         std::wstring badge = tr(L"창 캡처");
         D2D1_COLOR_F badgeColor = AccentHi;
@@ -1145,10 +1322,13 @@ void App::DrawCapturePanel(Rect r) {
             ui_.Icon(Rect::XYWH(then.l, then.t, 14, then.H()), icon::Warning, 11.f, Warning);
             ui_.Text(Rect(then.l + 18, then.t, then.r, then.b), warnLine, 12.5f, Warning);
         } else {
-            ui_.Text(then, tr(L"녹화를 멈추면 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다."), 12.5f, TextFaint);
+            ui_.Text(then, MultiPicking() ? tr(L"녹화를 멈추면 창마다 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다.")
+                                          : tr(L"녹화를 멈추면 파일로 저장됩니다. ‘편집’을 누르면 편집 탭에서 엽니다."),
+                     12.5f, TextFaint);
         }
     } else {
-        ui_.Text(cap, tr(L"녹화를 멈추면 편집 탭이 열립니다."), 12.5f, TextFaint);
+        ui_.Text(cap, MultiPicking() ? tr(L"녹화를 멈추면 첫 창이 편집 탭에 열립니다.") : tr(L"녹화를 멈추면 편집 탭이 열립니다."),
+                 12.5f, TextFaint);
         DrawTimerChip(then);
         ui_.Text(then, tr(L"거기서 자르고 저장하세요."), 12.5f, TextFaint);
     }
@@ -2165,7 +2345,9 @@ void App::DrawReplayMenus(Rect client) {
     };
     std::vector<Item> items;
     if (rpProgMenu_ >= 0) items = {{tr(L"목록에서 빼기"), false}};
-    if (rpFileMenu_ >= 0) items = {{tr(L"이름 바꾸기"), false}, {tr(L"휴지통으로 버리기"), true}};
+    if (rpFileMenu_ >= 0)
+        items = {{tr(L"이름 바꾸기"), false},
+                 {settings_.deleteMode == kDeleteNow ? tr(L"삭제") : tr(L"휴지통으로 버리기"), true}};
     float w = 0;
     for (const Item& it : items) w = std::max(w, ui_.Measure(it.text, 13.f) + 36);
     const float itemH = 34, pad = 5, h = pad * 2 + items.size() * itemH;
@@ -3331,8 +3513,9 @@ void App::DrawExportPanel(Rect r) {
             UiId id = HashId("ex.discard");
             if (ui_.Button(id, discard, video ? tr(L"삭제") : tr(L"버리기"), BtnStyle::Secondary, icon::Delete, true, 13.f))
                 ConfirmDiscard();
-            ui_.Tooltip(id, discard, video ? tr(L"이 동영상을 휴지통으로 옮깁니다 (Delete)")
-                                           : tr(L"이 녹화를 버립니다 (Delete)"));
+            ui_.Tooltip(id, discard, !video ? tr(L"이 녹화를 버립니다 (Delete)")
+                                     : settings_.deleteMode == kDeleteNow ? tr(L"이 동영상을 삭제합니다 (Delete)")
+                                                                          : tr(L"이 동영상을 휴지통으로 옮깁니다 (Delete)"));
         }
         if (ui_.Button(HashId("ex.saveas"), saveAs, tr(L"다른 이름으로 저장…"), BtnStyle::Secondary, 0, avail, 13.f))
             StartExport(true);
@@ -3584,6 +3767,15 @@ void App::SettingsGeneral(Rect& area, bool& changed) {
         ui_.Text(more.CutTop(16), hint, 12.f, warn ? Warning : TextFaint);
     }
 
+    // 편집 탭의 삭제 and the replay list's ⋯ both follow this; 저장하지 않은 움짤 has no file to move.
+    SettingRow(area, tr(L"삭제할 때"),
+               settings_.deleteMode == kDeleteNow ? tr(L"휴지통을 거치지 않고 지웁니다 · 되돌릴 수 없습니다")
+                                                  : tr(L"휴지통으로 옮깁니다 · 휴지통에서 되돌릴 수 있습니다"),
+               Language() == Lang::English ? 320.f : 260.f, [&](Rect c) {
+                   changed |= ui_.Segmented(HashId("set.delete"), c, {tr(L"휴지통으로 옮기기"), tr(L"바로 삭제")},
+                                            settings_.deleteMode);
+               });
+
     // A Windows contrast theme wins over the choice here.
     SettingRow(area, tr(L"테마"),
                Contrast() ? tr(L"Windows의 대비 테마가 켜져 있어서 그 색으로 그립니다.")
@@ -3663,7 +3855,7 @@ void App::AskReset() {
     q.danger = true;
     q.glyph = icon::Refresh;
     std::vector<std::wstring> back{tr(L"녹화 · 동영상 · 소리 · 내보내기 설정"),
-                                   tr(L"파일 이름 · 테마 · 언어 · 닫기 버튼 · 효과음 · 새 버전 확인"),
+                                   tr(L"파일 이름 · 삭제할 때 · 테마 · 언어 · 닫기 버튼 · 효과음 · 새 버전 확인"),
                                    tr(L"단축키") + std::wstring(L"  → ") + util::HotkeyToString(d.hkMods, d.hkVk) + L" · " +
                                        util::HotkeyToString(d.hkPauseMods, d.hkPauseVk)};
     std::vector<std::wstring> keep{tr(L"녹화한 파일 · 최근 파일 · 저장하지 않은 녹화"),
