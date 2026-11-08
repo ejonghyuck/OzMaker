@@ -2008,6 +2008,85 @@ int App::RunSelfTest(const std::wstring& dir) {
             if (!ok) ++failures;
             log((ok ? L"preview: ok   " : L"preview: FAIL ") + what);
         };
+        // 길이 (#70): the speed follows from the length and the range, it only ever shortens, and a next file starts whole.
+        {
+            auto lcheck = [&](bool ok, const std::wstring& what) {
+                if (!ok) ++failures;
+                log((ok ? L"length: ok   " : L"length: FAIL ") + what);
+            };
+            auto about = [](double a, double b) { return std::fabs(a - b) < 0.02; };
+            OpenEditor(MakeSyntheticClip(160, 90, 1500, 30));  // 50 s
+            fmt_ = (int)Format::Gif;
+            settings_.speedIdx = 3;
+            settings_.directionIdx = 0;
+            lcheck(lengthIdx_ == kLengthWhole && !LengthSpeed() && ExportSpeed() == 2.0, L"전체: 재생 속도 stays in charge");
+            PickLength(1);
+            lcheck(about(LengthSpeed(), 50.0 / 30) && ExportSpeed() == LengthSpeed() && PreviewRate() == ExportSpeed() &&
+                       MakeJob(settings_.scaleIdx, settings_.outFpsIdx, 0).speed == LengthSpeed(),
+                   util::Format(L"30초 of 50 s: %.2f×, and the preview and the job go by it", ExportSpeed()));
+            auto planned = [&] {
+                double ms = 0;
+                for (auto& p : PlanFrames(*clip_, inF_, outF_, 0, ExportSpeed(), settings_.directionIdx)) ms += p.durationMs;
+                return ms / 1000;
+            };
+            lcheck(about(planned(), 30), util::Format(L"30초 plans %.2f s", planned()));
+            PickLength(3);
+            lcheck(!LengthSpeed() && ExportSpeed() == 2.0, L"3분 of 50 s: not longer than the range");
+            PickLength(kLengthCustom);
+            lcheck(lengthCustom_ == 25 && about(LengthSpeed(), 2), L"직접 starts at half the range");
+            auto custom = [&](int s) {
+                lengthCustom_ = s;
+                return LengthSpeed();
+            };
+            custom(1);
+            lcheck(about(LengthSpeed(), 50) && about(planned(), 1), util::Format(L"직접 1 s: %.0f×, %.2f s", ExportSpeed(), planned()));
+            lcheck(!custom(0) && !custom(50) && !custom(600), L"직접 0 s, the whole 50 s and more: nothing");
+            custom(20);
+            outF_ = 299;  // 10 s
+            lcheck(!LengthSpeed(), L"a range too short for the row has no 길이");
+            outF_ = 1499;
+            settings_.directionIdx = 2;  // 부메랑: 100 s
+            custom(40);
+            lcheck(about(LengthSpeed(), 2.5) && std::fabs(planned() - 40) < 0.1,  // its ends aren't shown twice
+                   util::Format(L"부메랑 counts both ways: %.2f s", planned()));
+            settings_.directionIdx = 0;
+            // The clock goes on from where it is when the rate moves with the range.
+            custom(25);
+            playhead_ = 300;
+            playBack_ = false;
+            RestartClock();
+            playing_ = true;
+            playWall_ -= 0.5;  // 0.5 s at 2×: a second on
+            outF_ = 1199;      // 40 s: now 1.6×
+            size_t at = PlayheadFromClock();
+            lcheck(at >= 325 && at <= 345, util::Format(L"the rate moved: the playhead went on from frame 300 to %zu", at));
+            playing_ = false;
+            if (HasVideoProcessor()) {
+                // Saved and read back. The file is the length asked for, at the frame rate it had.
+                Exporter ex;
+                outF_ = 1499;
+                fmt_ = (int)Format::Mp4;
+                const int targets[] = {15, 30, 1, 49};
+                for (int target : targets) {
+                    custom(target);
+                    ExportJob job = MakeJob(0, 0, 0);
+                    job.path = dir + util::Format(L"\\length_%d.mp4", target);
+                    ExportResult r = ExportSync(ex, job);
+                    std::wstring err;
+                    auto v = r.ok ? VideoClip::Open(job.path, err) : nullptr;
+                    const double sec = v ? v->Seconds() : 0;
+                    const size_t frames = v ? v->Count() : 0;
+                    lcheck(v && std::fabs(sec - target) < 0.1 && (double)frames > target * 29.0 && (double)frames < target * 31.0,
+                           util::Format(L"saved at %d s: %.2f s, %zu frames %s", target, sec, frames, r.error.c_str()));
+                }
+                fmt_ = (int)Format::Gif;
+            }
+            settings_.speedIdx = 1;
+            CloseClip();
+            OpenEditor(MakeSyntheticClip(160, 90, 600, 30));
+            lcheck(lengthIdx_ == kLengthWhole && lengthCustom_ == 0, L"the next file starts whole");
+            CloseClip();
+        }
         OpenEditor(MakeSyntheticClip(320, 180, 60, 30));
         fmt_ = (int)Format::Gif;
         settings_.speedIdx = 1;
@@ -4008,6 +4087,23 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         estValid_ = true;
         shot(L"editor_mp4_reencode.png", 96);
         settings_.speedIdx = 1;
+        CloseClip();
+        // 길이 (#70): 4분 at 30초, 직접, longer than the range, and a clip with no row.
+        OpenEditor(MakeSyntheticClip(320, 180, 720, 3));
+        fmt_ = (int)Format::Mp4;
+        PickLength(1);
+        shot(L"editor_length.png", 96);
+        PickLength(kLengthCustom);
+        lengthCustom_ = 140;
+        shot(L"editor_length_custom.png", 96);
+        lengthCustom_ = 400;
+        shot(L"editor_length_over.png", 96);
+        settings_.exportDetails = true;
+        lengthCustom_ = 140;
+        exportScroll_ = 1000;
+        shot(L"editor_length_speed.png", 96);
+        settings_.exportDetails = false;
+        exportScroll_ = 0;
         CloseClip();
     } else {
         log(L"editor_mp4_copy.png: skipped, no test video (" + err + L")");
@@ -6926,6 +7022,30 @@ int App::RunEditorTest(const std::wstring& path, const std::wstring& dir) {
         settings_.deleteMode = kDeleteToBin;
     } else {
         check(false, L"copy for the 삭제 check");
+    }
+    // 길이 (#70): far above 재생 속도's 2× the preview keeps moving. Given a file long enough for the row.
+    {
+        std::wstring err;
+        auto long_ = VideoClip::Open(path, err);
+        if (long_ && long_->Seconds() > 16) {
+            const double seconds = long_->Seconds();
+            OpenEditor(long_);
+            pump(0.5);
+            for (double speed : {8.0, 40.0}) {
+                PickLength(kLengthCustom);
+                lengthCustom_ = std::max(1, (int)(seconds / speed));
+                SetPlaying(true);
+                size_t last = shown_;
+                int changes = 0;
+                pump(3.0, [&] {
+                    if (shown_ != last) ++changes;
+                    last = shown_;
+                    return false;
+                });
+                check(changes >= 15 && playing_, util::Format(L"length: at %.1f× the preview shows %.1f frames a second", ExportSpeed(), changes / 3.0));
+            }
+            CloseClip();
+        }
     }
     exporter_.Cancel();
     quitting_ = true;

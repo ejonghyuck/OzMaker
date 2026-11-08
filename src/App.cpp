@@ -2175,6 +2175,8 @@ void App::OpenEditor(std::shared_ptr<Clip> clip) {
     estValid_ = fitting_ = fitMissed_ = false;
     fitBitrate_ = 0;
     fitCorrection_ = 1;
+    lengthIdx_ = kLengthWhole;
+    lengthCustom_ = 0;
     // A video stays a video by default, an opened 움짤 starts in its own format and at 고화질 (#41), a recording
     // starts with the last 움짤 format.
     const bool video = clip_->IsVideo();
@@ -2684,6 +2686,7 @@ void App::ResetRange() {
 
 void App::RestartClock() {
     playWall_ = util::NowSeconds();
+    clockRate_ = PreviewRate();
     // Backwards a frame starts at its end.
     const size_t i = playhead_;
     playTs_ = !playBack_ ? clip_->Ts(i) : (i + 1 < clip_->Count() ? clip_->Ts(i + 1) : clip_->EndTs()) - 1;
@@ -2700,8 +2703,45 @@ void App::FollowDirection() {
     RestartClock();
 }
 
+double App::RangeSeconds() const {
+    if (!clip_) return 0;
+    const double s = (RangeEndTs() - clip_->Ts(inF_)) / 1e7;
+    return !IsVideoFormat(fmt_) && settings_.directionIdx == 2 ? s * 2 : s;
+}
+
+int App::LengthTarget() const {
+    return lengthIdx_ == kLengthWhole ? 0 : lengthIdx_ == kLengthCustom ? lengthCustom_ : kLengthSeconds[lengthIdx_];
+}
+
+double App::LengthSpeed() const {
+    const double range = RangeSeconds();
+    const int target = LengthTarget();
+    // Nothing above the range: it only gets shorter. A range too short for the row has no 길이 either.
+    return target >= 1 && target < range && range > kLengthSeconds[0] ? range / target : 0;
+}
+
+double App::ExportSpeed() const {
+    const double fit = LengthSpeed();
+    return fit ? fit : kSpeedOptions[settings_.speedIdx];
+}
+
+void App::PickLength(int idx) {
+    lengthIdx_ = idx;
+    if (idx == kLengthCustom && !lengthCustom_) lengthCustom_ = (int)(RangeSeconds() / 2);
+    hasResult_ = false;
+    Invalidate();
+}
+
 size_t App::PlayheadFromClock() {
     const double rate = PreviewRate();
+    // Under 길이 the rate moves with the range: what went by went at the rate before.
+    if (rate != clockRate_ && clockRate_ > 0) {
+        const double wall = util::NowSeconds();
+        const int64_t went = (int64_t)((wall - playWall_) * 1e7 * clockRate_);
+        playTs_ += playBack_ ? -went : went;
+        playWall_ = wall;
+    }
+    clockRate_ = rate;
     const bool boomerang = !shuttle_ && !IsVideoFormat(fmt_) && settings_.directionIdx == 2;
     const bool once = kLoopOptions[settings_.loopIdx] == 1;
     int64_t start = clip_->Ts(inF_), end = RangeEndTs();
@@ -2805,7 +2845,7 @@ double App::EffectiveOutFps(int outFpsIdx) const {
 bool App::ExportAudio() const {
     auto* video = dynamic_cast<const VideoClip*>(clip_.get());
     return IsVideoFormat(fmt_) && exportAudio_ && video && video->HasAudio() && video->AudioExportable() &&
-           kSpeedOptions[settings_.speedIdx] == 1.0;
+           ExportSpeed() == 1.0;
 }
 
 int App::ExportQuality() const {
@@ -2819,7 +2859,7 @@ const wchar_t* App::CopyBlocker() const {
     if (settings_.scaleIdx != 0 || settings_.outFpsIdx != 0) return tr(L"크기나 프레임 레이트를 바꿔서");
     if (crop_.left != 0 || crop_.top != 0 || crop_.right != clip_->Width() || crop_.bottom != clip_->Height())
         return tr(L"화면을 잘라서");
-    if (kSpeedOptions[settings_.speedIdx] != 1.0) return tr(L"재생 속도를 바꿔서");
+    if (ExportSpeed() != 1.0) return LengthSpeed() ? tr(L"길이를 줄여서") : tr(L"재생 속도를 바꿔서");
     if (!caption_.empty()) return tr(L"자막을 넣어서");
     return L"";
 }
@@ -3128,7 +3168,7 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
     job.crop = crop_;
     OutputSize(job.outW, job.outH, scaleIdx);
     job.fpsLimit = EffectiveOutFps(outFpsIdx);
-    job.speed = kSpeedOptions[settings_.speedIdx];
+    job.speed = ExportSpeed();
     job.format = (Format)fmt_;
     job.plays = kLoopOptions[settings_.loopIdx];
     job.holdLastMs = settings_.holdLast ? kHoldLastMs : 0;
@@ -3160,8 +3200,8 @@ ExportJob App::MakeJob(int scaleIdx, int outFpsIdx, int quality) const {
 }
 
 std::wstring App::ContentKey() const {
-    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %d %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top,
-                        crop_.right, crop_.bottom, fmt_, settings_.speedIdx, settings_.targetIdx, settings_.gifLossy,
+    return util::Format(L"%p %zu %zu %d,%d,%d,%d %d %.4f %d %d %d", clip_.get(), inF_, outF_, crop_.left, crop_.top,
+                        crop_.right, crop_.bottom, fmt_, ExportSpeed(), settings_.targetIdx, settings_.gifLossy,
                         settings_.directionIdx) +
            util::Format(L" %d ", captionPos_) + caption_;
 }
@@ -3225,7 +3265,7 @@ void App::StartFit() {
         return wa > wb;
     });
     // What each frame-rate choice really gives (a cap above the clip's own rate changes nothing).
-    const double speed = kSpeedOptions[settings_.speedIdx];
+    const double speed = ExportSpeed();
     auto outRate = [&](int i) {
         if (IsVideoFormat(f)) return EffectiveOutFps(i);
         auto plan = PlanFrames(*clip_, inF_, outF_, EffectiveOutFps(i), speed);

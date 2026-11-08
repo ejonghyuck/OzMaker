@@ -66,6 +66,9 @@ std::wstring GapWhen(const CaptureGap& g) {
 // The screenshots taken during that recording (#63), over its card.
 Rect ShotCardRect(const Rect& video) { return Rect(video.l, video.t - 8 - 56, video.r, video.t - 8); }
 
+// A speed to read: 8, 2.7.
+double ShownSpeed(double s) { return s >= 10 ? std::round(s) : std::round(s * 10) / 10; }
+
 // A file name pattern with its tokens in the UI's language: both work, the field shows these.
 std::wstring NameInLanguage(std::wstring_view p) {
     const int l = Language() == Lang::English ? 1 : 0;
@@ -956,6 +959,30 @@ void App::DrawMonitorLayout(Rect r, const RECT* region, bool pickable) {
         Rect rr = map(*region);
         ui_.Fill(rr, WithAlpha(Accent, 0.28f), 2);
         ui_.Stroke(rr, Accent, 2, 1.5f);
+    }
+}
+
+// 길이 (#70): 직접, in 분 and 초.
+void App::LengthFields(Rect r) {
+    const int values[2] = {lengthCustom_ / 60, lengthCustom_ % 60};
+    const wchar_t* units[2] = {tr(L"분"), tr(L"초")};
+    const wchar_t* names[2] = {tr(L"길이의 분"), tr(L"길이의 초")};
+    bool typed = false;
+    for (int i = 0; i < 2; ++i) {
+        const UiId id = HashId("len.field", i);
+        if (ui_.FocusedField() != id) lengthText_[i] = std::to_wstring(values[i]);  // as typed only while typing
+        if (ui_.TextField(id, r.CutLeft(56), lengthText_[i], L"0", i ? 2 : 3)) {
+            std::erase_if(lengthText_[i], [](wchar_t c) { return c < L'0' || c > L'9'; });
+            typed = true;
+        }
+        ui_.Describe(id, names[i], Role::Edit);
+        r.CutLeft(8);
+        ui_.Text(r.CutLeft(ui_.Measure(units[i], 13.f) + 4), units[i], 13.f, TextDim);
+        r.CutLeft(14);
+    }
+    if (typed) {
+        lengthCustom_ = _wtoi(lengthText_[0].c_str()) * 60 + std::min(_wtoi(lengthText_[1].c_str()), 59);
+        hasResult_ = false;
     }
 }
 
@@ -3061,7 +3088,7 @@ void App::DrawTransport(Rect r) {
     }
     if (clip_->HasAudio()) {
         Rect volR = r.CutLeft(34);
-        bool slow = kSpeedOptions[settings_.speedIdx] != 1.0;
+        bool slow = ExportSpeed() != 1.0;
         const int vol = previewMute_ ? 0 : settings_.previewVolume;
         const wchar_t* tip = slow ? tr(L"재생 속도가 1×일 때만 소리가 나옵니다")
                              : vol == 0 ? tr(L"미리보기 소리 켜기") : tr(L"미리보기 소리 끄기");
@@ -3277,7 +3304,7 @@ void App::DrawExportPanel(Rect r) {
     Format fmt = (Format)fmt_;
     const bool mp4 = fmt == Format::Mp4, webm = fmt == Format::WebM;
     const bool isVideo = IsVideoFormat(fmt);  // MP4 or WebM: a constant rate, sound, always forward
-    const double speed = kSpeedOptions[settings_.speedIdx];
+    const double speed = ExportSpeed();
     int ow = 0, oh = 0;
     OutputSize(ow, oh);
     double fpsLimit = EffectiveOutFps(), outSec = 0, outFps = 0;
@@ -3431,6 +3458,43 @@ void App::DrawExportPanel(Rect r) {
         in.CutTop(8);
     }
 
+    // 길이 (#70): how long the result lasts; the speed follows from it. Only where there is something to shorten.
+    if (const double range = RangeSeconds(); range > kLengthSeconds[0]) {
+        const std::wstring from = util::FormatClock(range, false);
+        const double fit = LengthSpeed();
+        Rect l = in.CutTop(20);
+        ui_.Text(l, tr(L"길이"), 12.5f, TextDim);
+        ui_.Name(tr(L"길이"));
+        ui_.Text(l, fit ? util::Format(tr(L"%s → %s · %g배"), from.c_str(), util::FormatClock(LengthTarget(), false).c_str(),
+                                       ShownSpeed(fit))
+                        : from,
+                 12.5f, TextColor, Bold(AlignEnd));
+        in.CutTop(4);
+        unsigned tooLong = 0;
+        for (int i = 0; i < (int)std::size(kLengthSeconds); ++i)
+            if (kLengthSeconds[i] >= range) tooLong |= 1u << i;
+        int idx = lengthIdx_;
+        if (ui_.Segmented(HashId("ex.len"), in.CutTop(32),
+                          {tr(L"15초"), tr(L"30초"), tr(L"60초"), tr(L"3분"), tr(L"전체"), tr(L"직접")}, idx, tooLong)) {
+            PickLength(idx);
+            changed = true;
+            if (idx == kLengthCustom) ui_.Focus(HashId("len.field", 0));
+        }
+        if (lengthIdx_ == kLengthCustom) {
+            in.CutTop(8);
+            LengthFields(in.CutTop(32));
+        }
+        in.CutTop(4);
+        const int target = LengthTarget();
+        const bool whole = lengthIdx_ == kLengthWhole, bad = !whole && !LengthSpeed();
+        const std::wstring note = whole        ? tr(L"구간 전체를 그대로 씁니다.")
+                                  : target < 1 ? tr(L"1초 이상을 넣으세요.")
+                                  : bad        ? util::Format(tr(L"구간(%s)보다 길게는 안 됩니다. 줄이기만 합니다."), from.c_str())
+                                               : tr(L"원본은 그대로 두고 새 파일로 저장합니다.");
+        hintText(note.c_str(), bad ? Warning : TextFaint);
+        in.CutTop(8);
+    }
+
     // 용량 맞추기: size, frame rate and quality (MP4, WebM: the bitrate) are picked to land under the size.
     {
         const bool missed = target && fitMissed_ && !fitting_;
@@ -3501,7 +3565,7 @@ void App::DrawExportPanel(Rect r) {
         part(util::Format(L"%d×%d", ow, oh));
         part(isVideo && settings_.vFrameMode == 1 ? util::Format(tr(L"%.0ffps 가변"), outFps)
                                                   : util::Format(L"%.0ffps", outFps));
-        part(util::Format(L"%g×", speed));
+        part(util::Format(L"%g×", ShownSpeed(speed)));
         if (direction) part(direction == 1 ? tr(L"거꾸로") : tr(L"부메랑"));
         if (!isVideo) part(tr(kLoopNames[settings_.loopIdx]));
         if (!isVideo && settings_.holdLast) part(tr(L"끝에서 멈춤"));
@@ -3583,10 +3647,11 @@ void App::DrawExportPanel(Rect r) {
                              settings_.outFpsIdx));
         in.CutTop(8);
 
-        label(tr(L"재생 속도"), {});
+        const bool byLength = LengthSpeed() > 0;
+        label(tr(L"재생 속도"), byLength ? tr(L"길이에 맞춤") : L"");
         int prevSpeed = settings_.speedIdx;
         if (ui_.Segmented(HashId("ex.speed"), in.CutTop(32), {L"0.5×", L"1×", L"1.5×", L"2×"},
-                          settings_.speedIdx)) {
+                          settings_.speedIdx, byLength ? 0b1111u : 0u)) {
             changed = true;
             // Re-base the preview clock so the playhead doesn't jump.
             std::swap(prevSpeed, settings_.speedIdx);

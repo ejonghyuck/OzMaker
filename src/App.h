@@ -292,8 +292,19 @@ private:
     void RestartClock();    // the preview clock from the playhead, now
     void FollowDirection();  // after the format or 재생 방향 changed
     bool PreviewBackwards() const;  // normal playback starts backwards (거꾸로)
-    double PreviewRate() const { return shuttle_ ? std::abs(shuttle_) : kSpeedOptions[settings_.speedIdx]; }
+    double PreviewRate() const { return shuttle_ ? std::abs(shuttle_) : ExportSpeed(); }
+    // 길이 (#70): the range sped up to last as long as picked. What it comes to if it plays through once (부메랑 twice).
+    double RangeSeconds() const;
+    int LengthTarget() const;    // seconds, 0 = 전체
+    double LengthSpeed() const;  // the speed that gives it; 0 where it doesn't apply
+    double ExportSpeed() const;  // that, or 재생 속도
+    void PickLength(int idx);
+    void LengthFields(Rect r);   // 직접: 분 and 초
     size_t PlayheadFromClock();
+    double clockRate_ = 0;  // what the clock runs at since playWall_: the rate follows the range under 길이
+    int lengthIdx_ = kLengthWhole;  // of this file: a next one starts whole
+    int lengthCustom_ = 0;          // 직접, seconds
+    std::wstring lengthText_[2];    // 분 and 초 as typed
     int64_t RangeEndTs() const;
     void OutputSize(int& w, int& h, int scaleIdx = -1) const;  // -1 = the current setting
     double EffectiveOutFps(int outFpsIdx = -1) const;
