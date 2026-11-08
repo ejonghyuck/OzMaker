@@ -30,6 +30,9 @@ inline int NameTokenAt(std::wstring_view p, size_t i, size_t& len) {
 }
 inline constexpr int kOutFpsOptions[] = {0, 30, 25, 20, 15, 10};  // 0 = as recorded
 inline constexpr double kSpeedOptions[] = {0.5, 1.0, 1.5, 2.0};
+// 길이 in the export panel (#70): seconds, then 전체 and 직접.
+inline constexpr int kLengthSeconds[] = {15, 30, 60, 180};
+inline constexpr int kLengthWhole = 4, kLengthCustom = 5;
 // 화질 in the export panel (고화질, 보통, 저용량): the size (kExportSizes) and frame rate (kOutFpsOptions) for 움짤 and
 // for MP4, and the GIF lossy level.
 struct ExportPreset {

@@ -81,7 +81,8 @@ OzMaker.exe --test-window <sec> cover <x> <y> <w> <h>   # 그 자리에 흰 창(
 OzMaker.exe --analyze <file.mp4> <dir> [freq ...]   # MP4 길이·프레임 간격·테스트 톤 크기 측정
 OzMaker.exe --video-test <dir> [w h]  # 합성 MP4로 색인·디코딩·구간 자르기(프레임 번호·소리 경계, MP4와 WebM) 검사
 OzMaker.exe --encoder-test <dir>      # 녹화용 MP4를 HEVC · CBR · 2474×1392 등 설정마다 1초씩 써 보고, 고른 인코더와 실패한 호출을 기록
-OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드(S로 프레임 이미지) → 잘라서 저장
+OzMaker.exe --editor-test <file.mp4> <dir>   # 실제 창에서 저장된 동영상 → 편집 → 키보드(S로 프레임 이미지) → 잘라서 저장,
+                                      # 16초보다 긴 파일이면 길이 맞추기로 빠르게 재생해도 미리 보기가 움직이는지도 확인
 OzMaker.exe --region-test <dir>       # 영역 지정 후 다듬기(손잡이·비율·키보드), 막대(카운트다운·영역만 저장·녹화), 직전 영역
 OzMaker.exe --preview-test <dir>      # 화면에서 확인: 파일 목록이 창 미리보기 위에 보이는지, 다른 프로그램 창이 목록에 바로 반영되는지
 OzMaker.exe --replay-test <dir>       # 순간 리플레이: 합성 영상으로 링 버퍼의 자르기(길이 · 첫 키프레임 · 소리 맞춤, 하드웨어와 소프트웨어),
