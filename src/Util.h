@@ -13,6 +13,8 @@ double NowSeconds();
 
 std::wstring FormatClock(double seconds, bool tenths);   // 0:12.3 / 1:02:03
 std::wstring FormatSpan(double seconds);                 // 45초 / 38분 / 1시간 20분
+std::wstring FormatLength(double seconds);               // 24초 / 1분 / 3분 12초
+std::wstring FormatCount(uint64_t n);                    // 5,781
 std::wstring FormatBytes(uint64_t bytes);
 std::wstring Format(const wchar_t* fmt, ...);
 
@@ -38,7 +40,8 @@ bool PickFolder(HWND owner, const std::wstring& initial, std::wstring& out);
 bool PickSavePath(HWND owner, const std::wstring& dir, const std::wstring& name,
                   const wchar_t* ext, const wchar_t* filterName, std::wstring& out);
 bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out);
-bool PickExeFile(HWND owner, std::wstring& out);  // a program (.exe), for 순간 리플레이's list
+bool PickExeFile(HWND owner, std::wstring& out, const wchar_t* title);  // a program (.exe), for a list of them
+bool PickVideoFiles(HWND owner, const std::wstring& dir, const wchar_t* title, std::vector<std::wstring>& out);
 // By the extension: a video, or a 움짤 (GIF, WebP, AVIF). The editor opens both.
 bool IsVideoPath(const std::wstring& path);
 bool IsAnimPath(const std::wstring& path);

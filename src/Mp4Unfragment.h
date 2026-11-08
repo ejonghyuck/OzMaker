@@ -6,8 +6,8 @@ namespace mp4 {
 // place: a new moov at the end holds the sample tables of every fragment, and the fragment boxes become `free`. No
 // sample data moves, so it takes a moment however long the recording is. A file a crash cut short keeps every sample
 // that is whole on disk. A plain file stays as it is; a conversion that was stopped halfway is finished.
-// `empty`: the file holds no samples at all.
-bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty = nullptr);
+// `empty`: the file holds no samples at all. `timelapse`: the new moov says it is one (#71).
+bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty = nullptr, bool timelapse = false);
 
 // Variable frame rate (#55): how long each video frame of a plain MP4 lasts, in 100 ns and the order written, so the
 // file has the times OzMaker meant whatever the encoder made of them, and the video starts with the sound. A new moov

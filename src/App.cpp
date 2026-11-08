@@ -87,6 +87,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     Fonts::Init(gfx_.DWrite());
     overlay_.Init(inst, gfx_.D2D());
     rpNotice_.Init(inst, gfx_.D2D());
+    askCard_.Init(inst, gfx_.D2D());
     picker_.Init(inst, gfx_.D2D());
     regionPicker_.Init(inst, gfx_.D2D());
 
@@ -112,6 +113,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--replay-test") return RunReplayTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--multi-test") return RunMultiTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--safety-test") return RunSafetyTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--timelapse-test") return RunTimelapseTest(args[1], args.size() >= 3 && args[2] == L"crash");
     if (args.size() >= 7 && args[0] == L"--test-window" && args[2] == L"cover") {
         const int x = _wtoi(args[3].c_str()), y = _wtoi(args[4].c_str());
         const RECT r{x, y, x + _wtoi(args[5].c_str()), y + _wtoi(args[6].c_str())};
@@ -135,6 +137,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     // The PC locking or going to sleep lets go of what 순간 리플레이 held.
     WTSRegisterSessionNotification(hwnd_, NOTIFY_FOR_THIS_SESSION);
     if (settings_.rpOn) SetReplayOn(true, false);  // on as it was left
+    TlAskArm();
     updater_.Init(util::ExePath(), hwnd_, WM_APP_UPDATE);
     SetTimer(hwnd_, kTimerUpdate, 15000, nullptr);  // the first check, once startup is out of the way
     if (updated) {
@@ -198,6 +201,15 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
 
 // The first of the files dragged over the window. While they are over it, the whole window says what dropping them
 // would do (DrawDropCue); a video or a 움짤 can be dropped.
+namespace {
+std::wstring JoinDay(const SYSTEMTIME& t) {
+    static const wchar_t* const kMonths[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
+                                             L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    return Language() == Lang::English ? util::Format(L"%s %d", kMonths[(t.wMonth + 11) % 12], t.wDay)
+                                       : util::Format(L"%d월 %d일", t.wMonth, t.wDay);
+}
+}  // namespace
+
 class App::DropTarget : public IDropTarget {
 public:
     explicit DropTarget(App* app) : app_(app) {}
@@ -218,11 +230,14 @@ public:
     }
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
         path_.clear();
+        more_.clear();
         FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
         STGMEDIUM med{};
         if (data && SUCCEEDED(data->GetData(&fmt, &med))) {
             wchar_t p[MAX_PATH * 4];
             if (DragQueryFileW((HDROP)med.hGlobal, 0, p, _countof(p)) > 0) path_ = p;
+            for (UINT i = 1, n = DragQueryFileW((HDROP)med.hGlobal, 0xFFFFFFFF, nullptr, 0); i < n; ++i)
+                if (DragQueryFileW((HDROP)med.hGlobal, i, p, _countof(p)) > 0) more_.push_back(p);
             ReleaseStgMedium(&med);
         }
         app_->dragKind_ = path_.empty() ? DragKind::None : app_->ClassifyDrop(path_);
@@ -248,6 +263,7 @@ public:
         // After DoDragDrop returns in the program the file came from: Explorer stays usable while it opens.
         if (open) {
             app_->pendingOpen_ = path_;
+            app_->pendingMore_ = more_;
             PostMessageW(app_->hwnd_, WM_APP_OPEN, 0, 0);
         }
         return S_OK;
@@ -257,6 +273,7 @@ private:
     App* app_;
     ULONG refs_ = 1;
     std::wstring path_;
+    std::vector<std::wstring> more_;
 };
 
 ComPtr<IDropTarget> App::MakeDropTarget() {
@@ -848,6 +865,8 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                 }
             } else if (w == kTimerReplay) {
                 ReplayTick();
+            } else if (w == kTimerAsk) {
+                TlAskTick();
             } else if (w == kTimerAnimLoad) {
                 if (animLoad_ && !animLoad_->done) ShowAnimProgress();
             } else if (w == kTimerUpdate) {
@@ -886,16 +905,25 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         case WM_APP_OPEN:
-            if (!pendingOpen_.empty()) OpenMediaFile(std::exchange(pendingOpen_, {}));
+            if (!pendingOpen_.empty()) {
+                std::vector<std::wstring> paths = std::exchange(pendingMore_, {});
+                paths.insert(paths.begin(), std::exchange(pendingOpen_, {}));
+                OpenDropped(std::move(paths));
+            }
             return 0;
         case WM_DROPFILES: {
             auto drop = (HDROP)w;
             wchar_t path[MAX_PATH * 4];
-            bool got = DragQueryFileW(drop, 0, path, _countof(path)) > 0;
+            std::vector<std::wstring> paths;
+            for (UINT i = 0, n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0); i < n; ++i)
+                if (DragQueryFileW(drop, i, path, _countof(path)) > 0) paths.push_back(path);
             DragFinish(drop);
-            if (got) OpenMediaFile(path);
+            if (!paths.empty()) OpenDropped(std::move(paths));
             return 0;
         }
+        case WM_APP_JOIN_DONE:
+            OnJoinDone();
+            return 0;
         case WM_APP_QUIT:
             quitting_ = true;
             DestroyWindow(hwnd_);
@@ -909,10 +937,12 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_CAPTURE_CLOSED:
             // lParam: which of the recording's captures (1-based); its window went away or its encoder failed.
             if (rec_ == RecState::Recording) {
-                if (l > 0 && (size_t)l <= recs_.size())
+                if (l > 0 && (size_t)l <= recs_.size()) {
+                    recs_[(size_t)l - 1].closed = w == 0;
                     EndRecSession((size_t)l - 1);
-                else
+                } else {
                     StopRecording();
+                }
             }
             return 0;
         case WM_APP_IMAGE_DONE:
@@ -934,6 +964,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (w == WTS_SESSION_LOCK || w == WTS_SESSION_UNLOCK) {
                 rpLocked_ = w == WTS_SESSION_LOCK;
                 RecGapUpdate();
+                RecPauseUpdate();
                 if (rpLocked_)
                     ReplayClear();
                 else
@@ -944,10 +975,12 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             if (w == PBT_APMSUSPEND) {
                 rpAsleep_ = true;
                 RecGapUpdate();
+                RecPauseUpdate();
                 ReplayClear();
             } else if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
                 rpAsleep_ = false;
                 RecGapUpdate();
+                RecPauseUpdate();
                 ReplayTick();
             }
             return TRUE;
@@ -1044,6 +1077,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
             overlay_.Hide();
             exporter_.Cancel();
             animLoad_.reset();  // stops and waits for it
+            join_.reset();
             StopThumbnails();
             audioPreview_.Stop();
             fetcher_.Stop();
@@ -1322,12 +1356,13 @@ void App::PlannedSize(int sw, int sh, int& ow, int& oh, bool* hevc) const {
     double f = 1.0;
     int longE = std::max(1, std::max(sw, sh)), shortE = std::max(1, std::min(sw, sh));
     bool useHevc = false;
-    if (settings_.output == kOutputVideo) {
+    if (settings_.output != kOutputClip) {
         if (int res = kVideoResOptions[settings_.vResIdx]) {
             f = std::min(f, res * 16.0 / 9.0 / longE);
             f = std::min(f, (double)res / shortE);
         }
-        useHevc = UseHevc((int)std::lround(longE * f));
+        // A timelapse stays H.264: HEVC isn't fragmented, and a crash would take hours of it.
+        useHevc = settings_.output == kOutputVideo && UseHevc((int)std::lround(longE * f));
         f = std::min(f, (useHevc ? 8192.0 : 4096.0) / longE);
     } else if (int maxE = kSizeOptions[settings_.sizeIdx]) {
         f = std::min(f, (double)maxE / longE);
@@ -1451,7 +1486,8 @@ void App::StartRecording(const std::vector<RecTarget>& targets, bool fromHotkey)
         return;
     }
     const RecTarget& lead = recs_[0].target;
-    recVideo_ = settings_.output == kOutputVideo;
+    recVideo_ = settings_.output != kOutputClip;
+    recTl_ = settings_.output == kOutputTimelapse;
     if (lead.source == kSourceWindow) {
         for (RecSession& s : recs_)
             if (IsIconic(s.target.hwnd)) {
@@ -1533,21 +1569,21 @@ void App::BeginCapture() {
         o.monitor = t.monitor;
         o.region = t.rect;
         o.clientOnly = settings_.clientOnly;
-        o.cursor = settings_.cursor;
-        o.clickFx = settings_.clickFx;
+        o.cursor = recTl_ ? settings_.tlCursor : settings_.cursor;
+        o.clickFx = settings_.clickFx && !recTl_;
         if (recVideo_) {
             VideoOptions v;
             std::wstring base = settings_.outDir + L"\\" + RecFileStem(s.name, several);
             v.path = base + L".mp4";
             for (int i = 2; taken(v.path); ++i) v.path = base + util::Format(L"_%d.mp4", i);
             paths.push_back(v.path);
-            o.fps = kVideoFpsOptions[settings_.vFpsIdx];
+            o.fps = recTl_ ? kTlFps : kVideoFpsOptions[settings_.vFpsIdx];
             v.video = VideoSettings(o.fps);
             int sw = 0, sh = 0, ow = 0, oh = 0;
             SourceSize(t, sw, sh);
             PlannedSize(sw, sh, ow, oh, &v.video.hevc);  // 자동: HEVC past 4096 (#42)
-            v.sound = settings_.audio;
-            v.mic = settings_.mic;
+            v.sound = settings_.audio && !recTl_;
+            v.mic = settings_.mic && !recTl_;
             v.micDevice = settings_.micDevice;
             v.micGain = settings_.micVolume / 100.f;
             v.audio.sampleRate = kAudioRateOptions[settings_.aRateIdx];
@@ -1563,6 +1599,14 @@ void App::BeginCapture() {
                 }
             }
             v.audio.enabled = v.sound || v.mic;
+            if (recTl_) {
+                o.intervalMs = tlMsForTest_ ? tlMsForTest_ : settings_.TlInterval() * 1000;
+                o.skipStill = settings_.tlSkip;
+                v.video.vfr = false;
+                v.video.gopFrames = 150;  // measured: half the size of 30, and a crash loses no more for it
+                v.video.quality = 95;
+                v.video.timelapse = true;
+            }
             o.maxEdge = v.video.hevc ? 8192 : 4096;  // encoder limits
             if (int res = kVideoResOptions[settings_.vResIdx]) {
                 o.boxShort = res;
@@ -1626,6 +1670,10 @@ void App::BeginCapture() {
     recGaps_.clear();
     recGap_.reset();
     KeepAwake();
+    recFrom_ = (int64_t)time(nullptr);
+    tlChecked_ = tlBlack_ = false;
+    tlThumb_.Reset();
+    tlThumbAt_ = 0;
     timerFiredFor_ = 0;
     nextDiskCheck_ = util::NowSeconds() + 2;
     SetRecordingLook(true);
@@ -1652,7 +1700,7 @@ void App::BeginCapture() {
 }
 
 void App::KeepAwake() {
-    const bool want = rec_ == RecState::Recording && !recPaused_;
+    const bool want = rec_ == RecState::Recording && !RecResting();
     if (want == awake_) return;
     awake_ = want;
     SetThreadExecutionState(want ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED : ES_CONTINUOUS);
@@ -1668,6 +1716,84 @@ void App::RecGapUpdate() {
         recGaps_ = RecGaps();
         recGap_.reset();
     }
+}
+
+bool App::RecResting() const {
+    for (const RecSession& s : recs_)
+        if (!s.ended && s.capture && !s.capture->Paused()) return false;
+    return true;
+}
+
+void App::RecPauseUpdate() {
+    if (rec_ != RecState::Recording) return;
+    const bool away = recTl_ && (rpLocked_ || rpAsleep_);
+    for (RecSession& s : recs_) {
+        if (s.ended || !s.capture) continue;
+        const bool minimized = recTl_ && s.target.source == kSourceWindow && IsIconic(s.target.hwnd);
+        if (minimized && !recPaused_ && !s.minimized) {
+            s.minimized = CaptureGap{(int64_t)time(nullptr), 0, CaptureGap::Why::Minimized};
+        } else if (!minimized && s.minimized) {
+            s.minimized->seconds = (double)((int64_t)time(nullptr) - s.minimized->at);
+            s.gaps.push_back(*s.minimized);
+            s.minimized.reset();
+        }
+        s.capture->SetPaused(recPaused_ || away || minimized);
+    }
+    overlay_.SetPaused(RecResting());
+    KeepAwake();
+}
+
+void App::FillResult(RecSession& s) const {
+    CaptureResult& r = s.result;
+    r.gaps = RecGaps();
+    r.gaps.insert(r.gaps.end(), s.gaps.begin(), s.gaps.end());
+    if (s.minimized) {
+        r.gaps.push_back(*s.minimized);
+        r.gaps.back().seconds = (double)((int64_t)time(nullptr) - s.minimized->at);
+    }
+    std::ranges::stable_sort(r.gaps, {}, &CaptureGap::at);
+    r.from = recFrom_;
+    r.to = (int64_t)time(nullptr);
+    if (s.closed) r.cutShort = s.target.source == kSourceWindow ? tr(L"창이 닫혔습니다") : tr(L"화면이 사라졌습니다");
+}
+
+std::wstring App::TlRestWhy() const {
+    if (recPaused_) return {};
+    if (rpAsleep_) return tr(L"절전");
+    if (rpLocked_) return tr(L"화면 잠김");
+    return tr(L"창 최소화");
+}
+
+void App::TlTick() {
+    RecSession* lead = RecLead();
+    if (!lead) return;
+    Capture& c = *lead->capture;
+    overlay_.SetNote(util::FormatCount(c.Frames()) + tr(L"장"));
+    const double now = util::NowSeconds();
+    const bool open = IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
+    if (tlChecked_ && (!open || now < tlThumbAt_)) return;
+    image::Picture pic;
+    if (!c.Frames() || !c.Shot(pic) || pic.w < 2 || pic.h < 2) return;
+    // A first picture that is black means hours of nothing: said right away, not at the end.
+    if (!tlChecked_) {
+        tlChecked_ = true;
+        uint8_t most = 0;
+        for (size_t i = 0; i + 3 < pic.px.size(); i += 4 * 97)
+            most = std::max({most, pic.px[i], pic.px[i + 1], pic.px[i + 2]});
+        tlBlack_ = most < 12;
+        if (tlBlack_ && !open) TrayBalloon(tr(L"첫 화면이 검게 찍혔습니다"), tr(L"설정 › 녹화의 창 캡처 방식을 ‘화면’으로 바꿔 보세요."));
+    }
+    if (!open) return;
+    tlThumbAt_ = now + 2;
+    // Small: the card's picture is the size of a stamp.
+    const int w = 172, h = std::clamp(w * pic.h / pic.w, 2, 120);
+    std::vector<uint32_t> stamp((size_t)w * h);
+    for (int y = 0; y < h; ++y) {
+        const auto* row = reinterpret_cast<const uint32_t*>(&pic.px[(size_t)(y * pic.h / h) * pic.w * 4]);
+        for (int x = 0; x < w; ++x) stamp[(size_t)y * w + x] = row[x * pic.w / w] | 0xFF000000u;
+    }
+    tlThumb_ = gfx_.CreateBitmap(w, h, stamp.data(), w * 4);
+    Invalidate();
 }
 
 std::vector<CaptureGap> App::RecGaps() const {
@@ -1703,7 +1829,7 @@ void App::EndRecSession(size_t i) {
     RecSession& s = recs_[i];
     const bool lead = RecLead() == &s;
     s.result = s.capture->Stop();
-    s.result.gaps = RecGaps();
+    FillResult(s);
     s.capture.reset();
     s.ended = true;
     overlay_.SetCount((int)live - 1);
@@ -1739,7 +1865,7 @@ void App::StopRecording() {
     for (RecSession& s : recs_) {
         if (s.ended || !s.capture) continue;
         s.result = s.capture->Stop();
-        s.result.gaps = lastGaps_;
+        FillResult(s);
     }
     std::vector<RecSession> done = std::move(recs_);
     recs_.clear();
@@ -1750,7 +1876,9 @@ void App::StopRecording() {
     RegisterPauseHotkey();  // releases it
     RegisterShotHotkey();
     lastShots_ = std::exchange(recShots_, 0);
+    overlay_.SetNote({});
     overlay_.Hide();
+    tlThumb_.Reset();
     TrayUpdate();
     if (done.size() > 1) {
         StopSeveral(done);
@@ -1914,7 +2042,8 @@ void App::OnVideoSaved(const CaptureResult& r) {
     if (NotifyQuietly() && failed)
         TrayBalloon(tr(L"녹화를 멈췄습니다"), r.failure);
     else if (NotifyQuietly())
-        TrayBalloon(tr(L"동영상 저장 완료 · ") + util::FormatClock(r.seconds, false), reason.empty() ? info : reason);
+        TrayBalloon((r.timelapse ? tr(L"타임랩스 저장 완료 · ") : tr(L"동영상 저장 완료 · ")) + util::FormatClock(r.seconds, false),
+                    reason.empty() ? info : reason);
     else
         ShowMain(true);
     if (failed && lastVideo_.notice.empty()) return;
@@ -1923,7 +2052,7 @@ void App::OnVideoSaved(const CaptureResult& r) {
     else if (!reason.empty())
         Alert(reason + L" · " + info);
     else
-        Toast(tr(L"동영상을 저장했습니다 · ") + info);
+        Toast((r.timelapse ? tr(L"타임랩스를 저장했습니다 · ") : tr(L"동영상을 저장했습니다 · ")) + info);
 }
 
 void App::OnVideosSaved() {
@@ -1955,11 +2084,8 @@ void App::OnVideosSaved() {
 void App::TogglePause() {
     if (rec_ != RecState::Recording) return;
     recPaused_ = !recPaused_;
-    KeepAwake();
     RecGapUpdate();
-    for (RecSession& s : recs_)
-        if (!s.ended && s.capture) s.capture->SetPaused(recPaused_);
-    overlay_.SetPaused(recPaused_);
+    RecPauseUpdate();
     if (settings_.sounds) sound::Play(sound::Cue::Tick);
     TrayUpdate();
     Invalidate();
@@ -1979,13 +2105,17 @@ std::wstring App::TimerWords(int minutes) const {
 
 void App::CheckLimits() {
     if (rec_ != RecState::Recording) return;
+    if (recTl_) {
+        RecPauseUpdate();
+        TlTick();
+    }
     // The record timer (#47), on the recorded time (pauses left out): once for each length it is set to.
     const int timer = settings_.TimerMinutes() * 60;
     const RecSession* lead = RecLead();
     if (timer > 0 && timerFiredFor_ != timer && lead && lead->capture->Elapsed() >= timer) {
         timerFiredFor_ = timer;
         const std::wstring words = TimerWords(timer / 60);
-        if (settings_.timerStop) {
+        if (settings_.TimerStop()) {
             stopReason_ = util::Format(tr(L"%s이 되어 녹화를 멈췄습니다."), words.c_str());
             StopRecording();
             return;
@@ -2277,6 +2407,130 @@ void App::BrowseForVideo() {
     if (util::PickVideoFile(hwnd_, settings_.outDir, path)) OpenMediaFile(path);
 }
 
+void App::BrowseForJoin() {
+    filesOpen_ = false;
+    std::vector<std::wstring> paths;
+    if (util::PickVideoFiles(hwnd_, settings_.outDir, tr(L"이을 타임랩스 파일을 고르세요"), paths)) OpenJoin(paths);
+}
+
+void App::OpenDropped(std::vector<std::wstring> paths) {
+    if (paths.size() > 1)
+        for (const std::wstring& p : paths)
+            if (auto c = mp4::CutSource::Open(p); c && c->Timelapse()) {
+                OpenJoin(paths);
+                return;
+            }
+    OpenMediaFile(paths[0]);
+}
+
+void App::OpenJoin(const std::vector<std::wstring>& paths) {
+    ShowMain(true);
+    filesOpen_ = false;
+    if (rec_ != RecState::Idle) {
+        Toast(tr(L"녹화 중에는 파일을 열 수 없습니다."), true);
+        return;
+    }
+    if (exporter_.Busy()) {
+        Toast(tr(L"내보내기가 끝난 뒤에 열 수 있습니다."), true);
+        return;
+    }
+    if (paths.size() < 2) {
+        Toast(tr(L"이을 파일을 두 개 이상 고르세요."), true);
+        return;
+    }
+    auto join = std::make_unique<Join>();
+    std::vector<std::pair<uint64_t, JoinFile>> found;  // last written, the file
+    for (const std::wstring& path : paths) {
+        JoinFile f;
+        f.path = path;
+        f.src = mp4::CutSource::Open(path);
+        if (f.src) {
+            f.timelapse = f.src->Timelapse();
+            f.w = f.src->Width();
+            f.h = f.src->Height();
+            f.seconds = f.src->Seconds();
+            f.frames = f.src->Frames();
+        }
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        SYSTEMTIME utc{}, t{};
+        uint64_t when = 0;
+        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && FileTimeToSystemTime(&fa.ftLastWriteTime, &utc) &&
+            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &t)) {
+            when = (uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32 | fa.ftLastWriteTime.dwLowDateTime;
+            f.day = JoinDay(t);
+        }
+        found.push_back({when, std::move(f)});
+    }
+    // Oldest first: the order they were taken in, most of the time.
+    std::ranges::stable_sort(found, {}, [](const auto& x) { return x.first; });
+    for (auto& [when, f] : found) join->files.push_back(std::move(f));
+    join_ = std::move(join);
+    ++joinSeq_;
+    joinScroll_ = 0;
+    Invalidate();
+}
+
+std::pair<int, std::wstring> App::JoinProblem() const {
+    const std::vector<JoinFile>& f = join_->files;
+    const int n = (int)f.size();
+    const std::wstring then = tr(L" 그 파일을 빼면 이을 수 있습니다.");
+    for (int i = n - 1; i >= 0; --i)
+        if (!f[i].timelapse) return {i, util::Format(tr(L"%d번 파일은 타임랩스가 아니라서 이을 수 없습니다."), i + 1) + then};
+    for (int i = n - 1; i > 0; --i)
+        if (f[i].w != f[0].w || f[i].h != f[0].h) return {i, util::Format(tr(L"%d번 파일의 크기가 달라 이을 수 없습니다."), i + 1) + then};
+    for (int i = n - 1; i > 0; --i)
+        if (f[i].src && f[0].src && !f[i].src->Follows(*f[0].src))
+            return {i, util::Format(tr(L"%d번 파일은 다른 설정으로 찍혀 이을 수 없습니다."), i + 1) + then};
+    return {-1, {}};
+}
+
+void App::JoinSave() {
+    Join& j = *join_;
+    if (j.busy || JoinProblem().first >= 0) return;
+    std::vector<std::shared_ptr<const mp4::CutSource>> parts;
+    uint64_t bytes = 0;
+    for (const JoinFile& f : j.files) {
+        parts.push_back(f.src);
+        bytes += util::FileSize(f.path);
+    }
+    auto all = mp4::CutSource::Joined(parts);
+    if (!all) {
+        Toast(tr(L"이어서 저장하지 못했습니다."), true);
+        return;
+    }
+    const std::wstring& first = j.files[0].path;
+    const size_t dot = first.find_last_of(L'.');
+    const std::wstring stem = first.substr(0, dot) + L"_joined";
+    j.out = stem + L".mp4";
+    for (int i = 2; GetFileAttributesW(j.out.c_str()) != INVALID_FILE_ATTRIBUTES; ++i) j.out = stem + util::Format(L"_%d.mp4", i);
+    if (util::FreeBytes(j.out.substr(0, j.out.find_last_of(L"\\/"))) < bytes + kLowDiskStop) {
+        Toast(tr(L"저장할 드라이브의 공간이 모자랍니다. 공간을 비운 뒤 다시 해 보세요."), true);
+        return;
+    }
+    j.busy = true;
+    j.thread = std::thread([this, &j, all] {
+        mp4::CutSource::Result res;
+        j.ok = all->Cut(0, all->Frames() - 1, false, j.out, j.cancel, j.progress, res, j.err);
+        if (!j.ok) DeleteFileW(j.out.c_str());
+        j.busy = false;
+        PostMessageW(hwnd_, WM_APP_JOIN_DONE, 0, 0);
+    });
+}
+
+void App::OnJoinDone() {
+    if (!join_ || join_->busy) return;
+    const bool ok = join_->ok, stopped = join_->cancel;
+    const std::wstring out = join_->out, err = join_->err;
+    join_.reset();
+    if (!ok) {
+        if (!stopped) Toast(err.empty() ? std::wstring(tr(L"이어서 저장하지 못했습니다.")) : err, true);
+        return;
+    }
+    AddRecent(out);
+    const std::wstring said = tr(L"이어서 저장했습니다: ") + util::FileNameOf(out);
+    if (rec_ != RecState::Idle || exporter_.Busy() || OpenVideo(out)) Toast(said);
+}
+
 void App::AddRecent(const std::wstring& path) {
     settings_.AddRecent(path);
     settings_.Save();
@@ -2468,7 +2722,7 @@ void App::CloseClip() {
 }
 
 const wchar_t* App::Activity() const {
-    if (rec_ == RecState::Recording) return recVideo_ ? tr(L"녹화 중 · 동영상") : tr(L"녹화 중 · 움짤");
+    if (rec_ == RecState::Recording) return recTl_ ? tr(L"녹화 중 · 타임랩스") : recVideo_ ? tr(L"녹화 중 · 동영상") : tr(L"녹화 중 · 움짤");
     if (rec_ == RecState::Countdown) return tr(L"녹화 카운트다운");
     if (exporter_.Busy()) return tr(L"내보내기 중");
     switch (screen_) {

@@ -65,6 +65,19 @@ std::wstring FormatSpan(double seconds) {
     return m % 60 ? h + L" " + Format(tr(L"%d분"), m % 60) : h;
 }
 
+std::wstring FormatLength(double seconds) {
+    const int s = (int)std::max(0.0, std::round(seconds)), m = s / 60;
+    if (!m) return Format(tr(L"%d초"), s);
+    const std::wstring words = Format(tr(L"%d분"), m);
+    return s % 60 ? words + L" " + Format(tr(L"%d초"), s % 60) : words;
+}
+
+std::wstring FormatCount(uint64_t n) {
+    std::wstring s = std::to_wstring(n);
+    for (int i = (int)s.size() - 3; i > 0; i -= 3) s.insert((size_t)i, L",");
+    return s;
+}
+
 std::wstring FormatBytes(uint64_t b) {
     if (b < 1024) return Format(L"%llu B", b);
     if (b < 1024 * 1024) return Format(L"%.0f KB", b / 1024.0);
@@ -291,12 +304,38 @@ bool PickVideoFile(HWND owner, const std::wstring& dir, std::wstring& out) {
     return true;
 }
 
-bool PickExeFile(HWND owner, std::wstring& out) {
+bool PickVideoFiles(HWND owner, const std::wstring& dir, const wchar_t* title, std::vector<std::wstring>& out) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    COMDLG_FILTERSPEC filters[] = {{L"MP4", L"*.mp4"}, {tr(L"모든 파일"), L"*.*"}};
+    dlg->SetFileTypes(_countof(filters), filters);
+    dlg->SetTitle(title);
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_ALLOWMULTISELECT);
+    ComPtr<IShellItem> folder;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        dlg->SetDefaultFolder(folder.Get());
+    if (FAILED(dlg->Show(owner))) return false;
+    ComPtr<IShellItemArray> items;
+    DWORD count = 0;
+    if (FAILED(dlg->GetResults(&items)) || FAILED(items->GetCount(&count))) return false;
+    for (DWORD i = 0; i < count; ++i) {
+        ComPtr<IShellItem> item;
+        PWSTR p = nullptr;
+        if (FAILED(items->GetItemAt(i, &item)) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) continue;
+        out.push_back(p);
+        CoTaskMemFree(p);
+    }
+    return !out.empty();
+}
+
+bool PickExeFile(HWND owner, std::wstring& out, const wchar_t* title) {
     ComPtr<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
     COMDLG_FILTERSPEC filters[] = {{tr(L"프로그램"), L"*.exe"}};
     dlg->SetFileTypes(_countof(filters), filters);
-    dlg->SetTitle(tr(L"리플레이를 켤 프로그램"));
+    dlg->SetTitle(title);
     DWORD opts = 0;
     dlg->GetOptions(&opts);
     dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);  // a shortcut gives the program it starts

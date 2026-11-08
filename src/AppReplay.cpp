@@ -613,19 +613,20 @@ void App::RemoveReplayTarget(size_t i) {
 
 // The 리플레이 tab's add popover: the programs that show a window now (full screen ones first), without those in the
 // list already and without OzMaker. Their names come from the exe, never from a window title.
-void App::ListRunningPrograms() {
+void App::ListRunningPrograms(const std::vector<ReplayTarget>* listed) {
+    const std::vector<ReplayTarget>& have = listed ? *listed : settings_.rpTargets;
     rpRunning_.clear();
     std::vector<WinInfo> wins = EnumerateCaptureWindows();
     if (testWindowsOnly_)
         std::erase_if(wins, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
     for (const WinInfo& w : wins) {
         if (w.exePath.empty() || w.pid == GetCurrentProcessId() || IsShellWindow(w.hwnd)) continue;
-        bool listed = std::any_of(settings_.rpTargets.begin(), settings_.rpTargets.end(), [&](const ReplayTarget& t) {
+        const bool known = std::any_of(have.begin(), have.end(), [&](const ReplayTarget& t) {
             return !t.monitor && SamePath(t.path, w.exePath);
         });
         auto it = std::find_if(rpRunning_.begin(), rpRunning_.end(),
                                [&](const RunningProgram& p) { return SamePath(p.path, w.exePath); });
-        if (listed) continue;
+        if (known) continue;
         if (it != rpRunning_.end()) {
             it->full = it->full || w.fullscreen;
             continue;
@@ -638,8 +639,87 @@ void App::ListRunningPrograms() {
 
 void App::BrowseReplayProgram() {
     std::wstring path;
-    if (!util::PickExeFile(hwnd_, path)) return;
+    if (!util::PickExeFile(hwnd_, path, tr(L"리플레이를 켤 프로그램"))) return;
     AddReplayTarget({false, path, ProgramName(path), true});
+}
+
+// 앱이 열리면 묻기 (#73). A program counts as opened when it shows a window and didn't at the last look; a window title
+// is neither kept nor shown, only the exe it belongs to.
+namespace {
+// 이 or 가 after a program's name: Hangul by its last letter, and the sound of the rest as near as spelling tells.
+const wchar_t* ProgramJosa(const std::wstring& name) {
+    const wchar_t c = name.empty() ? L'a' : (wchar_t)towlower(name.back());
+    if (c >= 0xAC00 && c <= 0xD7A3) return (c - 0xAC00) % 28 ? L"이" : L"가";
+    if (c >= L'0' && c <= L'9') return wcschr(L"013678", c) ? L"이" : L"가";
+    return wcschr(L"lmnp", c) ? L"이" : L"가";
+}
+}  // namespace
+
+void App::TlAskArm() {
+    tlLooked_ = false;
+    tlOpenApps_.clear();
+    if (settings_.tlApps.empty()) {
+        KillTimer(hwnd_, kTimerAsk);
+        askCard_.Hide();
+    } else {
+        SetTimer(hwnd_, kTimerAsk, 2000, nullptr);
+        TlAskTick();
+    }
+}
+
+void App::TlAskTick() {
+    if (tlOutputAfter_ >= 0 && rec_ == RecState::Idle) settings_.output = std::exchange(tlOutputAfter_, -1);
+    std::vector<WinInfo> wins = EnumerateCaptureWindows();
+    if (testWindowsOnly_)
+        std::erase_if(wins, [](const WinInfo& w) { return w.title.find(L"OzMaker Test Window") == std::wstring::npos; });
+    std::vector<std::wstring> open;
+    for (const ReplayTarget& t : settings_.tlApps) {
+        auto w = std::ranges::find_if(wins, [&](const WinInfo& x) { return x.pid != GetCurrentProcessId() && SamePath(t.path, x.exePath); });
+        if (w == wins.end()) continue;
+        open.push_back(t.path);
+        const bool before = std::ranges::any_of(tlOpenApps_, [&](const std::wstring& p) { return SamePath(p, t.path); });
+        if (before || !tlLooked_ || rec_ != RecState::Idle || askCard_.Visible()) continue;
+        tlAskWindow_ = w->hwnd;
+        const int seconds = 30;
+        RECT near_ = w->frame;
+        askCard_.Show(near_,
+                      {Language() == Lang::Korean ? t.name + ProgramJosa(t.name) + L" 열렸습니다" : t.name + L" opened",
+                       util::Format(tr(L"타임랩스 · %d초 간격 · 소리 없음"), settings_.TlInterval()),
+                       util::Format(tr(L"%d초 뒤에 사라집니다"), seconds)},
+                      askMsForTest_ ? askMsForTest_ : seconds * 1000, [this](int how) { TlAskAnswer(how); });
+    }
+    tlOpenApps_ = std::move(open);
+    tlLooked_ = true;
+}
+
+void App::TlAskAnswer(int how) {
+    if (how == AskCard::kSkip) Toast(tr(L"이번에는 찍지 않습니다"));
+    if (how != AskCard::kStart) return;
+    if (!IsWindow(tlAskWindow_)) {
+        ShowMain(true);
+        Toast(tr(L"그 창이 닫혀서 시작하지 못했습니다."), true);
+        return;
+    }
+    if (rec_ != RecState::Idle) return;
+    const int was = settings_.output;
+    settings_.output = kOutputTimelapse;  // for this recording: the next one goes by what 결과물 said
+    StartRecording(WindowTarget(tlAskWindow_), true);
+    if (rec_ == RecState::Idle)
+        settings_.output = was;
+    else
+        tlOutputAfter_ = was;
+}
+
+void App::AddTlApp(ReplayTarget t) {
+    for (const ReplayTarget& o : settings_.tlApps)
+        if (SamePath(o.path, t.path)) return;
+    if (settings_.tlApps.size() >= kMaxReplayTargets) {
+        Toast(util::Format(tr(L"프로그램은 %zu개까지 넣을 수 있습니다."), kMaxReplayTargets), true);
+        return;
+    }
+    settings_.tlApps.push_back(std::move(t));
+    settings_.Save();
+    TlAskArm();
 }
 
 // 저장 폴더 › 리플레이, and the same folder under the other language's name (saved before the language changed).

@@ -88,7 +88,12 @@ void Settings::Load() {
     std::wstring ini = IniPath();
     source = ReadInt(ini, L"Source", source, 0, 2);
     multiWindow = ReadInt(ini, L"MultiWindow", multiWindow, 0, 1) != 0;
-    output = ReadInt(ini, L"Output", output, 0, 1);
+    output = ReadInt(ini, L"Output", output, 0, kOutputTimelapse);
+    tlIntervalIdx = ReadInt(ini, L"TimelapseInterval", tlIntervalIdx, 0, kTlCustom);
+    tlSeconds = ReadInt(ini, L"TimelapseSeconds", tlSeconds, 1, 60);
+    tlCursor = ReadInt(ini, L"TimelapseCursor", tlCursor, 0, 1) != 0;
+    tlSkip = ReadInt(ini, L"TimelapseSkipStill", tlSkip, 0, 1) != 0;
+    tlTimerStop = ReadInt(ini, L"TimelapseTimerStop", tlTimerStop, 0, 1) != 0;
     region.left = ReadSigned(ini, L"RegionL");
     region.top = ReadSigned(ini, L"RegionT");
     region.right = ReadSigned(ini, L"RegionR");
@@ -216,6 +221,14 @@ void Settings::Load() {
         if (*buf) recent.push_back(buf);
     }
     // ReplayN=<p|m><1|0>|<path>|<name>: a program or a monitor, switched on or not, then what it is.
+    tlApps.clear();
+    for (size_t i = 0; i < kMaxReplayTargets; ++i) {
+        GetPrivateProfileStringW(L"OzMaker", util::Format(L"TimelapseApp%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
+        const std::wstring v = buf;
+        const size_t bar = v.find(L'|');
+        if (bar == std::wstring::npos || !bar) break;
+        tlApps.push_back({false, v.substr(0, bar), v.substr(bar + 1), true});
+    }
     rpTargets.clear();
     for (size_t i = 0; i < kMaxReplayTargets; ++i) {
         GetPrivateProfileStringW(L"OzMaker", util::Format(L"Replay%zu", i).c_str(), L"", buf, _countof(buf), ini.c_str());
@@ -246,6 +259,11 @@ void Settings::Save() const {
     num(L"Source", source);
     num(L"MultiWindow", multiWindow);
     num(L"Output", output);
+    num(L"TimelapseInterval", tlIntervalIdx);
+    num(L"TimelapseSeconds", tlSeconds);
+    num(L"TimelapseCursor", tlCursor);
+    num(L"TimelapseSkipStill", tlSkip);
+    num(L"TimelapseTimerStop", tlTimerStop);
     num(L"RegionL", region.left);
     num(L"RegionT", region.top);
     num(L"RegionR", region.right);
@@ -303,6 +321,8 @@ void Settings::Save() const {
     num(L"ReplayAudio", rpAudio);
     num(L"ReplayMic", rpMic);
     num(L"ReplayCursor", rpCursor);
+    for (size_t i = 0; i < tlApps.size() && i < kMaxReplayTargets; ++i)
+        put(util::Format(L"TimelapseApp%zu", i).c_str(), tlApps[i].path + L"|" + tlApps[i].name);
     num(L"ReplayHotkeyMods", (long)rpHkMods);
     num(L"ReplayHotkeyKey", (long)rpHkVk);
     num(L"ReplayHotkeyHook", rpHkHook);
@@ -357,6 +377,7 @@ void Settings::Reset() {
     d.region = region;
     d.recent = std::move(recent);
     d.rpTargets = std::move(rpTargets);  // what the 리플레이 tab has picked
+    d.tlApps = std::move(tlApps);        // and the programs picked to ask about
     d.crashSeen = std::move(crashSeen);
     d.trayHintShown = trayHintShown;
     d.settingsTab = settingsTab;

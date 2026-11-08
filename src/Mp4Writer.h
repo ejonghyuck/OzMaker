@@ -16,6 +16,8 @@ struct VideoConfig {
     int gopFrames = 120;
     bool vfr = false;            // a frame only when the picture changes (#55): HoldVideo, keyframes by time
     int qualityVsSpeed = 50;     // 0 = fastest, 100 = best
+    bool timelapse = false;  // said in the file (mp4::Unfragment), for 타임랩스 파일 잇기 (#72)
+    int quality = 0;             // 1 to 100: by quality where the encoder has that (#71); else the bitrate holds
     bool fragmented = false;     // fragmented MP4 while writing, so a crash leaves a file (#24); Finish makes it plain
 };
 

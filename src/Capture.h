@@ -37,11 +37,15 @@ struct CaptureOptions {
     // How a monitor (Monitor, Region, monitorMode) is taken: 0 = desktop duplication where Windows.Graphics.Capture
     // can't drop its yellow border (Windows 10), 1 = duplication wherever it works, 2 = Windows.Graphics.Capture.
     int screenVia = 0;
+    // 타임랩스 (#71): a frame every intervalMs, stamped n / fps in the file. It plays sped up from the first moment,
+    // also what a crash leaves behind.
+    int intervalMs = 0;
+    bool skipStill = false;  // a picture the same as the last one written isn't written
 };
 
 // A stretch of a recording in which nothing new may have come through (#69): when it began, for how long, and why.
 struct CaptureGap {
-    enum class Why { Locked, Asleep };
+    enum class Why { Locked, Asleep, Minimized };
     int64_t at = 0;  // seconds since 1970
     double seconds = 0;
     Why why = Why::Locked;
@@ -52,17 +56,19 @@ struct CaptureGap {
 class RefusalWatch {
 public:
     static constexpr int64_t kLimit = 5 * 10'000'000, kStall = 2 * 10'000'000;
+    // tick: the time between frames, where it is long (타임랩스).
+    explicit RefusalWatch(int64_t tick = 0) : limit_(std::max(kLimit, tick * 3)), stall_(std::max(kStall, tick * 2)) {}
     // A frame was refused at `now`: true when that has gone on too long. A tick this late is the PC having stood
     // still (sleep, a stall), not the encoder refusing all that time.
     bool Refused(int64_t now) {
-        if (!since_ || now - last_ > kStall) since_ = now;
+        if (!since_ || now - last_ > stall_) since_ = now;
         last_ = now;
-        return now - since_ >= kLimit;
+        return now - since_ >= limit_;
     }
     void Taken() { since_ = 0; }
 
 private:
-    int64_t since_ = 0, last_ = 0;
+    int64_t limit_, stall_, since_ = 0, last_ = 0;
 };
 
 struct CaptureResult {
@@ -76,6 +82,14 @@ struct CaptureResult {
     double seconds = 0;
     uint64_t bytes = 0;
     std::vector<CaptureGap> gaps;  // filled in by App, which hears of the lock and of sleep
+    // 타임랩스 (#71). seconds above is the file's length.
+    bool timelapse = false;
+    double realSeconds = 0;  // how long it took, pauses left out
+    size_t frames = 0;
+    int speed = 0;           // how many times faster it plays
+    double skipped = 0;      // seconds of a still screen left out
+    int64_t from = 0, to = 0;  // when it started and ended, seconds since 1970 (App)
+    std::wstring cutShort;   // what ended it early, in words (App)
 };
 
 // Windows.Graphics.Capture session. Frames are cropped/scaled on the GPU, then either read back through a small
@@ -105,6 +119,9 @@ public:
     bool Paused() const { return pausedAt_ != 0; }
     double Elapsed() const;  // recorded time, pauses left out
     size_t Frames() const;
+    // 타임랩스: how long ago a frame was last written and how long the picture has stood still, in seconds.
+    double SinceWrite() const;
+    double StillFor() const;
     size_t Scaled() const { return scaled_; }  // frames scaled on the GPU so far (tests)
     // Tests: a click as if the left button went down at `at` (screen pixels) now and up `hold` (100 ns) later.
     void InjectClick(POINT at, int64_t hold);
@@ -282,5 +299,6 @@ private:
     HANDLE tickStop_ = nullptr, firstFrame_ = nullptr, resumed_ = nullptr;
     std::wstring videoError_, notice_;
     std::atomic<bool> failed_{false}, refuse_{false};
+    std::atomic<int64_t> lastWrite_{0}, stillFrom_{0}, skipped_{0};  // QPC (100 ns); the last, a length
     bool refuseFinish_ = false;
 };

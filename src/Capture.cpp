@@ -176,7 +176,9 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
 
         // Clips keep at most `fps` frames. Video takes frames up to twice as often (a copy each; only the newest is
         // scaled, once per tick) and samples them at a fixed rate.
-        interval_ = 10'000'000 / std::max(1, opt.fps) / (video ? 2 : 1);
+        // A timelapse wants a recent picture at each of its far-apart ticks, and no more of them than that.
+        interval_ = opt.intervalMs ? std::min<int64_t>(opt.intervalMs * 5'000LL, 2'500'000)
+                                   : 10'000'000 / std::max(1, opt.fps) / (video ? 2 : 1);
         firstTs_ = -1;
         lastTs_ = 0;
         frames_ = 0;
@@ -184,6 +186,7 @@ bool Capture::Start(const CaptureOptions& opt, HWND notify, UINT closedMsg, std:
         finishDue_ = false;
         shots_ = 0;
         stopAt_ = 0;
+        lastWrite_ = stillFrom_ = skipped_ = 0;
         pausedAt_ = 0;
         pausedTotal_ = 0;
         running_ = true;
@@ -295,6 +298,16 @@ void Capture::SetPaused(bool on) {
 
 size_t Capture::Frames() const { return frames_.load(); }
 
+double Capture::SinceWrite() const {
+    const int64_t at = lastWrite_;
+    return at ? (util::Qpc100ns() - at) / 1e7 : 0;
+}
+
+double Capture::StillFor() const {
+    const int64_t at = stillFrom_;
+    return at && !Paused() ? (util::Qpc100ns() - at) / 1e7 : 0;
+}
+
 bool Capture::StoreFailed() const {
     std::lock_guard lk(mtx_);
     return store_ && store_->WriteFailed();
@@ -400,7 +413,7 @@ bool Capture::Setup(int sw, int sh) {
     clean_.Reset();
     if (opt_.monitorMode && FAILED(dev_->CreateTexture2D(&td, nullptr, &clean_))) clean_.Reset();  // black then
     diffReady_ = diffPending_ = false;
-    if (opt_.video && opt_.video->video.vfr) {
+    if (opt_.video && (opt_.video->video.vfr || opt_.intervalMs)) {
         // What the comparison needs. Without it every picture that may have changed counts as changed.
         D3D11_TEXTURE2D_DESC cd = td, dd = td;
         cd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -840,7 +853,11 @@ void Capture::TickLoop() {
         uint64_t checked = ~0ull;  // VFR: shots_ at the last tick
         bool fxChecked = false;    // and whether that tick had a click highlight
         int64_t end = 0;           // where the last tick ends, which the last frame lasts until
-        RefusalWatch refusals;
+        // 타임랩스 (#71): the ticks far apart, each compared with the frame before, and the file's time counted in
+        // frames written, not in the time gone by.
+        const int64_t step = opt_.intervalMs * 10'000LL;
+        const bool compare = vfr || step;
+        RefusalWatch refusals(step);
         // An encoder pool that is full passes. A device that is gone, or an encoder that has stopped taking frames,
         // doesn't: REC would stay on for hours with nothing written (#69).
         auto given = [&](ID3D11Texture2D* tex, bool& giveUp) {
@@ -860,7 +877,7 @@ void Capture::TickLoop() {
                 HANDLE waits[2] = {tickStop_, resumed_};
                 if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) break;
             }
-            int64_t due = startQpc_ + pausedTotal_ + k * 10'000'000 / fps;
+            int64_t due = startQpc_ + pausedTotal_ + (step ? k * step : k * 10'000'000 / fps);
             int64_t now = util::Qpc100ns();
             if (due > now) {
                 synced = true;
@@ -876,10 +893,12 @@ void Capture::TickLoop() {
             } else if (WaitForSingleObject(tickStop_, 0) == WAIT_OBJECT_0) {
                 break;
             } else if (synced) {
-                int64_t cur = (now - startQpc_ - pausedTotal_) * fps / 10'000'000;
+                const int64_t span = now - startQpc_ - pausedTotal_;
+                int64_t cur = step ? span / step : span * fps / 10'000'000;
                 if (cur > k + 2) k = cur;
             }
-            const int64_t t0 = k * 10'000'000 / fps, t1 = (k + 1) * 10'000'000 / fps;
+            const int64_t n = step ? (int64_t)frames_.load() : k;
+            const int64_t t0 = n * 10'000'000 / fps, t1 = (n + 1) * 10'000'000 / fps;
             // Never under mtx_: the frame callback may own the device lock while it waits for mtx_.
             ID3D11Texture2D* picture = out_.Get();
             bool maybe = false, keyDue = false;
@@ -888,13 +907,13 @@ void Capture::TickLoop() {
                 if (finishDue_) FinishFrame();
                 bool fx = false;
                 if (opt_.clickFx && DrawClicks(due)) picture = fx_.Get(), fx = true;
-                if (vfr) {
+                if (compare) {
                     // A new capture, or a highlight drawn or just gone, may have changed the picture. It is taken as
                     // it is now (Windows can put a newer one in out_ at any time) and compared with the last frame.
                     maybe = shots_ != checked || fx || fxChecked;
                     checked = shots_;
                     fxChecked = fx;
-                    keyDue = writer_->KeyDue(t0);
+                    keyDue = vfr && writer_->KeyDue(t0);
                     if (maybe || keyDue) picture = Snapshot(picture, maybe && !keyDue);
                 }
             }
@@ -919,6 +938,15 @@ void Capture::TickLoop() {
                 ++frames_;
                 continue;
             }
+            if (step) {
+                const int64_t at = util::Qpc100ns();
+                if ((maybe && Changed()) || !frames_) {
+                    stillFrom_ = at;
+                } else if (opt_.skipStill) {
+                    skipped_ += step;
+                    continue;
+                }
+            }
             bool giveUp = false;
             ComPtr<IMFSample> sample = given(picture, giveUp);
             if (giveUp) break;
@@ -928,6 +956,11 @@ void Capture::TickLoop() {
                 break;
             }
             ++frames_;
+            if (step) {
+                lastWrite_ = util::Qpc100ns();
+                DeviceLock lock(mt_.Get());
+                Written();
+            }
         }
         // The last frame lasts until the stop press, also when the ticker was behind then.
         if (vfr && !failed_ && !writer_->EndVideo(std::max(end, stopAt_.load())))
@@ -1337,6 +1370,14 @@ CaptureResult Capture::Stop() {
         res.path = opt_.video->path;
         res.notice = notice_;
         res.seconds = (stopQpc - startQpc_ - pausedTotal_) / 1e7;
+        if (opt_.intervalMs) {
+            res.timelapse = true;
+            res.realSeconds = res.seconds;
+            res.frames = frames_;
+            res.speed = (int)std::lround(opt_.intervalMs / 1000.0 * std::max(1, opt_.fps));
+            res.skipped = skipped_ / 1e7;
+            res.seconds = writer_->VideoEnd() / 1e7;
+        }
         // An error mid-recording keeps what was encoded before it.
         std::wstring finishErr;
         if (refuseFinish_) writer_->RefuseFinish();

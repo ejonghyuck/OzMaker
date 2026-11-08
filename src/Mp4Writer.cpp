@@ -184,11 +184,17 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoConfig& v, const Audio
 
 // OzMaker_<pid>_<qpc>.video next to the 움짤 recordings holds the path while the file is written: what a crash
 // leaves behind tells the next start which file to convert.
+namespace {
+constexpr std::wstring_view kTimelapseNote = L"|timelapse";  // after the path in a marker: no path has a |
+}
+
 void Mp4Writer::Mark() {
     marker_ = FrameStore::Dir() + util::Format(L"\\OzMaker_%lu_%lld.video", GetCurrentProcessId(), util::Qpc100ns());
     HANDLE h = CreateFileW(marker_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    DWORD bytes = (DWORD)(path_.size() * sizeof(wchar_t)), done = 0;
-    if (h == INVALID_HANDLE_VALUE || !WriteFile(h, path_.data(), bytes, &done, nullptr)) marker_.clear();
+    std::wstring text = path_;
+    if (v_.timelapse) text += kTimelapseNote;
+    DWORD bytes = (DWORD)(text.size() * sizeof(wchar_t)), done = 0;
+    if (h == INVALID_HANDLE_VALUE || !WriteFile(h, text.data(), bytes, &done, nullptr)) marker_.clear();
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
 }
 
@@ -221,11 +227,13 @@ std::vector<std::wstring> Mp4Writer::Recover() {
             CloseHandle(f);
         }
         DeleteFileW(marker.c_str());
+        const bool timelapse = path.ends_with(kTimelapseNote);
+        if (timelapse) path.resize(path.size() - kTimelapseNote.size());
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) continue;
         std::wstring err;
         bool empty = false;
-        if (!mp4::Unfragment(path, err, &empty) && empty) {  // nothing reached the disk: no file to offer
+        if (!mp4::Unfragment(path, err, &empty, timelapse) && empty) {  // nothing reached the disk: no file to offer
             DeleteFileW(path.c_str());
             continue;
         }
@@ -287,6 +295,10 @@ bool Mp4Writer::TryOpen(const std::wstring& path, bool hardware, bool codecParam
             // Variable frame rate: frames in the order shown, so Finish can set how long each lasts (B-frames would
             // reorder them; Windows' software encoder uses them).
             if (v_.vfr) params->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            if (v_.quality) {
+                params->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality);
+                params->SetUINT32(CODECAPI_AVEncCommonQuality, (UINT32)std::clamp(v_.quality, 1, 100));
+            }
         }
         call = L"SetInputMediaType(video)";
         hr = writer_->SetInputMediaType(videoStream_, vi.Get(), params.Get());
@@ -527,7 +539,7 @@ bool Mp4Writer::Finish(std::wstring& err) {
     if (v_.fragmented) {
         std::wstring why;
         bool empty = false;
-        plain = mp4::Unfragment(path_, why, &empty);
+        plain = mp4::Unfragment(path_, why, &empty, v_.timelapse);
         if (kept && !plain && empty) {  // nothing had reached the disk
             err = tr(L"동영상 파일을 마무리하지 못했습니다. (") + Hr(hr) + L")";
             DeleteFileW(path_.c_str());
