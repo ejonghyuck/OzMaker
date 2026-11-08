@@ -12,6 +12,7 @@ int64_t Qpc100ns();
 double NowSeconds();
 
 std::wstring FormatClock(double seconds, bool tenths);   // 0:12.3 / 1:02:03
+std::wstring FormatSpan(double seconds);                 // 45초 / 38분 / 1시간 20분
 std::wstring FormatBytes(uint64_t bytes);
 std::wstring Format(const wchar_t* fmt, ...);
 

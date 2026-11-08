@@ -125,6 +125,9 @@ private:
     void DrawVideoResult(Rect r);
     void DrawShotCard(Rect video, float a);
     void DrawVideoResults(Rect preview);  // the card for several windows' files
+    float VideoCardLines(Rect preview) const;
+    const std::vector<CaptureGap>& VideoCardGaps() const;
+    void DrawCardLines(Rect r, Rect preview, const D2D1_COLOR_F& line, float a);
     void DrawEditor(Rect r);
     void DrawEditHome(Rect r);  // the 편집 tab with no file open: where to drop one, what to open
     void DrawFileBar(Rect r);   // over the editor: the open file and 닫기
@@ -189,6 +192,12 @@ private:
     // The file name for one of several windows: the pattern, and the window's name after it when the pattern has
     // no {창 이름} of its own.
     std::wstring RecFileStem(const std::wstring& name, bool several) const;
+    // While something is being recorded Windows is asked to stay awake and keep the screen on, and let go of right
+    // after (#69). Replay doesn't ask: it stays on for hours and must not keep the PC from sleeping.
+    void KeepAwake();
+    // Follows the lock and sleep: each stretch of them during a recording becomes a gap on its result (#69).
+    void RecGapUpdate();
+    std::vector<CaptureGap> RecGaps() const;  // the gaps so far, one still going up to now
     void OnVideoSaved(const CaptureResult& r);
     void OnVideosSaved();  // several windows: lastVideos_
     void ShowVideo(const CaptureResult& r);
@@ -442,6 +451,7 @@ private:
     int RunEncoderTest(const std::wstring& dir);
     int RunReplayTest(const std::wstring& dir);
     int RunMultiTest(const std::wstring& dir);  // 여러 창 녹화 (#48)
+    int RunSafetyTest(const std::wstring& dir);  // what keeps a long recording safe (#69)
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
@@ -502,6 +512,9 @@ private:
     bool recScreen_ = false;  // the recording takes the screen (a monitor, a region, a fullscreen game through it)
     std::wstring recNotice_;
     std::wstring stopReason_;  // why the recording stopped by itself (length limit, disk space), shown after it
+    bool awake_ = false;       // KeepAwake asked Windows
+    std::vector<CaptureGap> recGaps_, lastGaps_;  // of the recording going on, of the one just ended
+    std::optional<CaptureGap> recGap_;            // one going on
     bool recPaused_ = false;
     double nextDiskCheck_ = 0;
     std::wstring recName_;  // what is being recorded, in words (window title, "화면 1", "영역")

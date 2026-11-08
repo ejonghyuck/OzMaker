@@ -39,6 +39,32 @@ struct CaptureOptions {
     int screenVia = 0;
 };
 
+// A stretch of a recording in which nothing new may have come through (#69): when it began, for how long, and why.
+struct CaptureGap {
+    enum class Why { Locked, Asleep };
+    int64_t at = 0;  // seconds since 1970
+    double seconds = 0;
+    Why why = Why::Locked;
+};
+
+// Whether an encoder that refuses a frame is only behind, as it is for a moment now and then, or has stopped taking
+// frames (#69). Times in 100 ns.
+class RefusalWatch {
+public:
+    static constexpr int64_t kLimit = 5 * 10'000'000, kStall = 2 * 10'000'000;
+    // A frame was refused at `now`: true when that has gone on too long. A tick this late is the PC having stood
+    // still (sleep, a stall), not the encoder refusing all that time.
+    bool Refused(int64_t now) {
+        if (!since_ || now - last_ > kStall) since_ = now;
+        last_ = now;
+        return now - since_ >= kLimit;
+    }
+    void Taken() { since_ = 0; }
+
+private:
+    int64_t since_ = 0, last_ = 0;
+};
+
 struct CaptureResult {
     std::shared_ptr<FrameStore> clip;  // clip mode
     bool video = false;                // video mode: the fields below
@@ -46,8 +72,10 @@ struct CaptureResult {
     bool audio = false;
     bool hardware = false;  // GPU encoder
     std::wstring path, error, notice, encoder;
+    std::wstring failure;  // ok, but it stopped by itself on this error: the file holds what came before it (#69)
     double seconds = 0;
     uint64_t bytes = 0;
+    std::vector<CaptureGap> gaps;  // filled in by App, which hears of the lock and of sleep
 };
 
 // Windows.Graphics.Capture session. Frames are cropped/scaled on the GPU, then either read back through a small
@@ -81,6 +109,12 @@ public:
     // Tests: a click as if the left button went down at `at` (screen pixels) now and up `hold` (100 ns) later.
     void InjectClick(POINT at, int64_t hold);
     size_t ClickFrames() const { return clickFrames_; }  // clip frames added for highlights (tests)
+    // Tests: from now on the encoder takes no frames, as when the graphics device is gone. finishFails: and it can't
+    // finish the file either.
+    void RefuseFrames(bool finishFails) {
+        refuseFinish_ = finishFails;
+        refuse_ = true;
+    }
     // Screenshot (#63): the newest picture of the source at its own size, whatever size is recorded, also while paused
     // and when the screen hasn't changed for a while. False before the first one. The window's thread.
     bool Shot(image::Picture& pic);
@@ -247,5 +281,6 @@ private:
     std::thread ticker_;
     HANDLE tickStop_ = nullptr, firstFrame_ = nullptr, resumed_ = nullptr;
     std::wstring videoError_, notice_;
-    std::atomic<bool> failed_{false};
+    std::atomic<bool> failed_{false}, refuse_{false};
+    bool refuseFinish_ = false;
 };
