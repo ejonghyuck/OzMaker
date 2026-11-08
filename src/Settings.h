@@ -75,7 +75,10 @@ struct ReplayTarget {
 };
 
 enum Source { kSourceWindow = 0, kSourceDisplay = 1, kSourceRegion = 2 };
-enum Output { kOutputClip = 0, kOutputVideo = 1 };
+enum Output { kOutputClip = 0, kOutputVideo = 1, kOutputTimelapse = 2 };
+// 타임랩스 (#71): the seconds between frames, then 직접 (1 to 60). The file plays at kTlFps.
+inline constexpr int kTlIntervals[] = {1, 2, 5, 10, 30};
+inline constexpr int kTlCustom = 5, kTlFps = 30;
 enum CaptureMode { kCaptureAuto = 0, kCaptureWindow = 1, kCaptureDisplay = 2 };
 enum OverlayMode { kOverlayAlways = 0, kOverlayExceptFullscreen = 1, kOverlayNever = 2 };
 // The numbers are saved (SettingsTab); the settings show 리플레이 after 녹화.
@@ -129,6 +132,16 @@ struct Settings {
     int timerIdx = 0;
     int timerMinutes = 90;   // 1 – kTimerMaxMinutes
     bool timerStop = false;  // false: a notification, the recording goes on; true: it stops and is saved
+    // 타임랩스 (#71). Nobody is there when its time is up, so by default it stops.
+    std::vector<ReplayTarget> tlApps;  // 앱이 열리면 묻기 (#73): programs only, exe and name, never a window title
+    int tlIntervalIdx = 1;
+    int tlSeconds = 7;
+    bool tlCursor = false;
+    bool tlSkip = false;
+    bool tlTimerStop = true;
+    int TlInterval() const { return tlIntervalIdx == kTlCustom ? tlSeconds : kTlIntervals[tlIntervalIdx]; }
+    bool& TimerStop() { return output == kOutputTimelapse ? tlTimerStop : timerStop; }
+    bool TimerStop() const { return output == kOutputTimelapse ? tlTimerStop : timerStop; }
     std::wstring outDir;
 
     // video (MP4)

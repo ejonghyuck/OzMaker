@@ -41,6 +41,10 @@ struct RecSession {
     std::unique_ptr<Capture> capture;
     CaptureResult result;  // once it stopped
     bool ended = false;    // stopped before the others: its window closed, or its encoder failed
+    bool closed = false;   // its window or screen went away
+    // 타임랩스 (#71): the stretches its window was minimized, and one going on.
+    std::vector<CaptureGap> gaps;
+    std::optional<CaptureGap> minimized;
 };
 
 class App {
@@ -65,11 +69,12 @@ private:
         WM_APP_ANIM_LOADED,  // a 움짤 file finished decoding (#41)
         WM_APP_REPLAY_CLOSED,  // 순간 리플레이's capture: what it held went away (wParam 0) or its encoder failed (1)
         WM_APP_REPLAY_SAVED,   // the replay being saved is written (or not)
+        WM_APP_JOIN_DONE,      // 타임랩스 파일 잇기: the new file is written (or not)
     };
     static constexpr ULONG_PTR kCopyOpenFile = 0x4F5A4F50;  // WM_COPYDATA tag ('OZOP'), shared with main.cpp
     static_assert(WM_APP_SHOW == WM_APP + 5 && WM_APP_QUIT == WM_APP + 6);
     enum : UINT_PTR {
-        kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad, kTimerReplay
+        kTimerRec = 1, kTimerCountdown, kTimerRefresh, kTimerUpdate, kTimerMicTest, kTimerAnimLoad, kTimerReplay, kTimerAsk
     };
     enum class RecState { Idle, Countdown, Recording };
     enum : int { kHotkeyRecord = 1, kHotkeyPause = 2, kHotkeyReplay = 3, kHotkeyShot = 4 };  // RegisterHotKey ids
@@ -165,6 +170,7 @@ private:
     // 여러 창 녹화 (#48): windows are checked instead of picked, up to kMaxRecWindows, in the order checked; the
     // first is target_ (the preview, the size line).
     bool MultiPicking() const { return settings_.source == kSourceWindow && settings_.multiWindow; }
+    bool TlResting() const { return recTl_ && (recs_.empty() ? tlRestForTest_ : RecResting()); }
     void SetMultiWindow(bool on);
     void TogglePick(HWND h);
     std::vector<RecTarget> PickedTargets() const;
@@ -198,6 +204,15 @@ private:
     // Follows the lock and sleep: each stretch of them during a recording becomes a gap on its result (#69).
     void RecGapUpdate();
     std::vector<CaptureGap> RecGaps() const;  // the gaps so far, one still going up to now
+    // 타임랩스 (#71) rests by itself while the screen is locked, the PC asleep or its window minimized, and goes on
+    // after. Each capture is paused when one of those or the user says so.
+    void RecPauseUpdate();
+    bool RecResting() const;  // nothing is being recorded right now
+    void FillResult(RecSession& s) const;  // what App knows of a recording that just stopped
+    void TlTick();            // each recording tick: the pill, the first picture, the live card's picture
+    std::wstring TlLine() const;    // what the interval does: 1시간이 1분으로 · 60배 · 소리 없음
+    std::wstring TlRestWhy() const;  // why it rests, in words
+    void DrawTlLive(Rect preview);
     void OnVideoSaved(const CaptureResult& r);
     void OnVideosSaved();  // several windows: lastVideos_
     void ShowVideo(const CaptureResult& r);
@@ -397,7 +412,7 @@ private:
     void RegisterReplayHotkey();  // only while replay is on
     void AddReplayTarget(ReplayTarget t);
     void RemoveReplayTarget(size_t i);
-    void ListRunningPrograms();
+    void ListRunningPrograms(const std::vector<ReplayTarget>* listed = nullptr);  // without these (else 리플레이's)
     void BrowseReplayProgram();
     void RefreshReplayFiles();
     void RenameReplay(size_t i, std::wstring name);
@@ -463,6 +478,7 @@ private:
     int RunReplayTest(const std::wstring& dir);
     int RunMultiTest(const std::wstring& dir);  // 여러 창 녹화 (#48)
     int RunSafetyTest(const std::wstring& dir);  // what keeps a long recording safe (#69)
+    int RunTimelapseTest(const std::wstring& dir, bool crash);  // a timelapse recorded for real (#71)
     int RunEditorTest(const std::wstring& path, const std::wstring& dir);
     int RunRegionTest(const std::wstring& dir);
     int RunPreviewTest(const std::wstring& dir);
@@ -524,6 +540,17 @@ private:
     std::wstring recNotice_;
     std::wstring stopReason_;  // why the recording stopped by itself (length limit, disk space), shown after it
     bool awake_ = false;       // KeepAwake asked Windows
+    bool recTl_ = false;       // the recording is a timelapse (#71)
+    int tlMsForTest_ = 0;      // tests: the time between frames
+    int batteryForTest_ = -1;  // tests: on battery or not, whatever this PC is
+    int64_t recFrom_ = 0;      // when the recording started, seconds since 1970
+    bool tlChecked_ = false, tlBlack_ = false;  // the first picture was looked at, and was black
+    size_t tlFramesForTest_ = 0;                // screenshots: a recording with no capture
+    double tlStillForTest_ = 0;
+    bool tlRestForTest_ = false;
+    ComPtr<ID2D1Bitmap1> tlThumb_;              // the live card's picture
+    double tlThumbAt_ = 0;                      // when to take it again
+    std::wstring tlText_;                       // 간격 직접, as typed
     std::vector<CaptureGap> recGaps_, lastGaps_;  // of the recording going on, of the one just ended
     std::optional<CaptureGap> recGap_;            // one going on
     bool recPaused_ = false;
@@ -582,6 +609,18 @@ private:
     RpSaveOut rpSaveOut_;  // written by the save thread, read once it is joined
     bool replayHotkeyOk_ = true, hookReplay_ = false;
     ReplayNotice rpNotice_;
+    // 앱이 열리면 묻기 (#73)
+    AskCard askCard_;
+    std::vector<std::wstring> tlOpenApps_;  // the registered programs that showed a window at the last look
+    bool tlLooked_ = false;                 // what is open at the first look was open before, and isn't asked about
+    HWND tlAskWindow_ = nullptr;
+    int tlOutputAfter_ = -1;                // what 결과물 goes back to after a timelapse started from the card
+    bool tlAddOpen_ = false;                // 설정 › 녹화: the programs to add are listed
+    DWORD askMsForTest_ = 0;
+    void TlAskArm();
+    void TlAskTick();
+    void TlAskAnswer(int how);
+    void AddTlApp(ReplayTarget t);
     std::vector<ReplayFile> rpFiles_;  // newest first
     std::wstring rpNewPath_;           // saved in this run, the newest: 새로
     std::wstring rpFilter_;            // the saved list's program, "" = all
@@ -636,6 +675,37 @@ private:
         }
     };
     std::unique_ptr<AnimLoad> animLoad_;
+    // 타임랩스 파일 잇기 (#72): the dialog's files, top to bottom, and the worker that saves them as one.
+    struct JoinFile {
+        std::wstring path, day;
+        std::shared_ptr<const mp4::CutSource> src;  // null when this isn't an MP4 that can be read sample by sample
+        bool timelapse = false;
+        int w = 0, h = 0;
+        double seconds = 0;
+        size_t frames = 0;
+    };
+    struct Join {
+        std::vector<JoinFile> files;
+        std::thread thread;
+        std::atomic<bool> busy{false}, cancel{false};
+        std::atomic<float> progress{0};
+        std::wstring out, err;
+        bool ok = false;
+        ~Join() {
+            cancel = true;
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<Join> join_;
+    UINT joinSeq_ = 0;
+    float joinScroll_ = 0;
+    void BrowseForJoin();
+    void OpenDropped(std::vector<std::wstring> paths);  // several files at once may be timelapses to join
+    void OpenJoin(const std::vector<std::wstring>& paths);
+    std::pair<int, std::wstring> JoinProblem() const;  // the file that stops it, and why; -1 when nothing does
+    void JoinSave();
+    void OnJoinDone();
+    void DrawJoin(Rect client);
     ComPtr<ID2D1BitmapBrush1> checker_;  // under an opened 움짤's transparent parts
     UINT checkerGen_ = 0;
     std::wstring caption_;      // 자막: one line over the whole clip (#22), kept for the clip open
@@ -672,6 +742,7 @@ private:
     Rect filesBtn_;
     float filesScroll_ = 0;
     std::wstring pendingOpen_;
+    std::vector<std::wstring> pendingMore_;  // dropped with it
     float editListScroll_[2]{};  // the 편집 tab's lists: 저장하지 않은 녹화, 최근 파일
 
     // Files dragged over the window (OLE): what dropping them would do, shown over the whole window before the drop.

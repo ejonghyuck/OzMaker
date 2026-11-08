@@ -224,6 +224,12 @@ float RecOverlay::Width() const { return PillWidth(timer_) + countW_; }
 
 namespace {
 std::wstring CountLabel(int windows) { return util::Format(tr(L"창 %d개"), windows); }
+// The room the chip takes. A count goes up all the time: measured as zeros, the pill keeps its width while it does.
+float ChipRoom(Painter& p, std::wstring text) {
+    if (text.empty()) return 0;
+    std::replace_if(text.begin(), text.end(), iswdigit, L'0');
+    return p.Measure(text, 11.5f, kSemibold) + 22;
+}
 }  // namespace
 
 void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()> onStop,
@@ -240,6 +246,7 @@ void RecOverlay::ShowPill(const RECT& target, bool outside, std::function<void()
     timerUp_ = false;
     count_ = 0;
     countW_ = 0;
+    note_.clear();
     Place(target, (int)kPillW, (int)kPillH, false, outside);
     Redraw(true);
     ShowWindow(win_.Hwnd(), SW_SHOWNOACTIVATE);
@@ -312,9 +319,24 @@ void RecOverlay::Resize() {
 
 void RecOverlay::SetCount(int windows) {
     if (count_ == windows) return;
-    const float was = countW_;
     count_ = windows;
-    countW_ = windows > 1 ? Painter().Measure(CountLabel(windows), 11.5f, kSemibold) + 22 : 0;
+    ChipChanged();
+}
+
+void RecOverlay::SetNote(const std::wstring& text) {
+    if (note_ == text) return;
+    note_ = text;
+    ChipChanged();
+}
+
+std::wstring RecOverlay::ChipText() const {
+    return !note_.empty() ? note_ : count_ > 1 ? CountLabel(count_) : L"";
+}
+
+void RecOverlay::ChipChanged() {
+    const float was = countW_;
+    Painter measure;
+    countW_ = ChipRoom(measure, ChipText());
     if (mode_ != Mode::Pill) return;
     if (countW_ == was)
         Redraw(false);
@@ -358,7 +380,7 @@ void RecOverlay::Redraw(bool move) {
 void RecOverlay::PaintTest(Painter& p, double elapsed, bool paused, int hover, int timer, bool timerUp,
                            int windows) {
     count_ = windows;
-    countW_ = windows > 1 ? p.Measure(CountLabel(windows), 11.5f, kSemibold) + 22 : 0;
+    countW_ = ChipRoom(p, ChipText());
     mode_ = Mode::Pill;
     elapsed_ = elapsed;
     paused_ = paused;
@@ -408,13 +430,17 @@ void RecOverlay::Paint(Painter& p) {
             float pulse = motion_ ? 0.55f + 0.45f * (float)std::cos(elapsed_ * 3.1415926 * 1.6) : 1.f;
             p.Circle(19, 20, 9, WithAlpha(Rec, 0.18f * pulse));
             p.Circle(19, 20, 5, Rec);
-            p.Text(Rect(32, 0, 90, 40), L"REC", 11.5f, Rec, label);
+            p.Text(Rect(32, 0, 90, 40), note_.empty() ? L"REC" : tr(L"타임랩스"), 11.5f, Rec, label);
         }
         TextStyle tm;
         tm.weight = kSemibold;
         tm.tabular = true;
-        float tx = paused_ ? 88.f : 66.f;
-        if (countW_ > 0) {  // 여러 창 녹화: "창 2개" in a chip before the time
+        float tx = paused_ || !note_.empty() ? 88.f : 66.f;
+        if (!note_.empty()) {  // after the time, by the buttons
+            TextStyle ns = tm;
+            ns.h = AlignEnd;
+            p.Text(Rect(pillW - 76 - countW_, 0, pillW - 76, 40), note_, 11.5f, TextDim, ns);
+        } else if (countW_ > 0) {  // 여러 창 녹화: "창 2개" in a chip before the time
             Rect chip = Rect::XYWH(tx - 2, 11, countW_ - 10, 18);
             if (Contrast())
                 p.Stroke(chip.Inset(0.5f), Border, 9);
@@ -423,7 +449,7 @@ void RecOverlay::Paint(Painter& p) {
             TextStyle cs;
             cs.h = AlignCenter;
             cs.weight = kSemibold;
-            p.Text(chip.Offset(0, -0.5f), CountLabel(count_), 11.5f, Contrast() ? TextColor : Hex(0xE6E8EE), cs);
+            p.Text(chip.Offset(0, -0.5f), ChipText(), 11.5f, Contrast() ? TextColor : Hex(0xE6E8EE), cs);
             tx += countW_;
         }
         const std::wstring now = util::FormatClock(elapsed_, true);
@@ -536,6 +562,148 @@ float TextWidth(std::wstring_view s, float size, DWRITE_FONT_WEIGHT w) {
     return lay && SUCCEEDED(lay->GetMetrics(&m)) ? std::ceil(m.widthIncludingTrailingWhitespace) : 0.f;
 }
 }  // namespace
+
+void AskCard::Init(HINSTANCE inst, ID2D1Factory1* factory) {
+    inst_ = inst;
+    factory_ = factory;
+}
+
+Rect AskCard::ButtonRect(int b) const {
+    const float start = TextWidth(tr(L"타임랩스 시작"), 12.5f, kSemibold) + 24;
+    if (b == kStart) return Rect::XYWH(14, 74, start, 30);
+    return Rect::XYWH(14 + start + 8, 74, TextWidth(tr(L"이번에는 안 함"), 12.5f, kSemibold) + 24, 30);
+}
+
+int AskCard::ButtonAt(float x, float y) const {
+    for (int b : {kStart, kSkip})
+        if (ButtonRect(b).Inset(-2).Contains(x, y)) return b;
+    return 0;
+}
+
+void AskCard::Show(const RECT& near_, Content c, DWORD ms, std::function<void(int)> onAnswer) {
+    if (!win_.Hwnd()) {
+        win_.Create(inst_, factory_, L"OzMakerAsk", WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, Proc, this);
+        SetWindowDisplayAffinity(win_.Hwnd(), WDA_EXCLUDEFROMCAPTURE);  // never shows up in recordings
+    }
+    c_ = std::move(c);
+    onAnswer_ = std::move(onAnswer);
+    hover_ = 0;
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromRect(&near_, MONITOR_DEFAULTTONEAREST), &mi);
+    scale_ = ScaleForRect(mi.rcWork);
+    const int w = (int)std::lround(kWidth * scale_), h = (int)std::lround(kHeight * scale_), gap = (int)std::lround(14 * scale_);
+    rect_ = {mi.rcWork.right - gap - w, mi.rcWork.bottom - gap - h, mi.rcWork.right - gap, mi.rcWork.bottom - gap};
+    shown_ = true;
+    Redraw();
+    SetWindowPos(win_.Hwnd(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetTimer(win_.Hwnd(), kNoticeTimer, ms, nullptr);
+}
+
+void AskCard::Hide() {
+    shown_ = false;
+    onAnswer_ = nullptr;
+    if (win_.Hwnd()) {
+        KillTimer(win_.Hwnd(), kNoticeTimer);
+        ShowWindow(win_.Hwnd(), SW_HIDE);
+    }
+}
+
+void AskCard::Answer(int how) {
+    auto cb = std::move(onAnswer_);
+    Hide();
+    if (cb) cb(how);
+}
+
+void AskCard::Redraw() {
+    if (shown_) win_.Render(rect_, scale_, true, [&](Painter& p) { Paint(p); });
+}
+
+void AskCard::PaintTest(Painter& p, const Content& c, int hover) {
+    c_ = c;
+    hover_ = hover;
+    Paint(p);
+    hover_ = 0;
+}
+
+void AskCard::Paint(Painter& p) {
+    theme::Use colors(theme::OverlayPalette());
+    Rect r(0.5f, 0.5f, kWidth - 0.5f, kHeight - 0.5f);
+    p.Fill(r, Panel(0.96f), 12);
+    p.Stroke(r, Edge(0.12f), 12);
+    Rect tile = Rect::XYWH(14, 12, 28, 28);
+    p.Fill(tile, WithAlpha(Accent, Contrast() ? 1.f : 0.22f), 8);
+    p.Icon(tile, 0xE7F4 /*TVMonitor*/, 13.f, Contrast() ? OnFill : AccentHi);
+    TextStyle bold;
+    bold.weight = kBold;
+    p.Text(Rect(50, 12, kWidth - 14, 40), c_.title, 13.5f, Ink(), bold);
+    p.Text(Rect(14, 46, kWidth - 14, 66), c_.sub, 12.5f, TextDim);
+    for (int b : {kStart, kSkip}) {
+        Rect br = ButtonRect(b);
+        const bool hot = hover_ == b, primary = b == kStart;
+        if (Contrast()) {
+            p.Fill(br, primary ? Accent : Bg, 8);
+            p.Stroke(br.Inset(0.5f), Border, 8, hot ? 2.f : 1.f);
+        } else {
+            p.Fill(br, primary ? (hot ? AccentHi : Accent) : WithAlpha(White, hot ? 0.20f : 0.10f), 8);
+        }
+        TextStyle st;
+        st.weight = kSemibold;
+        st.h = AlignCenter;
+        p.Text(br, primary ? tr(L"타임랩스 시작") : tr(L"이번에는 안 함"), 12.5f, Contrast() ? (primary ? OnFill : TextColor) : White, st);
+    }
+    p.Text(Rect(14, 112, kWidth - 14, 130), c_.note, 11.5f, TextFaint);
+}
+
+LRESULT CALLBACK AskCard::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)l)->lpCreateParams);
+    auto* self = (AskCard*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    return self ? self->Handle(h, m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT AskCard::Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
+    auto toDip = [&](LPARAM lp) {
+        return std::pair<float, float>{GET_X_LPARAM(lp) / scale_, GET_Y_LPARAM(lp) / scale_};
+    };
+    switch (m) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_TIMER:
+            // Not while the pointer is on a button: it goes once the pointer leaves.
+            if (w == kNoticeTimer && !hover_) Answer(kTimeUp);
+            return 0;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, hover_ ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        case WM_MOUSEMOVE: {
+            auto [x, y] = toDip(l);
+            const int hov = ButtonAt(x, y);
+            if (!tracking_) {
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+                TrackMouseEvent(&tme);
+                tracking_ = true;
+            }
+            if (hov != hover_) {
+                hover_ = hov;
+                Redraw();
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            tracking_ = false;
+            if (hover_) {
+                hover_ = 0;
+                Redraw();
+                SetTimer(h, kNoticeTimer, 1500, nullptr);
+            }
+            return 0;
+        case WM_LBUTTONUP: {
+            auto [x, y] = toDip(l);
+            if (const int b = ButtonAt(x, y)) Answer(b);
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
 
 void ReplayNotice::Init(HINSTANCE inst, ID2D1Factory1* factory) {
     inst_ = inst;

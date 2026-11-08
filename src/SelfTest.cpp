@@ -53,7 +53,7 @@ double ToneLevel(const std::vector<int16_t>& stereo, size_t from, size_t n, doub
 double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double a, double b);
 std::vector<int16_t> ReadAllAudio(const VideoClip& c, int64_t from, double seconds, int& rate);
 bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
-                  bool fragmented = false, bool crash = false);
+                  bool fragmented = false, bool crash = false, bool sound = true);
 bool ProbeMp4(const std::wstring& path, const VideoConfig& v, bool sound, std::wstring& err, std::wstring& got);
 bool WriteVfrMp4(const std::wstring& path, bool hardware, std::wstring& err, std::wstring& got, bool fragmented = true);
 class Log;
@@ -2746,6 +2746,24 @@ int App::RunSelfTest(const std::wstring& dir) {
         check(kept.timerIdx == kTimerCustom && kept.TimerMinutes() == 200 && !kept.timerStop &&
                   kept.vCodec == kCodecH264 && kept.hkHook && kept.startHide == kHideMinimize,
               L"a 0.6.5 file keeps its timer, codec, taken-over hotkey and start over the old keys");
+        // 타임랩스 (#71): its own choices, read back and kept in range, and a timer end of its own.
+        {
+            Settings tl = load(L"timelapse.ini", "[OzMaker]\r\nOutput=2\r\nTimelapseInterval=5\r\nTimelapseSeconds=45\r\n"
+                                                 "TimelapseCursor=1\r\nTimelapseSkipStill=1\r\nTimelapseTimerStop=0\r\nTimer=0\r\nTimerStop=1\r\n");
+            Settings odd = load(L"timelapse_odd.ini", "[OzMaker]\r\nTimelapseInterval=9\r\nTimelapseSeconds=900\r\n");
+            Settings none = load(L"timelapse_none.ini", "[OzMaker]\r\n");
+            check(tl.output == kOutputTimelapse && tl.tlIntervalIdx == kTlCustom && tl.TlInterval() == 45 && tl.tlCursor && tl.tlSkip &&
+                      !tl.TimerStop() && tl.timerStop,
+                  L"timelapse: its settings are read back, with a timer end of its own");
+            check(odd.TlInterval() == 60 && none.TlInterval() == 2 && none.TimerStop() == none.timerStop && none.tlTimerStop &&
+                      !none.tlCursor && !none.tlSkip,
+                  L"timelapse: values stay in range, and a file from before it starts at 2초");
+            none.output = kOutputTimelapse;
+            check(none.TimerStop(), L"timelapse: stops at the timer by itself");
+            Settings apps = load(L"timelapse_apps.ini", "[OzMaker]\r\nTimelapseApp0=C:\\Paint\\paint.exe|Paint\r\nTimelapseApp1=C:\\Note\\note.exe|Note\r\n");
+            check(apps.tlApps.size() == 2 && apps.tlApps[1].path == L"C:\\Note\\note.exe" && apps.tlApps[1].name == L"Note" && none.tlApps.empty(),
+                  L"timelapse: the apps to ask about are read back");
+        }
 
         // 프레임 레이트 방식 (#55): a file from before it has none and stays 고정.
         Settings vfrOld = load(L"vfr_old.ini", "[OzMaker]\r\nVideoRateControl=1\r\n");
@@ -3065,6 +3083,29 @@ int App::RunSelfTest(const std::wstring& dir) {
             bool empty = false;
             bool ok = mp4::Unfragment(cutAll, why, &empty);
             vcheck(copied && !ok && empty, L"cut before any fragment: nothing to keep (" + why + L")");
+        }
+        // 타임랩스 파일 잇기 (#72): samples as they are, one file after the other.
+        {
+            const std::wstring a = dir + L"\\join_a.mp4", b = dir + L"\\join_b.mp4", wide = dir + L"\\join_wide.mp4", both = dir + L"\\join_both.mp4";
+            std::wstring why;
+            const bool wrote = WriteTestMp4(a, 320, 180, 45, 30, 30, why, true, false, false) &&
+                               WriteTestMp4(b, 320, 180, 75, 30, 30, why, true, false, false) &&
+                               WriteTestMp4(wide, 240, 180, 30, 30, 30, why, true, false, false);
+            auto ca = mp4::CutSource::Open(a), cb = mp4::CutSource::Open(b), cw = mp4::CutSource::Open(wide);
+            const auto all = ca && cb ? mp4::CutSource::Joined({ca, cb, ca}) : nullptr;
+            vcheck(wrote && all && all->Frames() == 165 && ca->Width() == 320 && ca->Height() == 180 && !ca->Timelapse(),
+                   util::Format(L"join: 45 + 75 + 45 frames as one source, %zu", all ? all->Frames() : 0));
+            vcheck(cw && ca && !cw->Follows(*ca) && !mp4::CutSource::Joined({ca, cw}), L"join: another size can't go on");
+            std::atomic<bool> stop{false};
+            std::atomic<float> progress{0};
+            mp4::CutSource::Result res;
+            const bool cut = all && all->Cut(0, all->Frames() - 1, false, both, stop, progress, res, why);
+            auto v = cut ? VideoClip::Open(both, why) : nullptr;
+            size_t off = 0;
+            for (size_t i = 0; v && i < v->Count(); ++i)
+                if (std::llabs(v->Ts(i) - (int64_t)((double)i * 1e7 / 30)) > 5000) ++off;
+            vcheck(v && v->Count() == 165 && off == 0 && std::fabs(v->Seconds() - 5.5) < 0.05,
+                   util::Format(L"join: read back: %zu frames, %.3f s, %zu out of step ", v ? v->Count() : 0, v ? v->Seconds() : 0, off) + why);
         }
         uint64_t size = util::FileSize(cutMoof);
         std::wstring why;
@@ -3530,6 +3571,64 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     timerFiredFor_ = 0;
     settings_.timerIdx = 0;
     settings_.timerStop = false;
+    // 타임랩스 (#71): the panel and what it warns of, the timer's result, while it runs and rests.
+    settings_.output = kOutputTimelapse;
+    batteryForTest_ = 0;
+    shot(L"home_tl.png", 96);
+    settings_.tlIntervalIdx = kTlCustom;
+    settings_.tlSeconds = 7;
+    shot(L"home_tl_custom.png", 96);
+    settings_.tlIntervalIdx = 1;
+    settings_.timerIdx = kTimerCustom;
+    settings_.timerMinutes = 384;
+    timerOpen_ = true;
+    shot(L"home_tl_timer.png", 96);
+    timerOpen_ = false;
+    shot(L"home_tl_timer_set.png", 96);
+    settings_.timerIdx = 0;
+    settings_.source = kSourceDisplay;
+    shot(L"home_tl_full.png", 96);
+    settings_.source = kSourceWindow;
+    settings_.rpOn = true;
+    shot(L"home_tl_replay.png", 96);
+    settings_.rpOn = false;
+    batteryForTest_ = 1;
+    shot(L"home_tl_battery.png", 96);
+    batteryForTest_ = 0;
+    {
+        const int sw = 172, sh = 96;
+        std::vector<uint32_t> stamp((size_t)sw * sh);
+        for (int y = 0; y < sh; ++y)
+            for (int x = 0; x < sw; ++x)
+                stamp[(size_t)y * sw + x] = 0xFF000000u | (uint32_t)(60 + y) << 16 | (uint32_t)(90 + x / 2) << 8 | (uint32_t)(150 + y / 2);
+        tlThumb_ = gfx_.CreateBitmap(sw, sh, stamp.data(), sw * 4);
+    }
+    rec_ = RecState::Recording;
+    recTl_ = true;
+    recElapsedForTest_ = 11562;
+    tlFramesForTest_ = 5781;
+    shot(L"home_tl_live.png", 96);
+    settings_.timerIdx = kTimerCustom;
+    tlFramesForTest_ = 11520;
+    shot(L"home_tl_live_timer.png", 96);
+    settings_.timerIdx = 0;
+    tlFramesForTest_ = 5781;
+    tlStillForTest_ = 23 * 60;
+    shot(L"home_tl_still.png", 96);
+    tlStillForTest_ = 0;
+    tlRestForTest_ = rpLocked_ = true;
+    shot(L"home_tl_rest.png", 96);
+    tlRestForTest_ = rpLocked_ = false;
+    tlBlack_ = true;
+    shot(L"home_tl_black.png", 96);
+    tlBlack_ = false;
+    rec_ = RecState::Idle;
+    recTl_ = false;
+    recElapsedForTest_ = -1;
+    tlFramesForTest_ = 0;
+    tlThumb_.Reset();
+    batteryForTest_ = -1;
+    settings_.output = kOutputVideo;
     // 코덱 자동 on a 5K screen (#42): HEVC at full size where this PC plays it; else H.264, made smaller.
     settings_.source = kSourceDisplay;
     sourceForTest_ = {5120, 2160};
@@ -3575,6 +3674,27 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     lastVideo_.failure = tr(L"그래픽 장치가 응답하지 않아 더 쓸 수 없었습니다. 그래픽 드라이버를 확인하거나 PC를 다시 시작해 보세요.");
     shot(L"home_video_failed.png", 96);
     lastVideo_.failure.clear();
+    // 타임랩스 (#71): the card; with time skipped and gaps; and one that couldn't go on.
+    settings_.output = kOutputTimelapse;
+    lastVideo_.timelapse = true;
+    lastVideo_.realSeconds = 23040;
+    lastVideo_.frames = 11520;
+    lastVideo_.speed = 60;
+    lastVideo_.seconds = 384;
+    lastVideo_.bytes = 412'000'000;
+    lastVideo_.from = at - 13320;  // 09:30
+    lastVideo_.to = lastVideo_.from + 23040;
+    shot(L"home_tl_saved.png", 96);
+    lastVideo_.skipped = 720;
+    lastVideo_.gaps = {{at, 38 * 60, CaptureGap::Why::Asleep}, {at + 3000, 200, CaptureGap::Why::Minimized}};
+    shot(L"home_tl_skip.png", 96);
+    lastVideo_.cutShort = tr(L"창이 닫혔습니다");
+    shot(L"home_tl_cut.png", 96);
+    lastVideo_.timelapse = false;
+    lastVideo_.skipped = 0;
+    lastVideo_.gaps.clear();
+    lastVideo_.cutShort.clear();
+    settings_.output = kOutputVideo;
     lastVideo_.seconds = 74.2;
     lastVideo_.bytes = 48'213'004;
     showVideo_ = false;
@@ -3676,11 +3796,12 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             regionPicker_.PaintTest(p, mr, a, c);
         });
         // The recording pill: recording (stop hovered) and paused (resume hovered), then with the record timer
-        // (#47) and with its time up, and recording three windows (#48), at 150 %.
-        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 510, 342, 144, [&](ID2D1DeviceContext* dc) {
+        // (#47) and with its time up, recording three windows (#48), and a timelapse with its count, with the timer
+        // too (#71), at 150 %.
+        gfx_.RenderToPng((dir + L"\\rec_pill.png").c_str(), 600, 474, 144, [&](ID2D1DeviceContext* dc) {
             Painter p;
             p.Bind(dc);
-            p.Fill(Rect(0, 0, 340, 228), theme::Hex(0x2B4C7E));
+            p.Fill(Rect(0, 0, 400, 316), theme::Hex(0x2B4C7E));
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 6));
             overlay_.PaintTest(p, 73.4, false, 2);
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 50));
@@ -3691,6 +3812,25 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
             overlay_.PaintTest(p, 12034.5, false, 0, 200 * 60, true);
             dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 182));
             overlay_.PaintTest(p, 73.4, false, 0, 0, false, 3);  // 여러 창 녹화 (#48): three windows
+            overlay_.SetNote(L"5,781" + std::wstring(tr(L"장")));
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 226));
+            overlay_.PaintTest(p, 11562, false, 0);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(6, 270));
+            overlay_.PaintTest(p, 11562, true, 0, 384 * 60);
+            overlay_.SetNote({});
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        });
+        // 앱이 열리면 묻기 (#73): the card in the corner, at 150 %, and with 시작 under the pointer.
+        gfx_.RenderToPng((dir + L"\\ask_card.png").c_str(), 480, 480, 144, [&](ID2D1DeviceContext* dc) {
+            Painter p;
+            p.Bind(dc);
+            p.Fill(Rect(0, 0, 320, 320), theme::Hex(0x2B4C7E));
+            const AskCard::Content c{look == L"en" ? L"Canvas Studio opened" : L"캔버스 스튜디오가 열렸습니다",
+                                     util::Format(tr(L"타임랩스 · %d초 간격 · 소리 없음"), 2), util::Format(tr(L"%d초 뒤에 사라집니다"), 30)};
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(10, 10));
+            askCard_.PaintTest(p, c, 0);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(10, 165));
+            askCard_.PaintTest(p, c, AskCard::kStart);
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
         });
         // 순간 리플레이's save notice (#20): with 편집 · 폴더 (편집 under the pointer), over a game that holds the mouse
@@ -3844,6 +3984,17 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         hkConflict_ = {kHotkeyRecord, MOD_ALT, VK_F9};
         shot(L"settings_record_conflict.png", 96);
         hkConflict_ = {};
+        // 앱이 열리면 묻기 (#73): the programs listed; then adding one.
+        settings_.tlApps = {{false, L"C:\\Paint\\canvas.exe", look == L"en" ? L"Canvas Studio" : L"캔버스 스튜디오", true}};
+        settingsScroll_ = 300;
+        shot(L"settings_record_apps.png", 96);
+        rpRunning_ = {{L"C:\\Note\\pixelnote.exe", look == L"en" ? L"Pixel Note" : L"픽셀 노트", false}};
+        tlAddOpen_ = true;
+        shot(L"settings_record_apps_add.png", 96);
+        tlAddOpen_ = false;
+        rpRunning_.clear();
+        settings_.tlApps.clear();
+        settingsScroll_ = 0;
         settings_.timerIdx = 0;
         settings_.timerStop = false;
         settings_.startHide = kHideToTray;
@@ -4057,6 +4208,42 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     held_.clear();
     recentFiles_.clear();
     shot(L"edit_home_empty.png", 96);
+    // 타임랩스 파일 잇기 (#72): three files, another size, one that isn't a timelapse, a long list, saving.
+    {
+        join_ = std::make_unique<Join>();
+        auto file = [&](const wchar_t* name, double seconds, int w, int h, const wchar_t* day) {
+            JoinFile f;
+            f.path = settings_.outDir + L"\\" + name;
+            f.day = day;
+            f.timelapse = true;
+            f.w = w;
+            f.h = h;
+            f.seconds = seconds;
+            f.frames = (size_t)(seconds * kTlFps);
+            join_->files.push_back(f);
+        };
+        const bool en = look == L"en";
+        file(L"OzMaker_20261104_093012.mp4", 132, 1920, 1080, en ? L"Nov 4" : L"11월 4일");
+        file(L"OzMaker_20261105_101544.mp4", 168, 1920, 1080, en ? L"Nov 5" : L"11월 5일");
+        file(L"OzMaker_20261106_094120.mp4", 84, 1920, 1080, en ? L"Nov 6" : L"11월 6일");
+        shot(L"edit_join.png", 96);
+        join_->files[2].w = 1600;
+        join_->files[2].h = 900;
+        shot(L"edit_join_size.png", 96);
+        join_->files[2].w = 1920;
+        join_->files[2].h = 1080;
+        join_->files[1].timelapse = false;
+        shot(L"edit_join_other.png", 96);
+        join_->files[1].timelapse = true;
+        for (int i = 7; i < 15; ++i) file(util::Format(L"OzMaker_202611%02d_094120.mp4", i).c_str(), 60, 1920, 1080, en ? L"Nov 7" : L"11월 7일");
+        shot(L"edit_join_many.png", 96);
+        join_->files.resize(3);
+        join_->busy = true;
+        join_->progress = 0.42f;
+        shot(L"edit_join_saving.png", 96);
+        join_->busy = false;
+        join_.reset();
+    }
     // A video saved as MP4 (#22): at 고화질 it is cut as it is, from the keyframe before the range (the yellow line);
     // at 1.5× it is encoded again, and the panel says why.
     if (std::wstring video = dir + L"\\shot_video.mp4", err; WriteTestMp4(video, 960, 540, 180, 30, 60, err)) {
@@ -5147,7 +5334,7 @@ double ToneSwitch(const std::vector<int16_t>& st, int rate, double after, double
 
 // crash: the process crashes once the frames are written, the file as a crash leaves it (for the recovery test).
 bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, int gop, std::wstring& err,
-                  bool fragmented, bool crash) {
+                  bool fragmented, bool crash, bool sound) {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11Multithread> mt;
@@ -5175,7 +5362,7 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
     v.gopFrames = gop;
     v.fragmented = fragmented;
     AudioConfig a;
-    a.enabled = true;
+    a.enabled = sound;
     Mp4Writer w;
     if (!w.Open(path, v, a, dev.Get(), err)) return false;
     std::vector<uint8_t> px((size_t)W * H * 4);
@@ -5195,7 +5382,7 @@ bool WriteTestMp4(const std::wstring& path, int W, int H, int frames, int fps, i
             pcm.push_back(x);
             pcm.push_back(x);
         }
-        w.PushAudio(pcm.data(), pcm.size() / 2);
+        if (sound) w.PushAudio(pcm.data(), pcm.size() / 2);
         pushed = want;
         if (!s || !w.WriteVideo(s.Get(), (int64_t)k * 10'000'000 / fps, (int64_t)(k + 1) * 10'000'000 / fps -
                                                                              (int64_t)k * 10'000'000 / fps)) {
@@ -7185,6 +7372,28 @@ int App::RunMultiTest(const std::wstring& dir) {
     held_.clear();
     CloseEditor();
 
+    // 타임랩스 (#71): a file each too, and a window that is minimized rests by itself.
+    settings_.output = kOutputTimelapse;
+    tlMsForTest_ = 200;
+    StartRecording(PickedTargets(), true);
+    check(rec_ == RecState::Recording && recTl_ && recs_.size() == 2, L"multi timelapse: two windows recording");
+    pump(1.5, nullptr);
+    ShowWindow(wins[1], SW_SHOWMINNOACTIVE);
+    pump(1.5, nullptr);
+    check(recs_.size() == 2 && !recs_[0].capture->Paused() && recs_[1].capture->Paused() && !RecResting(),
+          L"multi timelapse: the minimized window rests, the other goes on");
+    ShowWindow(wins[1], SW_SHOWNOACTIVATE);
+    pump(1, nullptr);
+    StopRecording();
+    tlMsForTest_ = 0;
+    if (lastVideos_.size() == 2) {
+        const CaptureResult &a = lastVideos_[0].r, &b = lastVideos_[1].r;
+        check(a.timelapse && b.timelapse && a.gaps.empty() && b.gaps.size() == 1 && a.frames >= 15 && b.frames + 4 <= a.frames,
+              util::Format(L"multi timelapse: %zu and %zu frames, %zu and %zu gaps", a.frames, b.frames, a.gaps.size(), b.gaps.size()));
+    } else {
+        check(false, util::Format(L"multi timelapse: %zu files", lastVideos_.size()));
+    }
+
     // MP4: a file each; the first window closes partway.
     settings_.output = kOutputVideo;
     StartRecording(PickedTargets(), true);
@@ -7404,6 +7613,421 @@ int App::RunSafetyTest(const std::wstring& dir) {
     stopped(L"encoder gone, file not finished", false, true);
 
     cleanup();
+    lastVideo_ = {};
+    quitting_ = true;
+    DestroyWindow(hwnd_);
+    pump(1.0, nullptr);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+// 타임랩스 (#71), recorded for real: --test-window at a short interval, the files read back, and what the app does
+// around them. With crash: a child that records and is gone, for the parent to find its file.
+int App::RunTimelapseTest(const std::wstring& dir, bool crash) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + (crash ? L"\\timelapse-crash.log" : L"\\timelapse-test.log"));
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    settings_.outDir = dir;
+    settings_.sounds = false;
+    settings_.mic = false;  // never the real microphone: it records the room
+    settings_.audio = true; // and a timelapse has no sound all the same
+    settings_.rpOn = false;
+    settings_.source = kSourceWindow;
+    settings_.multiWindow = false;
+    settings_.nameTemplate = kNameTemplates[0];
+    settings_.output = kOutputTimelapse;
+    settings_.tlSkip = false;
+    settings_.timerIdx = 0;
+    tlMsForTest_ = crash ? 100 : 200;
+    if (!CreateMainWindow(SW_HIDE)) return 1;
+    auto pump = [&](double seconds, const std::function<bool()>& until) {
+        const double end = util::NowSeconds() + seconds;
+        MSG msg;
+        while (util::NowSeconds() < end && !(until && until())) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    };
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + util::ExePath() + L"\" --test-window 200 capture";
+    STARTUPINFOW si{sizeof(si)};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        log(L"FAIL can't start --test-window");
+        return 1;
+    }
+    HWND win = nullptr;
+    double nextList = 0;
+    pump(8, [&] {
+        if (util::NowSeconds() < nextList) return false;
+        nextList = util::NowSeconds() + 0.2;
+        RefreshWindows();
+        for (const WinInfo& w : windows_) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w.hwnd, &pid);
+            if (pid == pi.dwProcessId) win = w.hwnd;
+        }
+        return win != nullptr;
+    });
+    auto cleanup = [&] {
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    };
+    check(win != nullptr, L"the test window is listed");
+    if (!win) {
+        cleanup();
+        return 1;
+    }
+    SetWindowPos(win, nullptr, 0, 0, 800, 500, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    if (crash) {  // gone the way a power cut or a kill goes: nothing runs after this
+        StartRecording(WindowTarget(win), true);
+        pump(18, nullptr);
+        log(util::Format(L"frames written: %zu", recs_.empty() ? 0 : recs_[0].capture->Frames()));
+        cleanup();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    const auto awake = [] {
+        const EXECUTION_STATE both = ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED;
+        return (SetThreadExecutionState(0) & both) == both;
+    };
+    auto session = [&](WPARAM what) { SendMessageW(hwnd_, WM_WTSSESSION_CHANGE, what, 0); };
+    auto power = [&](WPARAM what) { SendMessageW(hwnd_, WM_POWERBROADCAST, what, 0); };
+    auto frames = [&] { return recs_.empty() || !recs_[0].capture ? size_t{0} : recs_[0].capture->Frames(); };
+    // A file reads back as what the card said: a frame every 1/30 s from the start, whatever came between, and no sound.
+    auto readBack = [&](const wchar_t* name, const std::wstring& path, size_t want) -> std::shared_ptr<VideoClip> {
+        std::wstring err;
+        auto v = VideoClip::Open(path, err);
+        if (!v) {
+            check(false, std::wstring(name) + L": the file opens: " + err);
+            return nullptr;
+        }
+        size_t off = 0;
+        for (size_t i = 0; i < v->Count(); ++i)
+            if (std::llabs(v->Ts(i) - (int64_t)((double)i * 1e7 / kTlFps)) > 5000) ++off;
+        const double seconds = v->EndTs() / 1e7, should = (double)v->Count() / kTlFps;
+        check((!want || v->Count() == want) && off == 0 && !v->HasAudio() && std::fabs(seconds - should) < 0.05,
+              util::Format(L"%s: %zu frames (%zu on the card), %zu out of step, %.3f s of %.3f", name, v->Count(), want, off, seconds, should));
+        return v;
+    };
+
+    // What the panel says, from the choice alone.
+    settings_.timerIdx = kTimerCustom;
+    settings_.timerMinutes = 384;
+    check(TlLine() == L"6시간 24분이 6분 24초로 · 11,520장 · 소리 없음", L"line: " + TlLine());
+    settings_.timerMinutes = 180;
+    check(TlLine() == L"3시간이 3분으로 · 5,400장 · 소리 없음", L"line: " + TlLine());
+    settings_.timerIdx = 0;
+    check(TlLine() == L"1시간이 1분으로 · 60배 · 소리 없음", L"line: " + TlLine());
+    settings_.tlIntervalIdx = kTlCustom;
+    settings_.tlSeconds = 7;
+    check(settings_.TlInterval() == 7 && TlLine() == L"1시간이 17초로 · 210배 · 소리 없음", L"line: " + TlLine());
+    settings_.tlIntervalIdx = 1;
+
+    // Plain, with a pause: file time goes on from where it was, and the pause isn't in the picture.
+    check(!awake(), L"awake: nothing asked for before recording");
+    StartRecording(WindowTarget(win), true);
+    check(rec_ == RecState::Recording && recTl_ && awake(), L"recording, and staying awake");
+    pump(3, nullptr);
+    TogglePause();
+    const size_t paused = frames();
+    check(!awake(), L"pause: awake let go of");
+    pump(1, nullptr);
+    check(frames() == paused, L"pause: nothing written");
+    TogglePause();
+    pump(2, nullptr);
+    StopRecording();
+    check(rec_ == RecState::Idle && !awake() && tlChecked_ && !tlBlack_, L"stopped, awake let go of, the first picture looked at and not black");
+    check(lastVideo_.ok && lastVideo_.timelapse && lastVideo_.frames >= 20 && lastVideo_.frames <= 30 && lastVideo_.speed == 6 && !lastVideo_.audio &&
+              lastVideo_.realSeconds > 4.5 && lastVideo_.realSeconds < 5.8 && lastVideo_.from && lastVideo_.to >= lastVideo_.from + 5,
+          util::Format(L"plain: %zu frames, %d×, %.2f s taken, %.2f s of video", lastVideo_.frames, lastVideo_.speed, lastVideo_.realSeconds, lastVideo_.seconds));
+    const std::wstring plain = lastVideo_.path;
+    if (auto v = readBack(L"plain", lastVideo_.path, lastVideo_.frames)) {
+        // A white square blinks in the window's corner every 1.5 s: the frames hold what was on screen, and move on.
+        auto reader = v->NewReader();
+        const size_t at = ((size_t)(44 * v->Height() / 500) * v->Width() + (size_t)(36 * v->Width() / 800)) * 4;
+        int moves = 0;
+        bool white = false;
+        for (size_t i = 0; i < v->Count(); ++i) {
+            const uint8_t* px = reader->Get(i);
+            if (!px) continue;
+            const bool now = px[at + 1] > 170;
+            if (i && now != white) ++moves;
+            white = now;
+        }
+        check(moves >= 2, util::Format(L"plain: the picture moved %d times", moves));
+    }
+
+    // 멈춘 화면 건너뛰기: only the ticks that show a change are written, and the time left out is told.
+    settings_.tlSkip = true;
+    StartRecording(WindowTarget(win), true);
+    pump(6, nullptr);
+    StopRecording();
+    settings_.tlSkip = false;
+    check(lastVideo_.frames >= 3 && lastVideo_.frames <= 10 && lastVideo_.skipped > 3,
+          util::Format(L"skip: %zu frames, %.1f s left out", lastVideo_.frames, lastVideo_.skipped));
+    readBack(L"skip", lastVideo_.path, lastVideo_.frames);
+    const std::wstring skipped = lastVideo_.path;
+
+    // Rests by itself and goes on by itself. Nothing is written, nothing keeps the PC awake, and the reason is told.
+    StartRecording(WindowTarget(win), true);
+    pump(1.2, nullptr);
+    auto rests = [&](const wchar_t* name, const wchar_t* why, const std::function<void()>& on, const std::function<void()>& off) {
+        on();
+        pump(0.5, nullptr);
+        const size_t at = frames();
+        const bool resting = RecResting() && !awake();
+        const std::wstring said = TlRestWhy();
+        pump(1.5, nullptr);
+        check(resting && frames() == at && said == why, std::wstring(name) + L": rests, says " + said);
+        off();
+        pump(0.6, nullptr);
+        check(!RecResting() && awake(), std::wstring(name) + L": goes on");
+        pump(1, nullptr);
+        check(frames() > at, util::Format(L"%s: frames again, %zu to %zu", name, at, frames()));
+    };
+    rests(L"locked", tr(L"화면 잠김"), [&] { session(WTS_SESSION_LOCK); }, [&] { session(WTS_SESSION_UNLOCK); });
+    rests(L"asleep", tr(L"절전"), [&] { power(PBT_APMSUSPEND); }, [&] { power(PBT_APMRESUMEAUTOMATIC); });
+    rests(L"minimized", tr(L"창 최소화"), [&] { ShowWindow(win, SW_SHOWMINNOACTIVE); }, [&] { ShowWindow(win, SW_SHOWNOACTIVATE); });
+    // A pause of one's own outlasts a lock: unlocking doesn't start it again.
+    TogglePause();
+    session(WTS_SESSION_LOCK);
+    pump(0.3, nullptr);
+    session(WTS_SESSION_UNLOCK);
+    pump(0.4, nullptr);
+    check(RecResting() && recPaused_, L"a pause stays through a lock");
+    TogglePause();
+    pump(0.4, nullptr);
+    check(!RecResting(), L"and ends with the press");
+    StopRecording();
+    {
+        using Why = CaptureGap::Why;
+        const std::vector<CaptureGap>& g = lastVideo_.gaps;
+        std::wstring lengths;
+        for (const CaptureGap& x : g) lengths += util::Format(L" %.0f", x.seconds);
+        check(g.size() == 3 && g[0].why == Why::Locked && g[1].why == Why::Asleep && g[2].why == Why::Minimized,
+              util::Format(L"rests: %zu gaps on the result:", g.size()) + lengths);
+    }
+    readBack(L"rests", lastVideo_.path, lastVideo_.frames);
+    const std::wstring rested = lastVideo_.path;
+
+    // The timer stops it by itself, over a keyframe or two: 300 frames.
+    settings_.timerIdx = kTimerCustom;
+    settings_.timerMinutes = 1;
+    settings_.timerStop = false;
+    settings_.tlTimerStop = true;
+    StartRecording(WindowTarget(win), true);
+    pump(70, [&] { return rec_ != RecState::Recording; });
+    settings_.timerIdx = 0;
+    check(rec_ == RecState::Idle && lastVideo_.frames >= 285 && lastVideo_.frames <= 305 && lastVideo_.realSeconds < 62,
+          util::Format(L"timer: stopped after %.1f s, %zu frames", lastVideo_.realSeconds, lastVideo_.frames));
+    readBack(L"timer", lastVideo_.path, lastVideo_.frames);
+
+    // 타임랩스 파일 잇기 (#72), on real files: the order they are put in, every frame as it was, the originals untouched;
+    // and what stops it.
+    {
+        // Another size, and a recording that isn't a timelapse.
+        SetWindowPos(win, nullptr, 0, 0, 640, 400, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        pump(0.5, nullptr);
+        StartRecording(WindowTarget(win), true);
+        pump(1.2, nullptr);
+        StopRecording();
+        const std::wstring narrow = lastVideo_.path;
+        SetWindowPos(win, nullptr, 0, 0, 800, 500, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        pump(0.5, nullptr);
+        settings_.output = kOutputVideo;
+        StartRecording(WindowTarget(win), true);
+        pump(1.2, nullptr);
+        StopRecording();
+        const std::wstring normal = lastVideo_.path;
+        settings_.output = kOutputTimelapse;
+        auto marked = [](const std::wstring& p) {
+            auto c = mp4::CutSource::Open(p);
+            return c && c->Timelapse();
+        };
+        check(marked(plain) && marked(narrow) && !marked(normal), L"join: a timelapse says so, a recording doesn't");
+        auto blocked = [&](const std::vector<std::wstring>& paths) {
+            OpenJoin(paths);
+            auto p = join_ ? JoinProblem() : std::pair<int, std::wstring>{-2, L"no dialog"};
+            join_.reset();
+            return p;
+        };
+        const auto bySize = blocked({plain, narrow}), byKind = blocked({plain, normal});
+        check(bySize.first == 1 && bySize.second.find(L"크기") != std::wstring::npos, L"join: another size is refused: " + bySize.second);
+        check(byKind.first == 1 && byKind.second.find(L"타임랩스") != std::wstring::npos, L"join: a plain recording is refused: " + byKind.second);
+        OpenJoin({plain});
+        check(!join_, L"join: one file isn't enough: " + toast_);
+        OpenDropped({skipped, normal});
+        check(join_ && join_->files.size() == 2, L"join: dropping a timelapse with another file opens the dialog");
+        join_.reset();
+
+        OpenJoin({rested, plain, skipped});
+        check(join_ && join_->files.size() == 3 && join_->files[0].path == plain && join_->files[2].path == rested && JoinProblem().first < 0,
+              L"join: oldest first, and nothing stops it: " + (join_ ? JoinProblem().second : L""));
+        if (join_ && JoinProblem().first < 0) {
+            std::swap(join_->files[0], join_->files[2]);  // what the buttons do: rested, skipped, plain
+            const uint64_t before = util::FileSize(plain);
+            const std::vector<std::wstring> order = {join_->files[0].path, join_->files[1].path, join_->files[2].path};
+            JoinSave();
+            pump(20, [&] { return !join_; });
+            const std::wstring both = lastVideo_.path, opened = clip_ ? clip_->SourcePath() : L"";
+            check(!join_ && !opened.empty() && opened.ends_with(L"_joined.mp4") && toast_.find(util::FileNameOf(opened)) != std::wstring::npos,
+                  L"join: saved and opened: " + toast_);
+            CloseEditor();
+            CloseClip();
+            screen_ = Screen::Home;
+            check(util::FileSize(plain) == before && marked(opened), L"join: the original is as it was, and the new file is a timelapse too");
+            std::wstring err;
+            size_t total = 0;
+            std::vector<std::shared_ptr<VideoClip>> parts;
+            for (const std::wstring& p : order) {
+                parts.push_back(VideoClip::Open(p, err));
+                total += parts.back() ? parts.back()->Count() : 0;
+            }
+            if (auto v = readBack(L"join", opened, total)) {
+                // Every frame of every part, at its place, decoded alike.
+                auto reader = v->NewReader();
+                const size_t bytes = (size_t)v->Width() * v->Height() * 4;
+                size_t at = 0, wrong = 0;
+                for (auto& part : parts) {
+                    auto from = part->NewReader();
+                    for (size_t i = 0; i < part->Count(); ++i, ++at) {
+                        std::vector<uint8_t> want;
+                        if (const uint8_t* px = from->Get(i)) want.assign(px, px + bytes);
+                        const uint8_t* got = reader->Get(at);
+                        if (want.empty() || !got || memcmp(want.data(), got, bytes)) ++wrong;
+                    }
+                }
+                check(wrong == 0, util::Format(L"join: %zu frames compared, %zu differ", at, wrong));
+            }
+            parts.clear();
+            OpenJoin({opened, plain});
+            check(join_ && JoinProblem().first < 0, L"join: a joined file can be joined again");
+            join_.reset();
+        }
+    }
+
+    // The window goes away: what was taken is kept, and the card says why it ended.
+    StartRecording(WindowTarget(win), true);
+    pump(2, nullptr);
+    PostMessageW(win, WM_CLOSE, 0, 0);
+    pump(6, [&] { return rec_ != RecState::Recording; });
+    check(rec_ == RecState::Idle && lastVideo_.ok && lastVideo_.cutShort == tr(L"창이 닫혔습니다") && lastVideo_.frames >= 5,
+          util::Format(L"closed: %zu frames: ", lastVideo_.frames) + lastVideo_.cutShort);
+    readBack(L"closed", lastVideo_.path, lastVideo_.frames);
+    cleanup();
+
+    // 앱이 열리면 묻기 (#73): a card that only asks. The registered program is this exe: its --test-window is what opens.
+    {
+        PROCESS_INFORMATION app{};
+        auto open = [&] {
+            std::wstring line = L"\"" + util::ExePath() + L"\" --test-window 60 capture";
+            STARTUPINFOW asi{sizeof(asi)};
+            if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &asi, &app)) return false;
+            bool shown = false;
+            pump(8, [&] {
+                RefreshWindows();
+                for (const WinInfo& w : windows_) {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(w.hwnd, &pid);
+                    shown |= pid == app.dwProcessId;
+                }
+                return shown;
+            });
+            return shown;
+        };
+        auto close = [&] {
+            TerminateProcess(app.hProcess, 0);
+            WaitForSingleObject(app.hProcess, 3000);
+            CloseHandle(app.hProcess);
+            CloseHandle(app.hThread);
+            pump(0.3, nullptr);
+            TlAskTick();
+        };
+        settings_.output = kOutputVideo;
+        check(open(), L"ask: the test window opens");
+        settings_.tlApps = {{false, util::ExePath(), L"테스트 앱", true}};
+        askMsForTest_ = 1500;
+        TlAskArm();
+        check(!askCard_.Visible(), L"ask: an app open when it was added isn't asked about");
+        close();
+        check(open(), L"ask: it opens again");
+        const HWND front = GetForegroundWindow();
+        TlAskTick();
+        check(askCard_.Visible() && rec_ == RecState::Idle, L"ask: the app opened: the card is up and nothing records");
+        pump(0.3, nullptr);
+        check(GetForegroundWindow() == front, L"ask: the card takes no focus");
+        pump(3, [&] { return !askCard_.Visible(); });
+        check(!askCard_.Visible() && rec_ == RecState::Idle, L"ask: time up: it goes, and nothing recorded");
+        TlAskTick();
+        check(!askCard_.Visible(), L"ask: not again while the app stays open");
+        close();
+        askMsForTest_ = 20000;
+        open();
+        TlAskTick();
+        const bool up = askCard_.Visible();
+        askCard_.Hide();
+        TlAskAnswer(AskCard::kSkip);
+        check(up && rec_ == RecState::Idle, L"ask: 이번에는 안 함: nothing recorded: " + toast_);
+        close();
+        open();
+        TlAskTick();
+        check(askCard_.Visible(), L"ask: asked again the next time it opens");
+        askCard_.Hide();
+        TlAskAnswer(AskCard::kStart);
+        check(rec_ == RecState::Recording && recTl_ && recs_.size() == 1 && recs_[0].target.hwnd == tlAskWindow_,
+              L"ask: 타임랩스 시작: that window, as a timelapse");
+        pump(1.5, nullptr);
+        StopRecording();
+        TlAskTick();
+        check(lastVideo_.ok && lastVideo_.timelapse && lastVideo_.frames >= 4 && settings_.output == kOutputVideo,
+              util::Format(L"ask: %zu frames, and 결과물 is back to what it was", lastVideo_.frames));
+        close();
+        settings_.Save();
+        // Only the exe and the name: no window title in the file.
+        HANDLE ini = CreateFileW(Settings::FilePath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::string bytes((size_t)util::FileSize(Settings::FilePath()), '\0');
+        DWORD got = 0;
+        const bool read = ini != INVALID_HANDLE_VALUE && ReadFile(ini, bytes.data(), (DWORD)bytes.size(), &got, nullptr);
+        if (ini != INVALID_HANDLE_VALUE) CloseHandle(ini);
+        const std::wstring_view wide(reinterpret_cast<const wchar_t*>(bytes.data()), bytes.size() / 2);
+        check(read && bytes.find("Test Window") == std::string::npos && wide.find(L"Test Window") == std::wstring_view::npos &&
+                  (bytes.find("TimelapseApp0") != std::string::npos || wide.find(L"TimelapseApp0") != std::wstring_view::npos),
+              L"ask: the settings file has the app, and no window title");
+        settings_.tlApps.clear();
+        settings_.output = kOutputTimelapse;
+        TlAskArm();
+    }
+
+    // Gone in the middle: the next start finds a file that plays at the same speed, up to the last whole fragment.
+    {
+        const std::wstring sub = dir + L"\\crash";
+        util::EnsureDir(sub);
+        std::wstring child = L"\"" + util::ExePath() + L"\" --timelapse-test \"" + sub + L"\" crash";
+        STARTUPINFOW csi{sizeof(csi)};
+        PROCESS_INFORMATION cpi{};
+        const bool ran = CreateProcessW(nullptr, child.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &csi, &cpi);
+        if (ran) {
+            if (WaitForSingleObject(cpi.hProcess, 60000) != WAIT_OBJECT_0) TerminateProcess(cpi.hProcess, 1);
+            CloseHandle(cpi.hThread);
+            CloseHandle(cpi.hProcess);
+        }
+        const std::vector<std::wstring> found = Mp4Writer::Recover();
+        check(ran && found.size() == 1, util::Format(L"crash: %zu file(s) found", found.size()));
+        if (found.size() == 1) {
+            if (auto v = readBack(L"crash", found[0], 0)) log(util::Format(L"crash: %zu frames came back", v->Count()));
+            auto c = mp4::CutSource::Open(found[0]);
+            check(c && c->Timelapse(), L"crash: still known as a timelapse");
+        }
+    }
+
     lastVideo_ = {};
     quitting_ = true;
     DestroyWindow(hwnd_);

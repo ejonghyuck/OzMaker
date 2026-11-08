@@ -45,6 +45,7 @@ public:
     void SetTimer(int seconds, bool up);
     // 여러 창 녹화 (#48): how many windows are recorded, shown after REC as "창 2개" (0 or 1: nothing).
     void SetCount(int windows);
+    void SetNote(const std::wstring& text);  // a timelapse's count after the time, and 타임랩스 for REC: 5,781장 (#71)
     // The window the pill sits on closed while the others go on: onto the next one.
     void MoveTo(const RECT& target);
     void ShowFrame(const RECT& area);
@@ -83,6 +84,9 @@ private:
     int timer_ = 0;  // seconds, 0 = none
     bool timerUp_ = false;
     int count_ = 0;       // windows recorded (SetCount)
+    std::wstring note_;   // SetNote
+    std::wstring ChipText() const;
+    void ChipChanged();
     float countW_ = 0;    // the room its label takes, DIPs
     int hover_ = 0;  // ButtonAt under the mouse
     bool tracking_ = false, paused_ = false, motion_ = true;
@@ -93,6 +97,42 @@ private:
 // 순간 리플레이's notice that a replay was saved (#20), over the top middle of what was held, like the REC pill: never
 // in recordings and never taking the focus. With 편집 and 폴더 only when the mouse is free; while a game holds the
 // mouse it has no buttons, lets clicks through to the game and goes after 3 s.
+// 앱이 열리면 묻기 (#73): a card in the corner of the screen. It takes no focus and stays out of recordings; what it
+// asks is only asked, and when the time is up it goes without anything having happened.
+class AskCard {
+public:
+    struct Content {
+        std::wstring title, sub, note;
+    };
+    enum : int { kTimeUp = 0, kStart = 1, kSkip = 2 };
+    void Init(HINSTANCE inst, ID2D1Factory1* factory);
+    // near: the program's window, screen pixels: the card goes in the corner of its monitor.
+    void Show(const RECT& near_, Content c, DWORD ms, std::function<void(int)> onAnswer);
+    void Hide();
+    bool Visible() const { return shown_; }
+    void PaintTest(Painter& p, const Content& c, int hover);  // screenshots: drawn at the origin, without a window
+    static constexpr float kWidth = 300, kHeight = 140;
+
+private:
+    static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT Handle(HWND, UINT, WPARAM, LPARAM);
+    void Paint(Painter& p);
+    Rect ButtonRect(int b) const;
+    int ButtonAt(float x, float y) const;
+    void Redraw();
+    void Answer(int how);
+
+    HINSTANCE inst_ = nullptr;
+    ID2D1Factory1* factory_ = nullptr;
+    LayeredWindow win_;
+    RECT rect_{};
+    float scale_ = 1;
+    Content c_;
+    std::function<void(int)> onAnswer_;
+    int hover_ = 0;
+    bool shown_ = false, tracking_ = false;
+};
+
 class ReplayNotice {
 public:
     struct Content {

@@ -76,6 +76,7 @@ bool CutSource::ReadTrack(const Bytes& moov, size_t trak, uint32_t movieScale, T
     const uint8_t* sd = Body(moov, box(kStsd), 16);
     if (!sd || Be32(sd + 4) != 1) return false;
     codec = Be32(sd + 12);
+    t.format.assign(sd, sd + box(kStsd)->BodySize());
 
     // Durations (stts) give the decode times.
     const uint8_t* p = Body(moov, box(Tag("stts")), 8);
@@ -237,6 +238,10 @@ std::shared_ptr<const CutSource> CutSource::Open(const std::wstring& path) {
         if (handler == Tag("vide") && !video) {
             if (!ReadTrack(moov, i, c->movieScale_, c->video_, codec)) return nullptr;
             c->avc_ = codec == Tag("avc1") || codec == Tag("avc3");
+            if (const auto& sd = c->video_.format; sd.size() >= 44) {  // a visual sample entry
+                c->width_ = sd[40] << 8 | sd[41];
+                c->height_ = sd[42] << 8 | sd[43];
+            }
             if (!c->avc_ && codec != Tag("hvc1") && codec != Tag("hev1")) return nullptr;
             c->video_.trak = i;
             video = true;
@@ -247,14 +252,47 @@ std::shared_ptr<const CutSource> CutSource::Open(const std::wstring& path) {
         }
     }
     if (!video) return nullptr;
-    // Frames in the order they show, as VideoClip numbers them.
-    const auto& vs = c->video_.samples;
-    c->shown_.resize(vs.size());
-    for (size_t i = 0; i < vs.size(); ++i) c->shown_[i] = (uint32_t)i;
-    std::stable_sort(c->shown_.begin(), c->shown_.end(), [&](uint32_t a, uint32_t b) {
+    for (const Box& x : kids)
+        if (x.type == kUdta && Find(Children(moov, x), kTimelapseMark)) c->timelapse_ = true;
+    c->SortShown();
+    c->path_ = path;
+    return c;
+}
+
+// Frames in the order they show, as VideoClip numbers them.
+void CutSource::SortShown() {
+    const auto& vs = video_.samples;
+    shown_.resize(vs.size());
+    for (size_t i = 0; i < vs.size(); ++i) shown_[i] = (uint32_t)i;
+    std::stable_sort(shown_.begin(), shown_.end(), [&](uint32_t a, uint32_t b) {
         return (int64_t)vs[a].dts + vs[a].cto < (int64_t)vs[b].dts + vs[b].cto;
     });
-    c->path_ = path;
+}
+
+bool CutSource::Follows(const CutSource& first) const {
+    return avc_ && first.avc_ && !HasAudio() && !first.HasAudio() && video_.timescale == first.video_.timescale &&
+           video_.format == first.video_.format;
+}
+
+std::shared_ptr<const CutSource> CutSource::Joined(const std::vector<std::shared_ptr<const CutSource>>& parts) {
+    if (parts.empty()) return nullptr;
+    auto c = std::make_shared<CutSource>(*parts[0]);  // the first file's boxes, which the new moov is made from
+    c->video_.samples.clear();
+    uint64_t base = 0, dts = 0;
+    for (const auto& p : parts) {
+        if (!p->Follows(*parts[0])) return nullptr;
+        c->joined_.push_back({base, p->path_});
+        uint64_t end = 0;
+        for (Sample s : p->video_.samples) {
+            end = std::max(end, s.offset + s.size);
+            s.offset += base;
+            s.dts += dts;
+            c->video_.samples.push_back(s);
+        }
+        base += end;
+        dts += (uint64_t)p->video_.End();
+    }
+    c->SortShown();
     return c;
 }
 
@@ -467,9 +505,14 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
     }
 
     File src, dst;
-    src.h = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (!src.Ok()) {
+    auto open = [&](const std::wstring& path) {
+        if (src.Ok()) CloseHandle(src.h);
+        src.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        return src.Ok();
+    };
+    size_t part = 0;  // of joined_, which samples go through in order
+    if (!open(joined_.empty() ? path_ : joined_[0].second)) {
         err = tr(L"원본 동영상을 열 수 없습니다.");
         return false;
     }
@@ -500,7 +543,12 @@ bool CutSource::Cut(size_t first, size_t last, bool sound, const std::wstring& o
             while (j < end && s[j].offset == s[j - 1].offset + s[j - 1].size && n + s[j].size <= (32u << 20))
                 n += s[j++].size;
             buf.resize(n);
-            if (!src.ReadAt(s[i].offset, buf.data(), n)) {
+            while (part + 1 < joined_.size() && s[i].offset >= joined_[part + 1].first)
+                if (!open(joined_[++part].second)) {
+                    err = tr(L"원본 동영상을 열 수 없습니다.");
+                    return false;
+                }
+            if (!src.ReadAt(s[i].offset - (joined_.empty() ? 0 : joined_[part].first), buf.data(), n)) {
                 err = tr(L"원본 동영상을 읽을 수 없습니다.");
                 return false;
             }

@@ -9,6 +9,8 @@ constexpr uint32_t Tag(const char (&s)[5]) {
     return (uint32_t)(uint8_t)s[0] << 24 | (uint32_t)(uint8_t)s[1] << 16 | (uint32_t)(uint8_t)s[2] << 8 |
            (uint8_t)s[3];
 }
+// In the moov's udta of a timelapse (#71): what 타임랩스 파일 잇기 goes by, since one looks like any 30 fps recording.
+constexpr uint32_t kUdta = Tag("udta"), kTimelapseMark = Tag("OzTL");
 constexpr uint32_t kMoov = Tag("moov"), kMoof = Tag("moof"), kMdat = Tag("mdat"), kFree = Tag("free"),
                    kMvhd = Tag("mvhd"), kMvex = Tag("mvex"), kTrex = Tag("trex"), kTrak = Tag("trak"),
                    kTkhd = Tag("tkhd"), kMdia = Tag("mdia"), kMdhd = Tag("mdhd"), kMinf = Tag("minf"),

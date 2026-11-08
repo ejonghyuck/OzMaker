@@ -220,7 +220,7 @@ struct Top {
 
 }  // namespace
 
-bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
+bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty, bool timelapse) {
     if (empty) *empty = false;
     File f(path);
     if (!f.Ok()) {
@@ -362,6 +362,7 @@ bool Unfragment(const std::wstring& path, std::wstring& err, bool* empty) {
                 Copy(o, moov, x);
             }
         }
+        if (timelapse) Wrap(o, kUdta, [&] { Wrap(o, kTimelapseMark, [] {}); });
     });
     if (!ok) {
         err = tr(L"MP4 구조를 읽을 수 없습니다.");

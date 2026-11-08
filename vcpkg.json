@@ -1,6 +1,6 @@
 {
   "name": "ozmaker",
-  "version-string": "0.7.6",
+  "version-string": "0.7.7",
   "dependencies": [
     "libwebp",
     {
