@@ -840,6 +840,21 @@ void Capture::TickLoop() {
         uint64_t checked = ~0ull;  // VFR: shots_ at the last tick
         bool fxChecked = false;    // and whether that tick had a click highlight
         int64_t end = 0;           // where the last tick ends, which the last frame lasts until
+        RefusalWatch refusals;
+        // An encoder pool that is full passes. A device that is gone, or an encoder that has stopped taking frames,
+        // doesn't: REC would stay on for hours with nothing written (#69).
+        auto given = [&](ID3D11Texture2D* tex, bool& giveUp) {
+            ComPtr<IMFSample> sample;
+            if (!refuse_) sample = writer_->Convert(tex);
+            if (sample) {
+                refusals.Taken();
+            } else if (FAILED(dev_->GetDeviceRemovedReason()) || refusals.Refused(util::Qpc100ns())) {
+                Fail(tr(L"그래픽 장치가 응답하지 않아 더 쓸 수 없었습니다. 그래픽 드라이버를 확인하거나 PC를 다시 시작해 "
+                        L"보세요."));
+                giveUp = true;
+            }
+            return sample;
+        };
         for (int64_t k = 0;; ++k) {
             if (pausedAt_) {
                 HANDLE waits[2] = {tickStop_, resumed_};
@@ -886,7 +901,9 @@ void Capture::TickLoop() {
             if (vfr) {
                 end = t1;
                 if (!keyDue && !(maybe && Changed())) continue;  // the frame shown goes on
-                ComPtr<IMFSample> sample = writer_->Convert(picture);
+                bool giveUp = false;
+                ComPtr<IMFSample> sample = given(picture, giveUp);
+                if (giveUp) break;
                 if (!sample) {  // encoder pool momentarily full: the next tick tries again
                     checked = ~0ull;
                     continue;
@@ -902,7 +919,9 @@ void Capture::TickLoop() {
                 ++frames_;
                 continue;
             }
-            ComPtr<IMFSample> sample = writer_->Convert(picture);
+            bool giveUp = false;
+            ComPtr<IMFSample> sample = given(picture, giveUp);
+            if (giveUp) break;
             if (!sample) continue;  // encoder pool momentarily full: this tick is dropped
             if (!writer_->WriteVideo(sample.Get(), t0, t1 - t0)) {
                 Fail(tr(L"동영상 인코딩 중 오류가 발생했습니다. 디스크 공간을 확인하세요."));
@@ -1320,13 +1339,13 @@ CaptureResult Capture::Stop() {
         res.seconds = (stopQpc - startQpc_ - pausedTotal_) / 1e7;
         // An error mid-recording keeps what was encoded before it.
         std::wstring finishErr;
+        if (refuseFinish_) writer_->RefuseFinish();
         res.ok = writer_->Finish(finishErr);
         if (res.ok && !writer_->Notice().empty())
             res.notice = res.notice.empty() ? writer_->Notice() : res.notice + L" " + writer_->Notice();
         if (res.ok && !videoError_.empty()) {
             res.seconds = writer_->VideoEnd() / 1e7;
-            std::wstring kept = videoError_ + tr(L" 오류 전까지(") + util::FormatClock(res.seconds, false) + tr(L") 저장했습니다.");
-            res.notice = res.notice.empty() ? kept : kept + L" " + res.notice;
+            res.failure = videoError_;
         }
         res.error = res.ok ? std::wstring() : !videoError_.empty() ? videoError_ : finishErr;
         res.encoder = writer_->EncoderName();

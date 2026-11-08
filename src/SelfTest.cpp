@@ -834,6 +834,26 @@ int App::RunSelfTest(const std::wstring& dir) {
     log(util::Format(L"store: %zu frames, %.2fs, disk %s, dropped %u, build %.0f ms", clip->Count(), clip->Seconds(),
                      util::FormatBytes(clip->DiskBytes()).c_str(), clip->Dropped(), (util::NowSeconds() - t0) * 1000));
 
+    // An encoder that is behind for a moment goes on; one that keeps refusing ends the recording (#69).
+    {
+        const int64_t s = 10'000'000;
+        RefusalWatch w;
+        bool early = false;
+        for (int64_t t = s; t < 5 * s; t += s / 30) early |= w.Refused(t);
+        const bool late = w.Refused(6 * s);
+        w.Taken();
+        const bool fresh = !w.Refused(7 * s);
+        const bool slept = !w.Refused(3600 * s);  // refused before the PC slept and after it woke: nothing long
+        const bool ok = !early && late && fresh && slept;
+        if (!ok) ++failures;
+        log(util::Format(L"refusals: %s (under the limit %d, over it %d, after a frame %d, after sleep %d)",
+                         ok ? L"ok" : L"FAIL", !early, late, fresh, slept));
+        const bool words = util::FormatSpan(45) == L"45초" && util::FormatSpan(38 * 60) == L"38분" &&
+                           util::FormatSpan(80 * 60) == L"1시간 20분" && util::FormatSpan(3600) == L"1시간";
+        if (!words) ++failures;
+        log(words ? L"span words: ok" : L"FAIL span words");
+    }
+
     // Round trip in a seek-heavy order (crosses keyframes both ways).
     {
         FrameStore::Reader rd(clip.get());
@@ -3454,6 +3474,30 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
     lastShot_ = ImageDir() + L"\\OzMaker_20261102_142311.png";
     shot(L"home_video_shots.png", 96);
     lastShots_ = 0;
+    // A long recording's gaps (#69): one, and more than fit; and one that stopped by itself.
+    tm noon{};
+    noon.tm_year = 126;
+    noon.tm_mon = 10;
+    noon.tm_mday = 7;
+    noon.tm_hour = 13;
+    noon.tm_min = 12;
+    noon.tm_isdst = -1;
+    const int64_t at = (int64_t)mktime(&noon);
+    lastVideo_.seconds = 6120;
+    lastVideo_.bytes = 5'200'000'000;
+    lastVideo_.gaps = {{at, 38 * 60, CaptureGap::Why::Asleep}};
+    shot(L"home_video_gap.png", 96);
+    for (int i = 1; i < 5; ++i)
+        lastVideo_.gaps.push_back({at + i * 1800, 80.0 * i, i % 2 ? CaptureGap::Why::Locked : CaptureGap::Why::Asleep});
+    shot(L"home_video_gaps.png", 96);
+    lastVideo_.gaps.clear();
+    lastVideo_.seconds = 760;
+    lastVideo_.bytes = 1'100'000'000;
+    lastVideo_.failure = tr(L"그래픽 장치가 응답하지 않아 더 쓸 수 없었습니다. 그래픽 드라이버를 확인하거나 PC를 다시 시작해 보세요.");
+    shot(L"home_video_failed.png", 96);
+    lastVideo_.failure.clear();
+    lastVideo_.seconds = 74.2;
+    lastVideo_.bytes = 48'213'004;
     showVideo_ = false;
     // 여러 창 녹화 (#48): the switch on with nothing checked; two windows side by side; four checked (the fifth row
     // dimmed) in a 2 × 2 grid; the card for three files, one closed early and one encoded on the CPU.
@@ -3505,6 +3549,10 @@ int App::RunScreenshots(const std::wstring& dir, const std::wstring& look) {
         lastShots_ = 6;
         shot(L"home_multi_shots.png", 96);
         lastShots_ = 0;
+        lastVideos_[0].r.gaps = lastVideos_[2].r.gaps = {{at, 38 * 60, CaptureGap::Why::Locked}};
+        lastVideos_[1].r.failure = L"-";
+        shot(L"home_multi_gap.png", 96);
+        lastVideo_.gaps.clear();
         showVideo_ = false;
         lastVideos_.clear();
         settings_.multiWindow = false;
@@ -7063,6 +7111,180 @@ int App::RunMultiTest(const std::wstring& dir) {
     lastVideos_.clear();
     lastVideo_ = {};
     picks_.clear();
+    quitting_ = true;
+    DestroyWindow(hwnd_);
+    pump(1.0, nullptr);
+    log(failures ? util::Format(L"RESULT: %d failure(s)", failures) : L"RESULT: all passed");
+    return failures ? 2 : 0;
+}
+
+// What keeps a long recording safe (#69), on a test window. Lock and sleep are the app's own messages sent to it: the
+// PC is neither locked nor put to sleep, and whether frames come through them is for the user to try by hand.
+int App::RunSafetyTest(const std::wstring& dir) {
+    testWindowsOnly_ = true;
+    util::EnsureDir(dir);
+    Log log(dir + L"\\safety-test.log");
+    int failures = 0;
+    auto check = [&](bool ok, const std::wstring& what) {
+        if (!ok) ++failures;
+        log((ok ? L"ok   " : L"FAIL ") + what);
+    };
+    settings_.outDir = dir;
+    settings_.sounds = false;
+    settings_.mic = false;  // never the real microphone: it records the room
+    settings_.audio = false;
+    settings_.rpOn = false;
+    settings_.source = kSourceWindow;
+    settings_.multiWindow = false;
+    settings_.nameTemplate = kNameTemplates[0];
+    settings_.sizeIdx = (int)std::size(kSizeOptions) - 1;
+    if (!CreateMainWindow(SW_HIDE)) return 1;
+    auto pump = [&](double seconds, const std::function<bool()>& until) {
+        const double end = util::NowSeconds() + seconds;
+        MSG msg;
+        while (util::NowSeconds() < end && !(until && until())) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    };
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + util::ExePath() + L"\" --test-window 120 capture";
+    STARTUPINFOW si{sizeof(si)};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        log(L"FAIL can't start --test-window");
+        return 1;
+    }
+    HWND win = nullptr;
+    double nextList = 0;
+    pump(8, [&] {
+        if (util::NowSeconds() < nextList) return false;
+        nextList = util::NowSeconds() + 0.2;
+        RefreshWindows();
+        for (const WinInfo& w : windows_) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w.hwnd, &pid);
+            if (pid == pi.dwProcessId) win = w.hwnd;
+        }
+        return win != nullptr;
+    });
+    auto cleanup = [&] {
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    };
+    check(win != nullptr, L"the test window is listed");
+    if (!win) {
+        cleanup();
+        return 1;
+    }
+    SetWindowPos(win, nullptr, 0, 0, 800, 500, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const auto awake = [] {
+        const EXECUTION_STATE both = ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED;
+        return (SetThreadExecutionState(0) & both) == both;
+    };
+    auto session = [&](WPARAM what) { SendMessageW(hwnd_, WM_WTSSESSION_CHANGE, what, 0); };
+    auto power = [&](WPARAM what) { SendMessageW(hwnd_, WM_POWERBROADCAST, what, 0); };
+
+    // Staying awake: while recording, not while paused, and let go of at the end.
+    settings_.output = kOutputVideo;
+    check(!awake(), L"awake: nothing asked for before recording");
+    StartRecording(WindowTarget(win), true);
+    check(rec_ == RecState::Recording && awake(), L"awake: asked for while recording");
+    pump(0.6, nullptr);
+    TogglePause();
+    check(!awake(), L"awake: let go of while paused");
+    session(WTS_SESSION_LOCK);  // a pause holds nothing: no gap
+    pump(1.1, nullptr);
+    session(WTS_SESSION_UNLOCK);
+    TogglePause();
+    check(awake(), L"awake: asked for again when it goes on");
+
+    // The gaps: the lock, sleep, sleep inside a lock (one stretch), and a lock still on when it stops.
+    session(WTS_SESSION_LOCK);
+    pump(2.1, nullptr);
+    session(WTS_SESSION_UNLOCK);
+    pump(0.3, nullptr);
+    power(PBT_APMSUSPEND);
+    pump(1.1, nullptr);
+    power(PBT_APMRESUMEAUTOMATIC);
+    pump(0.3, nullptr);
+    session(WTS_SESSION_LOCK);
+    pump(0.6, nullptr);
+    power(PBT_APMSUSPEND);
+    pump(0.6, nullptr);
+    power(PBT_APMRESUMESUSPEND);
+    pump(0.6, nullptr);
+    session(WTS_SESSION_UNLOCK);
+    pump(0.3, nullptr);
+    session(WTS_SESSION_LOCK);
+    pump(1.1, nullptr);
+    StopRecording();
+    session(WTS_SESSION_UNLOCK);
+    check(!awake(), L"awake: let go of when it stops");
+    {
+        const std::vector<CaptureGap>& g = lastVideo_.gaps;
+        using Why = CaptureGap::Why;
+        const bool shape = g.size() == 4 && g[0].why == Why::Locked && g[1].why == Why::Asleep &&
+                           g[2].why == Why::Asleep && g[3].why == Why::Locked;
+        std::wstring lengths;
+        for (const CaptureGap& x : g) lengths += util::Format(L" %.0f", x.seconds);
+        check(shape && lastVideo_.ok && showVideo_, util::Format(L"gaps: %zu on the result:", g.size()) + lengths);
+        check(shape && g[0].seconds >= 1 && g[0].seconds <= 4 && g[2].seconds >= 1 && g[2].seconds <= 4 &&
+                  g[0].at < g[1].at && g[1].at <= g[2].at,
+              L"gaps: in order, as long as the stretches were");
+    }
+
+    // 움짤: staying awake too, and no card for the gaps: the message says it.
+    settings_.output = kOutputClip;
+    StartRecording(WindowTarget(win), true);
+    check(rec_ == RecState::Recording && awake(), L"clip: awake while recording");
+    pump(0.4, nullptr);
+    session(WTS_SESSION_LOCK);
+    pump(1.1, nullptr);
+    session(WTS_SESSION_UNLOCK);
+    pump(0.4, nullptr);
+    StopRecording();
+    check(!awake() && clip_ && toast_.find(L"구간이 1개") != std::wstring::npos, L"clip: the message tells of the gap: " + toast_);
+    CloseClip();
+    held_.clear();
+    CloseEditor();
+
+    // The encoder stops taking frames: not at once, then the recording ends by itself and keeps what it has. Each
+    // frame rate way; and once with a file the encoder can't finish, as after a lost device.
+    settings_.output = kOutputVideo;
+    auto stopped = [&](const wchar_t* name, bool vfr, bool finishFails) {
+        const int was = settings_.vFrameMode;
+        settings_.vFrameMode = vfr ? 1 : 0;
+        StartRecording(WindowTarget(win), true);
+        pump(1.5, nullptr);
+        const double from = util::NowSeconds();
+        if (!recs_.empty() && recs_[0].capture) recs_[0].capture->RefuseFrames(finishFails);
+        pump(1, nullptr);
+        check(rec_ == RecState::Recording, std::wstring(name) + L": goes on for a moment");
+        pump(12, [&] { return rec_ != RecState::Recording; });
+        const double took = util::NowSeconds() - from;
+        settings_.vFrameMode = was;
+        check(rec_ == RecState::Idle && !awake(), util::Format(L"%s: ended by itself after %.1f s", name, took));
+        check(took >= 4.5 && took < 7, std::wstring(name) + L": after about five seconds");
+        std::wstring err;
+        auto v = VideoClip::Open(lastVideo_.path, err);
+        const double kept = v ? v->Seconds() : 0;
+        const size_t frames = v ? v->Count() : 0;
+        v.reset();
+        check(showVideo_ && lastVideo_.ok && !lastVideo_.failure.empty() && lastVideo_.bytes > 0,
+              std::wstring(name) + L": the card says so: " + lastVideo_.failure);
+        check(kept > 0.5 && kept < 3 && frames >= 2,  // the test window changes every 1.5 s: VFR writes few
+              util::Format(L"%s: the file plays: %.2f s, %zu frames, card says %.2f s", name, kept, frames, lastVideo_.seconds));
+    };
+    stopped(L"encoder gone", false, false);
+    stopped(L"encoder gone, variable frame rate", true, false);
+    stopped(L"encoder gone, file not finished", false, true);
+
+    cleanup();
+    lastVideo_ = {};
     quitting_ = true;
     DestroyWindow(hwnd_);
     pump(1.0, nullptr);

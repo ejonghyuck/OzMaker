@@ -56,6 +56,15 @@ std::wstring FormatClock(double seconds, bool tenths) {
     return Format(L"%lld:%02lld", m, sec);
 }
 
+std::wstring FormatSpan(double seconds) {
+    const int s = (int)std::max(0.0, std::round(seconds));
+    if (s < 60) return Format(tr(L"%d초"), s);
+    const int m = (s + 30) / 60;  // to the nearest minute
+    if (m < 60) return Format(tr(L"%d분"), m);
+    const std::wstring h = Format(tr(L"%d시간"), m / 60);
+    return m % 60 ? h + L" " + Format(tr(L"%d분"), m % 60) : h;
+}
+
 std::wstring FormatBytes(uint64_t b) {
     if (b < 1024) return Format(L"%llu B", b);
     if (b < 1024 * 1024) return Format(L"%.0f KB", b / 1024.0);

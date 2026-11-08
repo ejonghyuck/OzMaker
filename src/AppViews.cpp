@@ -32,9 +32,36 @@ float CardRowH(Rect preview, size_t files) {
     const float room = preview.H() - 24 - 90 - 16 - kCardHead;  // 90: the preview left above it
     return std::clamp(room / std::max<size_t>(files, 1), 36.f, kCardRow);
 }
-Rect VideoCardRect(Rect preview, size_t files = 1) {
-    const float h = files > 1 ? 16 + kCardHead + files * CardRowH(preview, files) : 64;
+// Lines under the head of the card (#69). With one file: the gaps in the recording, one to a row and as many as fit,
+// or why it stopped by itself. With several: one line about the gaps.
+constexpr float kCardLine = 22, kCardLineGap = 6, kCardWhy = 40;
+int CardGapRows(Rect preview, const CaptureResult& r) {
+    const float room = preview.H() - 24 - 90 - 64 - kCardLineGap - 2 * kCardLine;  // 2: the count and what it means
+    return std::clamp((int)(room / kCardLine), 0, std::min((int)r.gaps.size(), 3));
+}
+float CardLinesH(Rect preview, const CaptureResult& r) {
+    if (!r.failure.empty()) return kCardLineGap + kCardWhy;
+    if (r.gaps.empty()) return 0;
+    return kCardLineGap + (2 + CardGapRows(preview, r)) * kCardLine;
+}
+Rect VideoCardRect(Rect preview, size_t files = 1, float lines = 0) {
+    const float h = (files > 1 ? 16 + kCardHead + files * CardRowH(preview, files) : 64) + lines;
     return Rect(preview.l + 12, preview.b - 12 - h, preview.r - 12, preview.b - 12);
+}
+double GapSeconds(const std::vector<CaptureGap>& gaps) {
+    double s = 0;
+    for (const CaptureGap& g : gaps) s += g.seconds;
+    return s;
+}
+const wchar_t* GapWhy(const CaptureGap& g) {
+    return g.why == CaptureGap::Why::Asleep ? tr(L"절전") : tr(L"화면 잠김");
+}
+// 13:12부터 38분
+std::wstring GapWhen(const CaptureGap& g) {
+    tm t{};
+    const time_t at = (time_t)g.at;
+    localtime_s(&t, &at);
+    return util::Format(tr(L"%02d:%02d부터 %s"), t.tm_hour, t.tm_min, util::FormatSpan(g.seconds).c_str());
 }
 // The screenshots taken during that recording (#63), over its card.
 Rect ShotCardRect(const Rect& video) { return Rect(video.l, video.t - 8 - 56, video.r, video.t - 8); }
@@ -939,7 +966,7 @@ void App::DrawCapturePreview(Rect preview) {
     const bool card = showVideo_ && rec_ == RecState::Idle;
     Rect view = preview;
     if (card) {
-        const Rect video = VideoCardRect(preview, lastVideos_.size());
+        const Rect video = VideoCardRect(preview, lastVideos_.size(), VideoCardLines(preview));
         view.b = lastShots_ ? ShotCardRect(video).t : video.t;
     }
     std::wstring hk = HotkeyLabel();
@@ -1097,14 +1124,18 @@ void App::DrawVideoResult(Rect preview) {
         DrawVideoResults(preview);
         return;
     }
-    Rect card = VideoCardRect(preview);
+    const bool failed = !lastVideo_.failure.empty();
+    const float linesH = VideoCardLines(preview);
+    Rect card = VideoCardRect(preview, 1, linesH);
     float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
     card = card.Offset(0, (1 - a) * 12);
     if (lastShots_) DrawShotCard(card, a);
+    const D2D1_COLOR_F line = failed ? P.Rec : Success;
     ui_.Fill(card.Offset(0, 3), WithAlpha(Shadow, 0.4f * a), 12);
-    ui_.Fill(card, WithAlpha(P.SavedCard, 0.97f * a), 12);
-    ui_.Stroke(card.Inset(0.5f), WithAlpha(Success, 0.45f * a), 12);
+    ui_.Fill(card, WithAlpha(failed ? P.Toast : P.SavedCard, 0.97f * a), 12);
+    ui_.Stroke(card.Inset(0.5f), WithAlpha(line, failed ? 0.6f * a : 0.45f * a), 12);
     Rect in = card.Inset(14, 10);
+    if (linesH > 0) DrawCardLines(in.CutBottom(linesH), preview, line, a);
     Rect close = in.CutRight(28);
     if (ui_.IconButton(HashId("vres.close"), Rect::Centered(close.CX(), close.CY(), 28, 28), icon::Close, tr(L"닫기"),
                        true, 11.f))
@@ -1127,9 +1158,20 @@ void App::DrawVideoResult(Rect preview) {
         util::ShellOpen(lastVideo_.path);
     in.CutRight(12);
     Rect icon = in.CutLeft(28);
-    ui_.Circle(icon.CX(), icon.CY(), 12, WithAlpha(Success, 0.2f));
-    ui_.Icon(icon, icon::Check, 12.f, Success);
+    ui_.Circle(icon.CX(), icon.CY(), 12, WithAlpha(line, 0.2f));
+    ui_.Icon(icon, failed ? icon::Warning : icon::Check, 12.f, line);
     in.CutLeft(8);
+    if (failed) {
+        // Both in one line where it fits; the buttons leave little room in a narrow window.
+        const std::wstring upTo = util::Format(tr(L"%s까지 저장했습니다"), util::FormatClock(lastVideo_.seconds, false).c_str());
+        const std::wstring both = tr(L"녹화를 멈췄습니다 · ") + upTo;
+        const bool fits = ui_.Measure(both, 13.f, kBold) <= in.W();
+        const std::wstring file = util::FileNameOf(lastVideo_.path) + L" · " + util::FormatBytes(lastVideo_.bytes);
+        ui_.Text(Rect(in.l, in.t, in.r, in.CY() + 1), fits ? both : std::wstring(tr(L"녹화를 멈췄습니다")), 13.f, TextColor, Bold());
+        ui_.Text(Rect(in.l, in.CY() + 1, in.r, in.b), fits ? file : upTo + L" · " + util::FormatBytes(lastVideo_.bytes), 12.f,
+                 TextDim);
+        return;
+    }
     ui_.Text(Rect(in.l, in.t, in.r, in.CY() + 1), util::FileNameOf(lastVideo_.path), 13.f, TextColor, Bold());
     std::wstring sub = util::FormatClock(lastVideo_.seconds, false) + L" · " + util::FormatBytes(lastVideo_.bytes) +
                        (lastVideo_.audio ? tr(L" · 소리 포함") : tr(L" · 소리 없음"));
@@ -1144,7 +1186,8 @@ void App::DrawVideoResult(Rect preview) {
 // 여러 창 녹화's card: a header with 폴더, then each window's file with its own 편집 (the first one's the main button).
 void App::DrawVideoResults(Rect preview) {
     const size_t n = lastVideos_.size();
-    Rect card = VideoCardRect(preview, n);
+    const float linesH = VideoCardLines(preview);
+    Rect card = VideoCardRect(preview, n, linesH);
     float a = ui_.AnimFrom(HashId("vres.in"), 1.f, 0.f, 14.f);
     card = card.Offset(0, (1 - a) * 12);
     if (lastShots_) DrawShotCard(card, a);
@@ -1186,12 +1229,69 @@ void App::DrawVideoResults(Rect preview) {
         const bool cpu = settings_.vHardware && !r.hardware && !r.encoder.empty();
         std::wstring sub = util::FormatClock(r.seconds, false) + L" · " + util::FormatBytes(r.bytes) +
                            (r.audio ? tr(L" · 소리 포함") : tr(L" · 소리 없음"));
-        if (lastVideos_[i].early) sub += tr(L" · 닫혀서 먼저 끝남");
+        const bool failed = !r.failure.empty();
+        if (failed)
+            sub += tr(L" · 오류로 먼저 끝남");
+        else if (lastVideos_[i].early)
+            sub += tr(L" · 닫혀서 먼저 끝남");
         if (cpu) sub += tr(L" · CPU로 인코딩함 (그래픽카드 인코더가 모자람)");
         const float mid = row.CY();
         ui_.Text(Rect(row.l, row.t + 2, row.r, mid + 1), util::FileNameOf(r.path), 13.f, TextColor, Bold());
-        ui_.Text(Rect(row.l, mid + 1, row.r, row.b - 2), sub, 12.f, cpu ? Warning : TextDim);
+        ui_.Text(Rect(row.l, mid + 1, row.r, row.b - 2), sub, 12.f, cpu || failed ? Warning : TextDim);
     }
+    if (linesH > 0) {
+        const std::vector<CaptureGap>& gaps = VideoCardGaps();
+        Rect row = in.CutTop(linesH);
+        ui_.Fill(Rect(row.l, row.t, row.r, row.t + 1), WithAlpha(Success, 0.22f * a), 0);
+        row.CutLeft(36);
+        Rect sign = row.CutLeft(20);
+        ui_.Icon(sign, icon::Warning, 12.f, Warning);
+        const std::wstring when = gaps.size() == 1 ? GapWhen(gaps[0]) + L" · " + GapWhy(gaps[0]) : util::FormatSpan(GapSeconds(gaps));
+        ui_.Text(row, util::Format(tr(L"빈 구간 %zu개"), gaps.size()) + L" · " + when, 12.f, Warning);
+    }
+}
+
+// How much the card adds under its head (#69).
+float App::VideoCardLines(Rect preview) const {
+    if (lastVideos_.size() > 1) return VideoCardGaps().empty() ? 0.f : kCardLine + 2;
+    return CardLinesH(preview, lastVideo_);
+}
+
+// With several files, those of the one recorded longest.
+const std::vector<CaptureGap>& App::VideoCardGaps() const {
+    const std::vector<CaptureGap>* gaps = &lastVideo_.gaps;
+    for (const SavedVideo& v : lastVideos_)
+        if (v.r.gaps.size() > gaps->size()) gaps = &v.r.gaps;
+    return *gaps;
+}
+
+void App::DrawCardLines(Rect r, Rect preview, const D2D1_COLOR_F& line, float a) {
+    const CaptureResult& v = lastVideo_;
+    r.CutTop(kCardLineGap);
+    ui_.Fill(Rect(r.l, r.t - 1, r.r, r.t), WithAlpha(line, 0.3f * a), 0);
+    if (!v.failure.empty()) {
+        TextStyle st = Align(AlignStart, AlignCenter);
+        st.wrap = true;
+        ui_.Text(Rect(r.l + 36, r.t, r.r, r.b), v.failure, 12.5f, TextDim, st);
+        return;
+    }
+    const float indent = 36;
+    Rect head = r.CutTop(kCardLine);
+    ui_.Text(head.CutRight(120), util::FormatSpan(GapSeconds(v.gaps)), 12.5f, Warning, Align(AlignEnd));
+    head.CutLeft(indent);
+    ui_.Icon(head.CutLeft(20), icon::Warning, 12.f, Warning);
+    ui_.Text(head, util::Format(tr(L"빈 구간 %zu개"), v.gaps.size()), 12.5f, Warning);
+    const int rows = CardGapRows(preview, v);
+    for (int i = 0; i < rows; ++i) {
+        Rect row = r.CutTop(kCardLine);
+        // What doesn't fit is counted on the last row.
+        const size_t more = i == rows - 1 ? v.gaps.size() - rows : 0;
+        ui_.Text(row.CutRight(160), GapWhy(v.gaps[i]), 12.5f, TextDim, Align(AlignEnd));
+        row.CutLeft(indent + 20);
+        ui_.Text(row, more ? GapWhen(v.gaps[i]) + util::Format(tr(L" 외 %zu개"), more) : GapWhen(v.gaps[i]), 12.5f, TextDim);
+    }
+    r.CutLeft(indent);
+    ui_.Text(r, tr(L"이 구간은 화면이 멈춘 채 녹화됐을 수 있습니다."), 12.5f, TextDim);
 }
 
 void App::DrawCapturePanel(Rect r) {

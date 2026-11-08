@@ -62,6 +62,7 @@ public:
     void PushAudio(const int16_t* pcm, size_t frames);
 
     bool Finish(std::wstring& err);
+    void RefuseFinish() { refuseFinish_ = true; }  // tests: Finish finds the encoder gone
     void Abort();
     // After a Finish that worked: something the user should know, e.g. that the file stayed fragmented.
     const std::wstring& Notice() const { return notice_; }
@@ -92,6 +93,7 @@ private:
     std::wstring path_;
     ReplayRing* ring_ = nullptr;
     std::wstring marker_;  // fragmented: names path_ while it is written, for Recover
+    bool refuseFinish_ = false;
     std::wstring notice_;
     std::wstring tried_;
     ComPtr<ID3D11Device> dev_;

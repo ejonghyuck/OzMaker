@@ -90,6 +90,8 @@ OzMaker.exe --replay-test <dir>       # 순간 리플레이: 합성 영상으로
 OzMaker.exe --multi-test <dir>        # 여러 창 녹화: --test-window 두 개를 체크해 움짤로(둘 다 남고 첫 창이 열림), 그리고 MP4로
                                       # 녹화하며 첫 창이 도중에 닫힘(그 파일만 먼저 끝남, REC 표시가 다음 창으로, 카드에 두 파일),
                                       # 스크린샷(창마다 한 장, 줄인 녹화에서도 창 크기, 일시정지 중에도, 끝나면 키를 놓음)
+OzMaker.exe --safety-test <dir>       # 긴 녹화 안전장치: --test-window를 녹화하며 깨어 있기 요청이 녹화 중에만 걸리는지, 앱에 보낸 잠금 · 절전 메시지로
+                                      # 빈 구간이 결과에 남는지, 인코더가 프레임을 안 받으면 5초쯤 뒤에 멈추고 파일이 남는지(마무리까지 실패해도) 확인
 OzMaker.exe --update-test <dir> [url|github]  # 가짜 릴리스 폴더로 업데이트 확인 → 받기 → 검증 → 교체(--selftest에도 포함)
 OzMaker.exe --exit                    # 실행 중인 OzMaker 종료
 ```

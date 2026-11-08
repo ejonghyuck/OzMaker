@@ -508,12 +508,15 @@ bool Mp4Writer::Finish(std::wstring& err) {
     // After a write error the samples written before it are still good: finalize the file with those.
     if (held_) EndVideo(heldTime_ + 10'000'000 / std::max(1, v_.fps));
     if (!failed_) WriteAudioQueue();
-    HRESULT hr = videoFrames_ > 0 ? writer_->Finalize() : E_FAIL;
+    HRESULT hr = videoFrames_ > 0 && !refuseFinish_ ? writer_->Finalize() : E_FAIL;
     if (ring_) {  // the last fragments went into the ring: there is no file to finish
         Close();
         return SUCCEEDED(hr);
     }
-    if (FAILED(hr)) {
+    // A fragmented file doesn't need the encoder to end it: what reached the disk plays, as after a crash. A lost
+    // graphics device can't finish the file, and hours of recording must not go with it (#69).
+    const bool kept = FAILED(hr) && v_.fragmented && videoFrames_ > 0;
+    if (FAILED(hr) && !kept) {
         err = videoFrames_ == 0 ? tr(L"녹화된 화면이 없습니다.")
                                 : tr(L"동영상 파일을 마무리하지 못했습니다. (") + Hr(hr) + L")";
         Abort();
@@ -523,7 +526,14 @@ bool Mp4Writer::Finish(std::wstring& err) {
     bool plain = true;
     if (v_.fragmented) {
         std::wstring why;
-        plain = mp4::Unfragment(path_, why);
+        bool empty = false;
+        plain = mp4::Unfragment(path_, why, &empty);
+        if (kept && !plain && empty) {  // nothing had reached the disk
+            err = tr(L"동영상 파일을 마무리하지 못했습니다. (") + Hr(hr) + L")";
+            DeleteFileW(path_.c_str());
+            Unmark();
+            return false;
+        }
         if (!plain)
             notice_ = tr(L"동영상을 일반 MP4로 바꾸지 못했습니다(") + why + tr(L"). 대부분의 플레이어에서는 그대로 재생됩니다.");
     }

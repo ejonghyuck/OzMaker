@@ -111,6 +111,7 @@ int App::Run(HINSTANCE inst, int show, const std::wstring& cmdLine) {
     if (args.size() >= 2 && args[0] == L"--encoder-test") return RunEncoderTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--replay-test") return RunReplayTest(args[1]);
     if (args.size() >= 2 && args[0] == L"--multi-test") return RunMultiTest(args[1]);
+    if (args.size() >= 2 && args[0] == L"--safety-test") return RunSafetyTest(args[1]);
     if (args.size() >= 7 && args[0] == L"--test-window" && args[2] == L"cover") {
         const int x = _wtoi(args[3].c_str()), y = _wtoi(args[4].c_str());
         const RECT r{x, y, x + _wtoi(args[5].c_str()), y + _wtoi(args[6].c_str())};
@@ -932,6 +933,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_WTSSESSION_CHANGE:
             if (w == WTS_SESSION_LOCK || w == WTS_SESSION_UNLOCK) {
                 rpLocked_ = w == WTS_SESSION_LOCK;
+                RecGapUpdate();
                 if (rpLocked_)
                     ReplayClear();
                 else
@@ -941,9 +943,11 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
         case WM_POWERBROADCAST:
             if (w == PBT_APMSUSPEND) {
                 rpAsleep_ = true;
+                RecGapUpdate();
                 ReplayClear();
             } else if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
                 rpAsleep_ = false;
+                RecGapUpdate();
                 ReplayTick();
             }
             return TRUE;
@@ -1008,6 +1012,7 @@ LRESULT App::Handle(UINT m, WPARAM w, LPARAM l) {
                     if (s.capture) s.capture->Stop();
                 recs_.clear();
                 rec_ = RecState::Idle;
+                KeepAwake();
             }
             if (w) {
                 KillTimer(hwnd_, kTimerReplay);
@@ -1618,6 +1623,9 @@ void App::BeginCapture() {
     rec_ = RecState::Recording;
     recPaused_ = false;
     stopReason_.clear();
+    recGaps_.clear();
+    recGap_.reset();
+    KeepAwake();
     timerFiredFor_ = 0;
     nextDiskCheck_ = util::NowSeconds() + 2;
     SetRecordingLook(true);
@@ -1641,6 +1649,34 @@ void App::BeginCapture() {
     SetTimer(hwnd_, kTimerRec, 100, nullptr);
     TrayUpdate();
     Invalidate();
+}
+
+void App::KeepAwake() {
+    const bool want = rec_ == RecState::Recording && !recPaused_;
+    if (want == awake_) return;
+    awake_ = want;
+    SetThreadExecutionState(want ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED : ES_CONTINUOUS);
+}
+
+void App::RecGapUpdate() {
+    const bool on = rec_ == RecState::Recording && !recPaused_ && (rpLocked_ || rpAsleep_);
+    if (on && !recGap_) {
+        recGap_ = CaptureGap{(int64_t)time(nullptr), 0, rpAsleep_ ? CaptureGap::Why::Asleep : CaptureGap::Why::Locked};
+    } else if (on && rpAsleep_) {
+        recGap_->why = CaptureGap::Why::Asleep;  // locked first, then asleep: one stretch, and nothing recorded in it
+    } else if (!on && recGap_) {
+        recGaps_ = RecGaps();
+        recGap_.reset();
+    }
+}
+
+std::vector<CaptureGap> App::RecGaps() const {
+    std::vector<CaptureGap> gaps = recGaps_;
+    if (recGap_) {
+        gaps.push_back(*recGap_);
+        gaps.back().seconds = (double)((int64_t)time(nullptr) - recGap_->at);
+    }
+    return gaps;
 }
 
 RecSession* App::RecLead() {
@@ -1667,6 +1703,7 @@ void App::EndRecSession(size_t i) {
     RecSession& s = recs_[i];
     const bool lead = RecLead() == &s;
     s.result = s.capture->Stop();
+    s.result.gaps = RecGaps();
     s.capture.reset();
     s.ended = true;
     overlay_.SetCount((int)live - 1);
@@ -1698,12 +1735,17 @@ void App::StopRecording() {
     if (recs_.size() > 1)
         for (RecSession& s : recs_)
             if (!s.ended && s.capture) s.capture->SetPaused(true);
-    for (RecSession& s : recs_)
-        if (!s.ended && s.capture) s.result = s.capture->Stop();
+    lastGaps_ = RecGaps();
+    for (RecSession& s : recs_) {
+        if (s.ended || !s.capture) continue;
+        s.result = s.capture->Stop();
+        s.result.gaps = lastGaps_;
+    }
     std::vector<RecSession> done = std::move(recs_);
     recs_.clear();
     rec_ = RecState::Idle;
     recPaused_ = false;
+    KeepAwake();
     SetRecordingLook(false);
     RegisterPauseHotkey();  // releases it
     RegisterShotHotkey();
@@ -1743,6 +1785,13 @@ void App::OpenClipWarn(const std::shared_ptr<FrameStore>& clip, size_t held) {
         warn = tr(L"디스크 공간이 부족해 녹화를 멈췄습니다. 그 앞까지만 저장되어 있습니다.");
     else if (clip->Dropped() > 0)
         warn = util::Format(tr(L"디스크가 느려 프레임 %u개를 건너뛰었습니다."), clip->Dropped());
+    if (!lastGaps_.empty()) {  // no card to show them on
+        double seconds = 0;
+        for (const CaptureGap& g : lastGaps_) seconds += g.seconds;
+        const std::wstring gaps = util::Format(tr(L"화면이 잠겼거나 PC가 절전에 들어간 구간이 %zu개(%s) 있습니다."),
+                                               lastGaps_.size(), util::FormatSpan(seconds).c_str());
+        warn = warn.empty() ? gaps : warn + L" " + gaps;
+    }
     if (!stopReason_.empty() && !clip->WriteFailed()) warn = stopReason_ + (warn.empty() ? L"" : L" " + warn);
     stopReason_.clear();
     const std::wstring done = held > 1 ? util::Format(tr(L"창 %zu개를 녹화했습니다. 첫 창을 편집 탭에서 열었고, 나머지는 "
@@ -1762,13 +1811,14 @@ void App::OpenClipWarn(const std::shared_ptr<FrameStore>& clip, size_t held) {
 
 // 여러 창 녹화: a file (MP4) or a held clip (움짤) for each window, the first one shown.
 void App::StopSeveral(std::vector<RecSession>& done) {
-    std::wstring failed;
+    std::wstring failed, stopped;
     size_t failures = 0;
     if (done[0].result.video || recVideo_) {
         lastVideos_.clear();
         for (RecSession& s : done) {
             if (s.result.video && s.result.ok) {
                 lastVideos_.push_back({s.result, s.ended});
+                if (!s.result.failure.empty() && stopped.empty()) stopped = s.name + L": " + s.result.failure;
             } else {
                 ++failures;
                 if (failed.empty())
@@ -1781,7 +1831,10 @@ void App::StopSeveral(std::vector<RecSession>& done) {
             return;
         }
         OnVideosSaved();
-        if (failures) Alert(util::Format(tr(L"창 %zu개는 저장하지 못했습니다. "), failures) + failed);
+        if (failures)
+            Alert(util::Format(tr(L"창 %zu개는 저장하지 못했습니다. "), failures) + failed);
+        else if (!stopped.empty())
+            Alert(stopped);
         return;
     }
     // 움짤: each into 저장하지 않은 녹화, the first window's at the top; the first opens.
@@ -1852,15 +1905,19 @@ void App::OnVideoSaved(const CaptureResult& r) {
         ReportError(tr(L"동영상 저장 실패"), r.error.empty() ? tr(L"동영상을 저장하지 못했습니다.") : r.error);
         return;
     }
-    if (settings_.sounds) sound::Play(sound::Cue::Saved);
+    const bool failed = !r.failure.empty();  // the card says it
+    if (settings_.sounds) sound::Play(failed ? sound::Cue::Stop : sound::Cue::Saved);
     ShowVideo(r);
     if (!recNotice_.empty()) lastVideo_.notice = recNotice_;
     std::wstring info = util::FileNameOf(r.path) + L" · " + util::FormatBytes(r.bytes);
     std::wstring reason = std::exchange(stopReason_, {});
-    if (NotifyQuietly())
+    if (NotifyQuietly() && failed)
+        TrayBalloon(tr(L"녹화를 멈췄습니다"), r.failure);
+    else if (NotifyQuietly())
         TrayBalloon(tr(L"동영상 저장 완료 · ") + util::FormatClock(r.seconds, false), reason.empty() ? info : reason);
     else
         ShowMain(true);
+    if (failed && lastVideo_.notice.empty()) return;
     if (!lastVideo_.notice.empty())
         Alert(reason.empty() ? lastVideo_.notice : reason + L" " + lastVideo_.notice);
     else if (!reason.empty())
@@ -1898,6 +1955,8 @@ void App::OnVideosSaved() {
 void App::TogglePause() {
     if (rec_ != RecState::Recording) return;
     recPaused_ = !recPaused_;
+    KeepAwake();
+    RecGapUpdate();
     for (RecSession& s : recs_)
         if (!s.ended && s.capture) s.capture->SetPaused(recPaused_);
     overlay_.SetPaused(recPaused_);
